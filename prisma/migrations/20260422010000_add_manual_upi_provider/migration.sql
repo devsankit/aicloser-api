@@ -1,0 +1,1 @@
+ALTER TYPE "BillingPaymentProvider" ADD VALUE IF NOT EXISTS 'UPI_MANUAL';

@@ -1,0 +1,2 @@
+ALTER TABLE IF EXISTS "MobilePushToken"
+ADD COLUMN IF NOT EXISTS "projectOfferChannelId" TEXT;
