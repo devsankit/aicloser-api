@@ -241,9 +241,25 @@ Cookie: aicloser_token=<jwt_session_token>; gx_session=<jwt_session_token>
 - **Response**: SSE stream with durable outbox events and reconnect cursor support through the `since` timestamp.
 
 #### Mobile sync endpoints
+- `POST /api/v1/mobile/contacts` creates or updates the authenticated mobile sales agent's contact in both the tenant contact directory and CRM lead pipeline. It accepts either a single contact or a batch of up to 100 contacts. The phone is normalized to E.164 (10-digit numbers default to `+91`) and matching is tenant- and agent-scoped, so retries do not create duplicates.
 - `POST /api/v1/mobile/devices` registers or reactivates the authenticated agent's device.
 - `POST /api/v1/mobile/devices/:deviceId/heartbeat` updates device liveness within the current tenant.
 - `POST /api/v1/mobile/offline-events/sync` accepts up to 100 idempotent events per batch. `CALL_END` is applied exactly once and acknowledged with its client idempotency key.
+
+Example mobile contact request:
+
+```json
+{
+  "contact": {
+    "name": "Aarav Khanna",
+    "phone": "9811234901",
+    "email": "aarav@company.com",
+    "notes": "Interested in the CRM demo",
+    "tags": ["hot", "mobile"],
+    "source": "MOBILE_MANUAL"
+  }
+}
+```
 
 Call recording states are restricted to `NONE`, `RECORDING_UNAVAILABLE`, `LOCAL_PENDING`, `UPLOADING`, `UPLOADED`, and `FAILED`. `PENDING_UPLOAD` is not a valid server state.
 

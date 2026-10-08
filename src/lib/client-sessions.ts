@@ -29,6 +29,7 @@ type ClientSessionInput = {
   deviceName?: string | null;
   platform?: string | null;
   appVersion?: string | null;
+  replaceExisting?: boolean;
 };
 
 function slotLockKey(input: Pick<ClientSessionInput, 'userId' | 'channel'>) {
@@ -48,36 +49,47 @@ export async function acquireClientSession(input: ClientSessionInput) {
 
     if (slot?.activeSession?.status === AppClientSessionStatus.ACTIVE) {
       if (slot.activeSession.installationId !== input.installationId) {
-        throw new ClientSlotOccupiedError(
-          input.channel,
-          slot.activeSession.lastActiveAt,
-          slot.activeSession.deviceName,
-        );
+        if (!input.replaceExisting) {
+          throw new ClientSlotOccupiedError(
+            input.channel,
+            slot.activeSession.lastActiveAt,
+            slot.activeSession.deviceName,
+          );
+        }
+        const now = new Date();
+        await tx.appClientSession.update({
+          where: { id: slot.activeSession.id },
+          data: {
+            status: AppClientSessionStatus.REVOKED,
+            revokedAt: now,
+            revokeReason: 'Replaced by explicit login from another installation',
+          },
+        });
+      } else {
+        const now = new Date();
+        const session = await tx.appClientSession.update({
+          where: { id: slot.activeSession.id },
+          data: {
+            lastActiveAt: now,
+            deviceId: input.deviceId ?? slot.activeSession.deviceId,
+            deviceName: input.deviceName ?? slot.activeSession.deviceName,
+            platform: input.platform ?? slot.activeSession.platform,
+            appVersion: input.appVersion ?? slot.activeSession.appVersion,
+          },
+        });
+        await tx.appClientSlot.update({
+          where: { id: slot.id },
+          data: {
+            status: 'ACTIVE',
+            lastActiveAt: now,
+            deviceId: input.deviceId ?? slot.deviceId,
+            deviceName: input.deviceName ?? slot.deviceName,
+            platform: input.platform ?? slot.platform,
+            appVersion: input.appVersion ?? slot.appVersion,
+          },
+        });
+        return { session, resumed: true };
       }
-
-      const now = new Date();
-      const session = await tx.appClientSession.update({
-        where: { id: slot.activeSession.id },
-        data: {
-          lastActiveAt: now,
-          deviceId: input.deviceId ?? slot.activeSession.deviceId,
-          deviceName: input.deviceName ?? slot.activeSession.deviceName,
-          platform: input.platform ?? slot.activeSession.platform,
-          appVersion: input.appVersion ?? slot.activeSession.appVersion,
-        },
-      });
-      await tx.appClientSlot.update({
-        where: { id: slot.id },
-        data: {
-          status: 'ACTIVE',
-          lastActiveAt: now,
-          deviceId: input.deviceId ?? slot.deviceId,
-          deviceName: input.deviceName ?? slot.deviceName,
-          platform: input.platform ?? slot.platform,
-          appVersion: input.appVersion ?? slot.appVersion,
-        },
-      });
-      return { session, resumed: true };
     }
 
     if (!slot) {

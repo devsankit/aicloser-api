@@ -30,6 +30,169 @@ async function agentForRequest(req: Request) {
   return agent;
 }
 
+const mobileContactSchema = z.object({
+  name: z.string().trim().min(1, 'Contact name is required').max(160),
+  phone: z.string().trim().min(5, 'Contact phone is required').max(40),
+  email: z.string().trim().email('A valid email is required').max(320).optional().or(z.literal('')),
+  source: z.string().trim().min(1).max(80).default('MOBILE_MANUAL'),
+  tags: z.array(z.string().trim().min(1).max(80)).max(30).default([]),
+  notes: z.string().trim().max(5000).optional(),
+});
+
+const mobileContactsRequestSchema = z.union([
+  z.object({ contacts: z.array(mobileContactSchema).min(1).max(100) }),
+  z.object({ contact: mobileContactSchema }),
+  mobileContactSchema,
+]);
+
+function normalizeMobilePhone(rawPhone: string) {
+  const trimmed = rawPhone.trim();
+  const digits = trimmed.replace(/\D/g, '');
+  if (digits.length < 7 || digits.length > 15) throw new Error('Phone must contain 7 to 15 digits.');
+  if (trimmed.startsWith('+')) return `+${digits}`;
+  if (trimmed.startsWith('00')) return `+${digits.slice(2)}`;
+  if (digits.length === 10) return `+91${digits}`;
+  if (digits.startsWith('91') || digits.startsWith('1')) return `+${digits}`;
+  return `+91${digits}`;
+}
+
+function contactResult(lead: {
+  id: string;
+  customerName: string;
+  customerPhone: string | null;
+  customerEmail: string | null;
+  stage: string;
+  tags: string[];
+  notes: string | null;
+}, marketingContact: { id: string }) {
+  return {
+    id: lead.id,
+    leadId: lead.id,
+    marketingContactId: marketingContact.id,
+    name: lead.customerName,
+    phone: lead.customerPhone ?? '',
+    email: lead.customerEmail ?? '',
+    stage: lead.stage,
+    tags: lead.tags,
+    notes: lead.notes ?? '',
+  };
+}
+
+mobileRouter.post('/contacts', validateBody(mobileContactsRequestSchema), async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const agent = await agentForRequest(req).catch(() => null);
+  if (!agent) {
+    res.status(403).json({ success: false, error: 'Forbidden', message: 'Active sales agent profile required' });
+    return;
+  }
+
+  const parsed = req.body as z.infer<typeof mobileContactsRequestSchema>;
+  const contacts = 'contacts' in parsed ? parsed.contacts : 'contact' in parsed ? [parsed.contact] : [parsed];
+  const results: Array<Record<string, unknown>> = [];
+
+  for (const input of contacts) {
+    try {
+      const e164Phone = normalizeMobilePhone(input.phone);
+      const email = input.email?.trim().toLowerCase() || null;
+      const tags = Array.from(new Set(['Mobile Contact', ...input.tags]));
+
+      const marketingContact = await prisma.marketingContact.upsert({
+        where: { tenantId_e164Phone: { tenantId, e164Phone } },
+        update: {
+          fullName: input.name,
+          email,
+          source: input.source,
+          assignedAgentId: agent.id,
+          tags: { push: tags },
+          updatedAt: new Date(),
+        },
+        create: {
+          tenantId,
+          fullName: input.name,
+          e164Phone,
+          email,
+          source: input.source,
+          assignedAgentId: agent.id,
+          tags,
+        },
+      });
+
+      const existing = await prisma.salesLeadAssignment.findFirst({
+        where: {
+          tenantId,
+          assignedAgentId: agent.id,
+          OR: [
+            { customerPhone: e164Phone },
+            ...(email ? [{ customerEmail: email }] : []),
+          ],
+        },
+        orderBy: { updatedAt: 'desc' },
+        select: { id: true, customerName: true, customerPhone: true, customerEmail: true, stage: true, tags: true, notes: true },
+      });
+
+      if (existing) {
+        const lead = await prisma.salesLeadAssignment.update({
+          where: { id: existing.id },
+          data: {
+            customerName: input.name,
+            customerPhone: e164Phone,
+            customerEmail: email ?? existing.customerEmail,
+            source: input.source,
+            tags: Array.from(new Set([...(existing.tags ?? []), ...tags])),
+            notes: input.notes ?? existing.notes,
+          },
+          select: { id: true, customerName: true, customerPhone: true, customerEmail: true, stage: true, tags: true, notes: true },
+        });
+        results.push({ ok: true, created: false, updated: true, contact: contactResult(lead, marketingContact) });
+        continue;
+      }
+
+      const lead = await prisma.salesLeadAssignment.create({
+        data: {
+          tenantId,
+          assignedAgentId: agent.id,
+          createdById: req.user?.userId,
+          customerName: input.name,
+          customerPhone: e164Phone,
+          customerEmail: email,
+          source: input.source,
+          serviceInterest: 'Mobile Contact',
+          segment: 'CRM Contact',
+          priority: 'normal',
+          tags,
+          notes: input.notes,
+          stage: 'NEW',
+        },
+        select: { id: true, customerName: true, customerPhone: true, customerEmail: true, stage: true, tags: true, notes: true },
+      });
+
+      await prisma.salesActivityLog.create({
+        data: {
+          tenantId,
+          assignmentId: lead.id,
+          actorUserId: req.user?.userId,
+          action: 'LEAD_CREATED',
+          note: 'Contact synced from mobile CRM.',
+        },
+      });
+      results.push({ ok: true, created: true, updated: false, contact: contactResult(lead, marketingContact) });
+    } catch (error) {
+      results.push({ ok: false, error: error instanceof Error ? error.message : 'Contact sync failed.' });
+    }
+  }
+
+  const failed = results.filter((result) => !result.ok);
+  res.status(failed.length === results.length ? 422 : 200).json({
+    success: failed.length === 0,
+    data: {
+      created: results.filter((result) => result.created === true).length,
+      updated: results.filter((result) => result.updated === true).length,
+      skipped: failed.length,
+      contacts: results,
+    },
+  });
+});
+
 mobileRouter.post('/devices', validateBody(deviceSchema), async (req: Request, res: Response) => {
   try {
     const agent = await agentForRequest(req);

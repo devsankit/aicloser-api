@@ -20,6 +20,8 @@ const loginSchema = z.object({
   deviceName: z.string().max(200).optional(),
   platform: z.string().max(80).optional(),
   appVersion: z.string().max(80).optional(),
+  replaceExisting: z.boolean().optional(),
+  force: z.boolean().optional(),
 });
 
 function passwordsMatch(password: string, salt: string, expectedHash: string) {
@@ -95,6 +97,7 @@ authRouter.post('/login', validateBody(loginSchema), async (req: Request, res: R
       deviceName: deviceName ?? null,
       platform: platform ?? (clientType === 'MOBILE' ? 'ANDROID' : 'WEB'),
       appVersion: appVersion ?? null,
+      replaceExisting: req.body.replaceExisting !== false,
     });
   } catch (error) {
     if (error instanceof ClientSlotOccupiedError) {
