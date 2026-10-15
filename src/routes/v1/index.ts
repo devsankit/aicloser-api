@@ -15,6 +15,7 @@ import { paymentsRouter } from './payments.js';
 import { reportsRouter } from './reports.js';
 import { teamRouter } from './team.js';
 import { stagesRouter } from './stages.js';
+import { googleDriveRouter } from './google-drive.js';
 
 export const v1Router = Router();
 
@@ -35,3 +36,4 @@ v1Router.use('/payments', paymentsRouter);
 v1Router.use('/reports', reportsRouter);
 v1Router.use('/team', teamRouter);
 v1Router.use('/stages', stagesRouter);
+v1Router.use('/integrations/google-drive', googleDriveRouter);

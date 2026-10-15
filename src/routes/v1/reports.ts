@@ -7,7 +7,7 @@ export const reportsRouter = Router();
 
 reportsRouter.use(authenticate, enforceTenantIsolation);
 
-reportsRouter.get('/summary', async (req: Request, res: Response) => {
+const getSummaryHandler = async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
 
   const [
@@ -54,8 +54,13 @@ reportsRouter.get('/summary', async (req: Request, res: Response) => {
       totalCalls,
       totalCallHours,
     },
+    error: null,
   });
-});
+};
+
+// Support both /summary and /overview routes
+reportsRouter.get('/summary', getSummaryHandler);
+reportsRouter.get('/overview', getSummaryHandler);
 
 reportsRouter.get('/closers', async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
@@ -117,5 +122,6 @@ reportsRouter.get('/closers', async (req: Request, res: Response) => {
   res.json({
     success: true,
     data: leaderboard,
+    error: null,
   });
 });

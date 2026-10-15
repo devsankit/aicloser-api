@@ -5,6 +5,7 @@ import { authenticate } from '../../middlewares/auth.js';
 import { enforceTenantIsolation } from '../../middlewares/tenant-isolation.js';
 import { validateBody, validateQuery } from '../../middlewares/validate.js';
 import { SalesLeadStage } from '@prisma/client';
+import { persistApiRealtimeEvent } from '../../lib/realtime.js';
 
 export const leadsRouter = Router();
 
@@ -147,7 +148,14 @@ leadsRouter.post('/', validateBody(createLeadSchema), async (req: Request, res: 
     },
   });
 
-  res.status(201).json({ success: true, data: lead });
+  await persistApiRealtimeEvent({
+    tenantId,
+    eventType: 'lead.created',
+    payload: lead,
+    actorUserId: req.user?.userId,
+  }).catch(() => undefined);
+
+  res.status(201).json({ success: true, data: lead, error: null });
 });
 
 leadsRouter.get('/pipeline-aggregates', async (req: Request, res: Response) => {
@@ -329,32 +337,75 @@ leadsRouter.get('/:id/360', async (req: Request, res: Response) => {
     return;
   }
 
-  // Find associated conversation by customerPhone
-  const conversation = lead.customerPhone ? await prisma.appConversation.findFirst({
-    where: { tenantId, customerPhone: lead.customerPhone },
-    select: { id: true, status: true, updatedAt: true, payload: true },
-  }) : null;
+  // 1. Prioritize direct conversationId on lead, fallback to phone
+  let conversation = null;
+  if (lead.conversationId) {
+    conversation = await prisma.appConversation.findFirst({
+      where: { id: lead.conversationId, tenantId },
+      select: { id: true, status: true, updatedAt: true, payload: true },
+    });
+  }
+  if (!conversation && lead.customerPhone) {
+    conversation = await prisma.appConversation.findFirst({
+      where: { tenantId, customerPhone: lead.customerPhone },
+      select: { id: true, status: true, updatedAt: true, payload: true },
+    });
+    if (conversation) {
+      await prisma.salesLeadAssignment.update({
+        where: { id: lead.id },
+        data: { conversationId: conversation.id },
+      }).catch(() => undefined);
+    }
+  }
 
-  // Find associated payments by customerPhone
+  // 2. Prioritize payments associated directly with this leadId in customFields, fallback to customerPhone
   const payments = await prisma.upiPaymentLink.findMany({
-    where: { tenantId, customerPhone: lead.customerPhone },
+    where: {
+      tenantId,
+      OR: [
+        { customFields: { path: ['leadId'], equals: id } },
+        ...(lead.customerPhone ? [{ customerPhone: lead.customerPhone }] : []),
+      ],
+    },
     orderBy: { id: 'desc' },
     take: 10,
   });
+
+  const rawMessages = Array.isArray((conversation?.payload as any)?.messages)
+    ? (conversation!.payload as any).messages
+    : [];
+  const lastMessage = rawMessages.length > 0 ? rawMessages[rawMessages.length - 1] : null;
 
   res.json({
     success: true,
     data: {
       lead,
+      assignedAgent: lead.assignedAgent ? {
+        id: lead.assignedAgent.id,
+        agentCode: lead.assignedAgent.agentCode,
+        displayName: lead.assignedAgent.user?.displayName,
+        email: lead.assignedAgent.user?.email,
+        phone: lead.assignedAgent.user?.phone,
+      } : null,
+      timelineNotes: timeline,
       timeline,
       tasks,
+      callLogs: calls,
       calls,
+      activeConversation: conversation ? {
+        id: conversation.id,
+        status: conversation.status,
+        updatedAt: conversation.updatedAt,
+        unreadCount: 0,
+        lastMessage,
+      } : null,
       conversation: conversation ? {
         id: conversation.id,
         status: conversation.status,
         updatedAt: conversation.updatedAt,
       } : null,
       payments,
+      customFieldDefinitions: customFieldsDef,
       customFieldsDefinition: customFieldsDef,
     },
     error: null,
@@ -469,7 +520,21 @@ leadsRouter.patch('/:id', validateBody(updateLeadSchema), async (req: Request, r
     },
   });
 
-  res.json({ success: true, data: updated });
+  await persistApiRealtimeEvent({
+    tenantId,
+    eventType: 'lead.stage_changed',
+    payload: {
+      id: updated.id,
+      stage: updated.stage,
+      kanbanPosition: updated.kanbanPosition,
+      priority: updated.priority,
+      budgetAmount: updated.budgetAmount,
+      updatedAt: updated.updatedAt,
+    },
+    actorUserId: req.user?.userId,
+  }).catch(() => undefined);
+
+  res.json({ success: true, data: updated, error: null });
 });
 
 leadsRouter.delete('/:id', async (req: Request, res: Response) => {
@@ -539,7 +604,18 @@ leadsRouter.post('/:id/claim', async (req: Request, res: Response) => {
     },
   });
 
-  res.json({ success: true, data: updated, message: 'Lead claimed successfully' });
+  await persistApiRealtimeEvent({
+    tenantId,
+    eventType: 'lead.claimed',
+    payload: {
+      id: updated.id,
+      assignedAgentId: profile.id,
+      agentCode: profile.agentCode,
+    },
+    actorUserId: req.user?.userId,
+  }).catch(() => undefined);
+
+  res.json({ success: true, data: updated, message: 'Lead claimed successfully', error: null });
 });
 
 // GET /:id/notes - Get internal notes for a lead

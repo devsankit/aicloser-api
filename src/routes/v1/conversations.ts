@@ -1,3 +1,5 @@
+import multer from 'multer';
+import { persistApiRealtimeEvent } from '../../lib/realtime.js';
 import fs from 'fs';
 import { Router, Request, Response } from 'express';
 import { z } from 'zod';
@@ -10,6 +12,8 @@ import { validateBody, validateQuery } from '../../middlewares/validate.js';
 
 import path from 'path';
 export const conversationsRouter = Router();
+
+const upload = multer({ limits: { fileSize: 25 * 1024 * 1024 }, storage: multer.memoryStorage() });
 
 conversationsRouter.use(authenticate, enforceTenantIsolation);
 
@@ -320,7 +324,19 @@ conversationsRouter.post('/:id/messages', validateBody(sendMessageSchema), async
     },
   });
 
-  res.status(201).json({ success: true, data: newMessage });
+  await persistApiRealtimeEvent({
+    tenantId,
+    eventType: 'message.received',
+    payload: {
+      conversationId: conversation.id,
+      customerPhone: conversation.customerPhone,
+      customerName: conversation.customerName,
+      message: newMessage,
+    },
+    actorUserId: req.user?.userId,
+  }).catch(() => undefined);
+
+  res.status(201).json({ success: true, data: newMessage, error: null });
 });
 
 // 5. POST /:id/read - Mark conversation read
@@ -372,21 +388,9 @@ conversationsRouter.get('/:id', async (req: Request, res: Response) => {
 });
 
 // 7. POST /:id/attachments - Upload chat attachment (Image, PDF, Document)
-conversationsRouter.post('/:id/attachments', async (req: Request, res: Response) => {
+conversationsRouter.post('/:id/attachments', upload.single('file'), async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const id = String(req.params.id);
-  const { name, mimeType, sizeBytes, base64Data, externalUrl } = req.body as {
-    name: string;
-    mimeType?: string;
-    sizeBytes?: number;
-    base64Data?: string;
-    externalUrl?: string;
-  };
-
-  if (!name) {
-    res.status(400).json({ success: false, data: null, error: 'InvalidRequest', message: 'Attachment name is required' });
-    return;
-  }
 
   const conversation = await prisma.appConversation.findFirst({
     where: { id, tenantId },
@@ -398,12 +402,50 @@ conversationsRouter.post('/:id/attachments', async (req: Request, res: Response)
   }
 
   const fileId = `att-${randomUUID().slice(0, 10)}`;
+  const uploadDir = path.resolve(process.cwd(), 'data', 'uploads', 'attachments', id);
+  fs.mkdirSync(uploadDir, { recursive: true });
+
+  // Option A: Multipart FormData file
+  if (req.file) {
+    const safeFilename = `${fileId}-${req.file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_')}`;
+    const filePath = path.join(uploadDir, safeFilename);
+    fs.writeFileSync(filePath, req.file.buffer);
+    const fileUrl = `https://api.aicloser.in/api/v1/conversations/${id}/attachments/${safeFilename}`;
+
+    res.status(201).json({
+      success: true,
+      data: {
+        id: fileId,
+        name: req.file.originalname,
+        mimeType: req.file.mimetype || 'application/octet-stream',
+        sizeBytes: req.file.size,
+        url: fileUrl,
+        externalUrl: fileUrl,
+      },
+      error: null,
+    });
+    return;
+  }
+
+  // Option B: JSON payload with base64Data or externalUrl
+  const { name, mimeType, sizeBytes, base64Data, externalUrl } = req.body as {
+    name?: string;
+    mimeType?: string;
+    sizeBytes?: number;
+    base64Data?: string;
+    externalUrl?: string;
+  };
+
+  if (!name && !externalUrl) {
+    res.status(400).json({ success: false, data: null, error: 'InvalidRequest', message: 'Attachment file or name is required' });
+    return;
+  }
+
   let fileUrl = externalUrl || '';
+  const finalName = name || 'attachment';
 
   if (base64Data) {
-    const uploadDir = path.resolve(process.cwd(), 'data', 'uploads', 'attachments', id);
-    fs.mkdirSync(uploadDir, { recursive: true });
-    const safeFilename = `${fileId}-${name.replace(/[^a-zA-Z0-9._-]/g, '_')}`;
+    const safeFilename = `${fileId}-${finalName.replace(/[^a-zA-Z0-9._-]/g, '_')}`;
     const filePath = path.join(uploadDir, safeFilename);
     const buffer = Buffer.from(base64Data.replace(/^data:.*,/, ''), 'base64');
     fs.writeFileSync(filePath, buffer);
@@ -414,16 +456,16 @@ conversationsRouter.post('/:id/attachments', async (req: Request, res: Response)
     success: true,
     data: {
       id: fileId,
-      name,
+      name: finalName,
       mimeType: mimeType || 'application/octet-stream',
       sizeBytes: sizeBytes || 0,
       url: fileUrl,
+      externalUrl: fileUrl,
     },
     error: null,
   });
 });
 
-// 8. GET /:id/attachments/:filename - Securely stream/preview chat attachment
 conversationsRouter.get('/:id/attachments/:filename', async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const { id, filename } = req.params;

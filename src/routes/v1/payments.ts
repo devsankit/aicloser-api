@@ -1,3 +1,4 @@
+import { persistApiRealtimeEvent } from '../../lib/realtime.js';
 import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import { randomUUID } from 'crypto';
@@ -95,9 +96,23 @@ paymentsRouter.post('/', validateBody(createPaymentSchema), async (req: Request,
       customerEmail: body.customerEmail,
       productName: body.productName,
       customerNote: body.customerNote,
+      customFields: body.leadId ? { leadId: body.leadId } : undefined,
       status: UpiPaymentLinkStatus.PENDING,
     },
   });
+
+  await persistApiRealtimeEvent({
+    tenantId,
+    eventType: 'payment.created',
+    payload: {
+      paymentId: payment.id,
+      leadId: body.leadId,
+      amount: payment.totalAmount,
+      customerName: payment.customerName,
+      customerPhone: payment.customerPhone,
+    },
+    actorUserId: req.user?.userId,
+  }).catch(() => undefined);
 
   const paymentUrl = "https://app.aicloser.in/pay/" + payment.publicToken;
 
@@ -132,7 +147,19 @@ paymentsRouter.post('/:id/approve', async (req: Request, res: Response) => {
     },
   });
 
-  res.json({ success: true, data: updated, message: 'Payment verified and approved successfully' });
+  await persistApiRealtimeEvent({
+    tenantId,
+    eventType: 'payment.confirmed',
+    payload: {
+      paymentId: updated.id,
+      amount: updated.totalAmount,
+      customerName: updated.customerName,
+      customerPhone: updated.customerPhone,
+    },
+    actorUserId: req.user?.userId,
+  }).catch(() => undefined);
+
+  res.json({ success: true, data: updated, message: 'Payment verified and approved successfully', error: null });
 });
 
 paymentsRouter.post('/:id/reject', async (req: Request, res: Response) => {
