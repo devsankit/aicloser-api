@@ -126,16 +126,6 @@ callsRouter.post('/', validateBody(logCallSchema), async (req: Request, res: Res
     return;
   }
 
-  // Verify agent belongs to same tenant
-  const agent = await prisma.salesAgentProfile.findFirst({
-    where: { id: body.agentId, tenantId },
-  });
-
-  if (!agent) {
-    res.status(400).json({ success: false, error: 'InvalidAgent', message: 'Assigned agent does not exist within your workspace' });
-    return;
-  }
-
   // Strict closer scoping: SALES_AGENT can only log calls for themselves
   if (req.user?.role === 'SALES_AGENT') {
     const profile = await prisma.salesAgentProfile.findFirst({
@@ -146,6 +136,16 @@ callsRouter.post('/', validateBody(logCallSchema), async (req: Request, res: Res
       res.status(403).json({ success: false, error: 'Forbidden', message: 'You cannot log calls on behalf of another agent' });
       return;
     }
+  }
+
+  // Verify agent belongs to same tenant
+  const agent = await prisma.salesAgentProfile.findFirst({
+    where: { id: body.agentId, tenantId },
+  });
+
+  if (!agent) {
+    res.status(400).json({ success: false, error: 'InvalidAgent', message: 'Assigned agent does not exist within your workspace' });
+    return;
   }
 
   const call = await prisma.salesMobileCall.create({
