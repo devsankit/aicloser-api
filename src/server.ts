@@ -6,6 +6,7 @@ import { rateLimit } from 'express-rate-limit';
 import { env } from './config/env.js';
 import { v1Router } from './routes/v1/index.js';
 import { healthRouter } from './routes/health.js';
+import { mobileCompatRouter } from './routes/mobile-compat.js';
 import { logger } from './lib/logger.js';
 
 export function createServer() {
@@ -59,6 +60,8 @@ export function createServer() {
 
   // 6. Routes
   app.use('/health', healthRouter);
+  app.use('/sales/mobile', mobileCompatRouter);
+  app.use('/api/sales/mobile', mobileCompatRouter);
   app.use('/api/v1', v1Router);
 
   // 7. 404 Catch-All

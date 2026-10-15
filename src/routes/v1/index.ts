@@ -10,6 +10,7 @@ import { recordingsRouter } from './recordings.js';
 import { realtimeRouter } from './realtime.js';
 import { mobileRouter } from './mobile.js';
 import { adminUsersRouter, meSessionsRouter } from './client-sessions.js';
+import { customFieldsRouter } from './custom-fields.js';
 
 export const v1Router = Router();
 
@@ -25,3 +26,4 @@ v1Router.use('/realtime', realtimeRouter);
 v1Router.use('/mobile', mobileRouter);
 v1Router.use('/me', meSessionsRouter);
 v1Router.use('/admin/users', adminUsersRouter);
+v1Router.use('/custom-fields', customFieldsRouter);

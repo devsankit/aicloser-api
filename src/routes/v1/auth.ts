@@ -122,7 +122,7 @@ authRouter.post('/login', validateBody(loginSchema), async (req: Request, res: R
     role: user.role as AuthenticatedUser['role'],
     tenantId: user.tenantId,
     displayName: user.displayName,
-    phone: user.phone,
+    phone: user.phone ?? '',
     email: user.email,
     sessionId: clientSession.session.sessionId,
     clientType,
