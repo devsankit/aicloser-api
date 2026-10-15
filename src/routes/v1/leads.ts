@@ -151,6 +151,43 @@ leadsRouter.post('/', validateBody(createLeadSchema), async (req: Request, res: 
   res.status(201).json({ success: true, data: lead });
 });
 
+leadsRouter.get('/pipeline-aggregates', async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+
+  const aggregates = await prisma.salesLeadAssignment.groupBy({
+    by: ['stage'],
+    where: { tenantId },
+    _count: { id: true },
+    _sum: { budgetAmount: true },
+  });
+
+  const stageProbabilities: Record<string, number> = {
+    NEW: 0.1,
+    CONTACTED: 0.2,
+    IN_PROGRESS: 0.35,
+    DEMO_SCHEDULED: 0.5,
+    FOLLOW_UP: 0.6,
+    NEGOTIATION: 0.8,
+    CLOSED_WON: 1.0,
+    CLOSED_LOST: 0.0,
+  };
+
+  const results = aggregates.map((item) => {
+    const count = item._count?.id ?? 0;
+    const totalValue = Number(item._sum?.budgetAmount ?? 0);
+    const winProb = stageProbabilities[item.stage] ?? 0.2;
+    const weightedValue = Math.round(totalValue * winProb);
+    return {
+      stage: item.stage,
+      count,
+      totalValue,
+      weightedValue,
+    };
+  });
+
+  res.json({ success: true, data: results });
+});
+
 leadsRouter.get('/:id', async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const id = String(req.params.id);
