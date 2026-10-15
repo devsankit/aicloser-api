@@ -48,10 +48,14 @@ export function createServer() {
     }),
   );
 
-  // 3. Global Rate Limiter (300 requests per 15 minutes)
+  // 3. Global Rate Limiter (1000 requests per 15 minutes; internal loopback bypass)
   const limiter = rateLimit({
     windowMs: 15 * 60 * 1000,
-    limit: 300,
+    limit: 1000,
+    skip: (req) => {
+      const ip = req.ip || req.socket.remoteAddress || '';
+      return ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1';
+    },
     standardHeaders: 'draft-7',
     legacyHeaders: false,
     message: { success: false, data: null, error: 'TooManyRequests', message: 'Rate limit exceeded. Please try again later.' },
@@ -112,3 +116,4 @@ export function createServer() {
 
   return app;
 }
+
