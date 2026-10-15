@@ -36,7 +36,17 @@ leadsRouter.get('/', validateQuery(listLeadsQuerySchema), async (req: Request, r
   };
 
   if (stage) where.stage = stage;
-  if (assignedAgentId) where.assignedAgentId = assignedAgentId;
+
+  // Strict closer scoping: SALES_AGENT can only see their own assigned leads
+  if (req.user?.role === 'SALES_AGENT') {
+    const profile = await prisma.salesAgentProfile.findFirst({
+      where: { userId: req.user.userId, tenantId },
+      select: { id: true },
+    });
+    where.assignedAgentId = profile?.id ?? '__NO_ACCESS__';
+  } else if (assignedAgentId) {
+    where.assignedAgentId = assignedAgentId;
+  }
 
   if (search) {
     where.OR = [
@@ -145,8 +155,17 @@ leadsRouter.get('/:id', async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const id = String(req.params.id);
 
+  const where: Record<string, unknown> = { id, tenantId };
+  if (req.user?.role === 'SALES_AGENT') {
+    const profile = await prisma.salesAgentProfile.findFirst({
+      where: { userId: req.user.userId, tenantId },
+      select: { id: true },
+    });
+    where.assignedAgentId = profile?.id ?? '__NO_ACCESS__';
+  }
+
   const lead = await prisma.salesLeadAssignment.findFirst({
-    where: { id, tenantId },
+    where,
     include: {
       assignedAgent: {
         select: {
@@ -200,7 +219,23 @@ leadsRouter.patch('/:id', validateBody(updateLeadSchema), async (req: Request, r
     return;
   }
 
-  // If reassigning, verify target agent belongs to same tenant
+  // Strict closer scoping: Closers can only update leads assigned to them and cannot reassign
+  if (req.user?.role === 'SALES_AGENT') {
+    const profile = await prisma.salesAgentProfile.findFirst({
+      where: { userId: req.user.userId, tenantId },
+      select: { id: true },
+    });
+    if (existing.assignedAgentId !== profile?.id) {
+      res.status(403).json({ success: false, error: 'Forbidden', message: 'You can only update leads assigned to you' });
+      return;
+    }
+    if (body.assignedAgentId && body.assignedAgentId !== existing.assignedAgentId) {
+      res.status(403).json({ success: false, error: 'Forbidden', message: 'Only workspace administrators can reassign leads' });
+      return;
+    }
+  }
+
+  // If reassigning (admin/manager), verify target agent belongs to same tenant
   if (body.assignedAgentId && body.assignedAgentId !== existing.assignedAgentId) {
     const targetAgent = await prisma.salesAgentProfile.findFirst({
       where: { id: body.assignedAgentId, tenantId },
@@ -225,6 +260,12 @@ leadsRouter.patch('/:id', validateBody(updateLeadSchema), async (req: Request, r
 leadsRouter.delete('/:id', async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const id = String(req.params.id);
+
+  // Closers cannot delete leads
+  if (req.user?.role === 'SALES_AGENT') {
+    res.status(403).json({ success: false, error: 'Forbidden', message: 'Only workspace administrators can delete leads' });
+    return;
+  }
 
   const existing = await prisma.salesLeadAssignment.findFirst({
     where: { id, tenantId },

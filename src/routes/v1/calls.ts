@@ -35,7 +35,17 @@ callsRouter.get('/', validateQuery(listCallsQuerySchema), async (req: Request, r
   const where: Prisma.SalesMobileCallWhereInput = { tenantId };
 
   if (phoneNumber) where.phoneNumber = phoneNumber;
-  if (agentId) where.agentId = agentId;
+
+  // Strict closer scoping: SALES_AGENT can only view calls they logged
+  if (req.user?.role === 'SALES_AGENT') {
+    const profile = await prisma.salesAgentProfile.findFirst({
+      where: { userId: req.user.userId, tenantId },
+      select: { id: true },
+    });
+    where.agentId = profile?.id ?? '__NO_ACCESS__';
+  } else if (agentId) {
+    where.agentId = agentId;
+  }
   if (recordingStatus) where.recordingStatus = recordingStatus as Prisma.EnumSalesMobileRecordingStatusFilter;
   if (search) {
     where.OR = [

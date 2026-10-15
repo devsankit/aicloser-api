@@ -129,6 +129,23 @@ recordingsRouter.get('/:id/playback', async (req: Request, res: Response) => {
     res.status(404).json({ success: false, error: 'NotFound', message: 'Uploaded recording not found in this workspace' });
     return;
   }
+
+  // Strict closer scoping: Closers can only listen to recordings of calls they conducted
+  if (req.user?.role === 'SALES_AGENT') {
+    const profile = await prisma.salesAgentProfile.findFirst({
+      where: { userId: req.user.userId, tenantId: req.tenantId! },
+      select: { id: true },
+    });
+    const call = await prisma.salesMobileCall.findFirst({
+      where: { id: upload.callId, tenantId: req.tenantId! },
+      select: { agentId: true },
+    });
+    if (call?.agentId !== profile?.id) {
+      res.status(403).json({ success: false, error: 'Forbidden', message: 'You can only listen to recordings for your own calls' });
+      return;
+    }
+  }
+
   const playback = await getRecordingPlayback({ objectKey: upload.objectKey, contentType: upload.mimeType });
   if (playback.mode === 's3') {
     res.json({ success: true, data: { url: playback.url, expiresIn: 300 } });
