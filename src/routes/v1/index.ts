@@ -16,9 +16,14 @@ import { reportsRouter } from './reports.js';
 import { teamRouter } from './team.js';
 import { stagesRouter } from './stages.js';
 import { googleDriveRouter } from './google-drive.js';
+import { workspaceRouter } from './workspace.js';
+import { integrationsRouter } from './integrations.js';
+import { marketingRouter } from './marketing.js';
+import { aiRouter } from './ai.js';
 
 export const v1Router = Router();
 
+// Core Canonical V1 API Domains
 v1Router.use('/auth', authRouter);
 v1Router.use('/leads', leadsRouter);
 v1Router.use('/contacts', contactsRouter);
@@ -36,4 +41,16 @@ v1Router.use('/payments', paymentsRouter);
 v1Router.use('/reports', reportsRouter);
 v1Router.use('/team', teamRouter);
 v1Router.use('/stages', stagesRouter);
+
+// Workspace Plan & Entitlements
+v1Router.use('/workspace', workspaceRouter);
+
+// Integrations (WhatsApp, Instagram, Google Drive)
+v1Router.use('/integrations', integrationsRouter);
 v1Router.use('/integrations/google-drive', googleDriveRouter);
+
+// Marketing, Campaigns & Templates
+v1Router.use('/marketing', marketingRouter);
+
+// Dedicated AI Engine (Consultative Reply, Lead Scoring, Transcribe, Objection Handling, Copilot)
+v1Router.use('/ai', aiRouter);
