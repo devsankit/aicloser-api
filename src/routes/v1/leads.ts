@@ -4,7 +4,8 @@ import { prisma } from '../../lib/prisma.js';
 import { authenticate } from '../../middlewares/auth.js';
 import { enforceTenantIsolation } from '../../middlewares/tenant-isolation.js';
 import { validateBody, validateQuery } from '../../middlewares/validate.js';
-import { SalesLeadStage } from '@prisma/client';
+import { SalesLeadStage, salesLeadStageSchema } from '../../types/leads.js';
+import { hasPermission, requirePermissions, PERM_LEADS_REASSIGN } from '../../middlewares/rbac.js';
 import { persistApiRealtimeEvent } from '../../lib/realtime.js';
 
 export const leadsRouter = Router();
@@ -15,7 +16,7 @@ leadsRouter.use(authenticate, enforceTenantIsolation);
 const listLeadsQuerySchema = z.object({
   page: z.string().optional().transform((v) => (v ? Math.max(1, Number(v)) : 1)),
   limit: z.string().optional().transform((v) => (v ? Math.min(100, Math.max(1, Number(v))) : 25)),
-  stage: z.nativeEnum(SalesLeadStage).optional(),
+  stage: salesLeadStageSchema.optional(),
   search: z.string().optional(),
   assignedAgentId: z.string().optional(),
 });
@@ -98,7 +99,7 @@ const createLeadSchema = z.object({
   segment: z.string().optional(),
   priority: z.string().default('normal'),
   notes: z.string().optional(),
-  stage: z.nativeEnum(SalesLeadStage).default('NEW'),
+  stage: salesLeadStageSchema.default('NEW'),
   budgetAmount: z.number().optional(),
 });
 
@@ -535,7 +536,7 @@ leadsRouter.get('/:id', async (req: Request, res: Response) => {
 });
 
 const updateLeadSchema = z.object({
-  stage: z.nativeEnum(SalesLeadStage).optional(),
+  stage: salesLeadStageSchema.optional(),
   kanbanPosition: z.number().optional(),
   priority: z.string().optional(),
   notes: z.string().optional(),
@@ -574,8 +575,11 @@ leadsRouter.patch('/:id', validateBody(updateLeadSchema), async (req: Request, r
       return;
     }
     if (body.assignedAgentId && body.assignedAgentId !== existing.assignedAgentId) {
-      res.status(403).json({ success: false, error: 'Forbidden', message: 'Only workspace administrators can reassign leads' });
-      return;
+      const canReassign = await hasPermission(req.user.userId, tenantId, req.user.role, PERM_LEADS_REASSIGN);
+      if (!canReassign) {
+        res.status(403).json({ success: false, error: 'Forbidden', message: 'Only workspace administrators or authorized users can reassign leads' });
+        return;
+      }
     }
   }
 
@@ -925,5 +929,77 @@ leadsRouter.get('/delta', async (req: Request, res: Response) => {
       serverTime: new Date().toISOString(),
     },
     error: null,
+  });
+});
+
+
+const reassignLeadSchema = z.object({
+  assignedAgentId: z.string().min(1, 'Target assignedAgentId is required'),
+  reason: z.string().optional(),
+});
+
+// POST /:id/reassign - Dedicated lead reassignment endpoint
+leadsRouter.post('/:id/reassign', requirePermissions(PERM_LEADS_REASSIGN), validateBody(reassignLeadSchema), async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const id = String(req.params.id);
+  const { assignedAgentId, reason } = req.body as z.infer<typeof reassignLeadSchema>;
+
+  const lead = await prisma.salesLeadAssignment.findFirst({
+    where: { id, tenantId },
+  });
+
+  if (!lead) {
+    res.status(404).json({ success: false, error: 'NotFound', message: 'Lead not found in this workspace' });
+    return;
+  }
+
+  // Resolve target agent profile
+  const targetAgent = await prisma.salesAgentProfile.findFirst({
+    where: {
+      tenantId,
+      OR: [
+        { id: assignedAgentId },
+        { userId: assignedAgentId },
+      ],
+    },
+    include: { user: { select: { displayName: true } } },
+  });
+
+  if (!targetAgent) {
+    res.status(400).json({ success: false, error: 'InvalidAgent', message: 'Target agent not found in this workspace' });
+    return;
+  }
+
+  const updated = await prisma.salesLeadAssignment.update({
+    where: { id: lead.id },
+    data: {
+      assignedAgentId: targetAgent.id,
+      updatedAt: new Date(),
+    },
+  });
+
+  await prisma.salesActivityLog.create({
+    data: {
+      tenantId,
+      assignmentId: lead.id,
+      actorUserId: req.user?.userId,
+      action: 'LEAD_REASSIGNED',
+      note: `Lead reassigned to ${targetAgent.user.displayName || targetAgent.agentCode}${reason ? ': ' + reason : ''}`,
+      metadata: { previousAgentId: lead.assignedAgentId, newAgentId: targetAgent.id, reason },
+    },
+  }).catch(() => undefined);
+
+  await persistApiRealtimeEvent({
+    tenantId,
+    actorUserId: req.user?.userId,
+    audienceRoles: ['SUPER_ADMIN', 'ADMIN', 'MANAGER', 'SALES_AGENT'],
+    eventType: 'lead.reassigned',
+    payload: { id: lead.id, assignedAgentId: targetAgent.id, agentCode: targetAgent.agentCode },
+  }).catch(() => undefined);
+
+  res.json({
+    success: true,
+    data: updated,
+    message: `Lead successfully reassigned to ${targetAgent.user.displayName || targetAgent.agentCode}`,
   });
 });

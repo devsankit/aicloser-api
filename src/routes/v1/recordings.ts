@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { prisma } from '../../lib/prisma.js';
 import { authenticate } from '../../middlewares/auth.js';
 import { enforceTenantIsolation } from '../../middlewares/tenant-isolation.js';
+import { hasPermission, PERM_RECORDINGS_PLAY_ALL } from '../../middlewares/rbac.js';
 import { validateBody } from '../../middlewares/validate.js';
 import { createRecordingUploadUrl, getRecordingPlayback, recordingExists, recordingStorageMode, writeRecording } from '../../lib/recording-storage.js';
 
@@ -33,6 +34,18 @@ recordingsRouter.post('/init', validateBody(initSchema), async (req: Request, re
   if (!call) {
     res.status(404).json({ success: false, error: 'NotFound', message: 'Call not found in this workspace' });
     return;
+  }
+
+  // Ownership verification: SALES_AGENT can only upload recordings for their own calls
+  if (req.user?.role === 'SALES_AGENT') {
+    const profile = await prisma.salesAgentProfile.findFirst({
+      where: { userId: req.user.userId, tenantId },
+      select: { id: true },
+    });
+    if (!profile || call.agentId !== profile.id) {
+      res.status(403).json({ success: false, error: 'Forbidden', message: 'You can only upload recordings for your own calls' });
+      return;
+    }
   }
 
   const existing = await prisma.callRecordingUpload.findUnique({
@@ -141,19 +154,22 @@ recordingsRouter.get('/:id/playback', async (req: Request, res: Response) => {
     return;
   }
 
-  // Strict closer scoping: Closers can only listen to recordings of calls they conducted
+  // Strict closer scoping: Closers can only listen to recordings of calls they conducted unless granted permission
   if (req.user?.role === 'SALES_AGENT') {
-    const profile = await prisma.salesAgentProfile.findFirst({
-      where: { userId: req.user.userId, tenantId: req.tenantId! },
-      select: { id: true },
-    });
-    const call = await prisma.salesMobileCall.findFirst({
-      where: { id: upload.callId, tenantId: req.tenantId! },
-      select: { agentId: true },
-    });
-    if (call?.agentId !== profile?.id) {
-      res.status(403).json({ success: false, error: 'Forbidden', message: 'You can only listen to recordings for your own calls' });
-      return;
+    const canPlayAll = await hasPermission(req.user.userId, req.tenantId!, 'SALES_AGENT', PERM_RECORDINGS_PLAY_ALL);
+    if (!canPlayAll) {
+      const profile = await prisma.salesAgentProfile.findFirst({
+        where: { userId: req.user.userId, tenantId: req.tenantId! },
+        select: { id: true },
+      });
+      const call = await prisma.salesMobileCall.findFirst({
+        where: { id: upload.callId, tenantId: req.tenantId! },
+        select: { agentId: true },
+      });
+      if (!profile || call?.agentId !== profile.id) {
+        res.status(403).json({ success: false, error: 'Forbidden', message: 'You can only listen to recordings for your own calls' });
+        return;
+      }
     }
   }
 

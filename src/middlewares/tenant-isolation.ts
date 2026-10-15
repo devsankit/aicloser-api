@@ -75,7 +75,7 @@ export async function enforceTenantIsolation(req: Request, res: Response, next: 
     // Super admin without tenant context cannot access tenant-scoped resources
     res.status(400).json({
       success: false,
-      error: 'MissingTenantContext',
+      error: 'SuperAdminTenantContextRequired',
       message: 'Super Admin must specify x-target-tenant-id header with a valid workspace ID to access tenant resources',
     });
     return;

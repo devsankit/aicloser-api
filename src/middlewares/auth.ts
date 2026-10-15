@@ -73,7 +73,7 @@ export async function authenticate(req: Request, res: Response, next: NextFuncti
     const authenticatedUser: AuthenticatedUser = {
       userId: decoded.userId,
       role: role || 'SALES_AGENT',
-      tenantId: decoded.tenantId || req.tenantId || 'workspace-default',
+      tenantId: decoded.tenantId ? String(decoded.tenantId) : null,
       displayName: decoded.displayName || 'CRM User',
       email: decoded.email,
       phone: decoded.phone,

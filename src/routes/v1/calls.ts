@@ -4,7 +4,8 @@ import { prisma } from '../../lib/prisma.js';
 import { authenticate } from '../../middlewares/auth.js';
 import { enforceTenantIsolation } from '../../middlewares/tenant-isolation.js';
 import { validateBody, validateQuery } from '../../middlewares/validate.js';
-import { SalesMobileCallDirection, SalesMobileCallStatus, SalesLeadStage } from '@prisma/client';
+import { SalesMobileCallDirection, SalesMobileCallStatus } from '@prisma/client';
+import { SalesLeadStage, salesLeadStageSchema } from '../../types/leads.js';
 import { Prisma } from '@prisma/client';
 import { persistApiRealtimeEvent } from '../../lib/realtime.js';
 
@@ -36,13 +37,18 @@ callsRouter.get('/', validateQuery(listCallsQuerySchema), async (req: Request, r
 
   if (phoneNumber) where.phoneNumber = phoneNumber;
 
-  // Strict closer scoping: SALES_AGENT can only view calls they logged
+    // Strict closer scoping: SALES_AGENT can only view calls they logged unless they have calls:view_all permission
   if (req.user?.role === 'SALES_AGENT') {
     const profile = await prisma.salesAgentProfile.findFirst({
       where: { userId: req.user.userId, tenantId },
-      select: { id: true },
+      select: { id: true, permissions: true },
     });
-    where.agentId = profile?.id ?? '__NO_ACCESS__';
+    const perms = (profile?.permissions as Record<string, boolean> | null) || {};
+    if (perms['calls:view_all']) {
+      if (agentId) where.agentId = agentId;
+    } else {
+      where.agentId = profile?.id ?? '__NO_ACCESS__';
+    }
   } else if (agentId) {
     where.agentId = agentId;
   }
@@ -130,6 +136,18 @@ callsRouter.post('/', validateBody(logCallSchema), async (req: Request, res: Res
     return;
   }
 
+  // Strict closer scoping: SALES_AGENT can only log calls for themselves
+  if (req.user?.role === 'SALES_AGENT') {
+    const profile = await prisma.salesAgentProfile.findFirst({
+      where: { userId: req.user.userId, tenantId },
+      select: { id: true },
+    });
+    if (!profile || body.agentId !== profile.id) {
+      res.status(403).json({ success: false, error: 'Forbidden', message: 'You cannot log calls on behalf of another agent' });
+      return;
+    }
+  }
+
   const call = await prisma.salesMobileCall.create({
     data: {
       tenantId, // Root ownership strictly enforced
@@ -183,6 +201,18 @@ callsRouter.post('/:id/end', validateBody(endCallSchema), async (req: Request, r
     res.status(404).json({ success: false, error: 'NotFound', message: 'Call not found in this workspace' });
     return;
   }
+
+  // Ownership verification: SALES_AGENT can only end their own calls
+  if (req.user?.role === 'SALES_AGENT') {
+    const profile = await prisma.salesAgentProfile.findFirst({
+      where: { userId: req.user.userId, tenantId },
+      select: { id: true },
+    });
+    if (!profile || existing.agentId !== profile.id) {
+      res.status(403).json({ success: false, error: 'Forbidden', message: 'You are not authorized to update this call' });
+      return;
+    }
+  }
   const body = req.body as z.infer<typeof endCallSchema>;
   const call = await prisma.salesMobileCall.update({
     where: { id: existing.id },
@@ -209,7 +239,7 @@ const dispositionSchema = z.object({
   outcome: z.string().min(1, 'Outcome/disposition is required'),
   note: z.string().optional(),
   nextFollowUpAt: z.string().optional(),
-  stage: z.nativeEnum(SalesLeadStage).optional(),
+  stage: salesLeadStageSchema.optional(),
 });
 
 callsRouter.post('/:id/disposition', validateBody(dispositionSchema), async (req: Request, res: Response) => {

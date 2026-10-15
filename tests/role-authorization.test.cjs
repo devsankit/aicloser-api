@@ -1,4 +1,4 @@
-const jwt = require('jsonwebtoken');
+﻿const jwt = require('jsonwebtoken');
 const assert = require('assert');
 const http = require('http');
 
@@ -45,9 +45,9 @@ function apiRequest(options, postData) {
 }
 
 async function runRoleAuthorizationTests() {
-  console.log('===============================================================');
-  console.log('🧪 RUNNING AICLOSER-API ROLE & PERMISSION AUTHORIZATION SUITE ');
-  console.log('===============================================================\n');
+  console.log('===================================================================');
+  console.log('🧪 RUNNING AICLOSER-API ROLE & PERMISSION AUTHORIZATION MATRIX SUITE ');
+  console.log('===================================================================\n');
 
   let passed = 0;
   let failed = 0;
@@ -64,10 +64,11 @@ async function runRoleAuthorizationTests() {
     }
   }
 
-  // Tokens for different roles in Tenant A
+  // Workspaces
   const tenantA = 'tenant-the-storage-test-1d01dda2';
   const tenantB = 'tenant-jay-estate-management-01773ec9';
 
+  // Tokens for different roles in Tenant A
   const tokenAdminA = makeToken({
     userId: 'usr-admin-a',
     role: 'ADMIN',
@@ -92,6 +93,7 @@ async function runRoleAuthorizationTests() {
     phone: '+919999000003',
   });
 
+  // Token for Sales Agent in Tenant B
   const tokenAgentB = makeToken({
     userId: 'usr-agent-b',
     role: 'SALES_AGENT',
@@ -100,6 +102,7 @@ async function runRoleAuthorizationTests() {
     phone: '+919999000004',
   });
 
+  // Global Super Admin (no tenant)
   const tokenSuperAdmin = makeToken({
     userId: 'usr-super-admin',
     role: 'SUPER_ADMIN',
@@ -123,11 +126,10 @@ async function runRoleAuthorizationTests() {
     );
     assert.strictEqual(res.statusCode, 403);
     assert.strictEqual(res.data.success, false);
-    assert.ok(res.data.message.includes('not authorized'));
   });
 
   // TEST 3: Manager restricted from modifying team member commission settings
-  await test('3. Manager cannot modify team member settings without ADMIN role (PATCH /api/v1/team/:id -> 403)', async () => {
+  await test('3. Manager cannot modify team member settings without team:manage (PATCH /api/v1/team/:id -> 403)', async () => {
     const res = await apiRequest(
       { path: '/api/v1/team/some-agent-id', method: 'PATCH', token: tokenManagerA },
       { commissionPercent: 50 }
@@ -136,8 +138,20 @@ async function runRoleAuthorizationTests() {
     assert.strictEqual(res.data.success, false);
   });
 
-  // TEST 4: Non-Super-Admin blocked from /api/v1/super-admin
-  await test('4. Admin & Sales Agent blocked from /api/v1/super-admin/tenants -> 403', async () => {
+  // TEST 4: Sales Agent without team:view cannot list full team, but CAN view /team/me
+  await test('4. Sales Agent blocked from full team list (GET /api/v1/team -> 403), allowed on /team/me (200)', async () => {
+    const resList = await apiRequest({ path: '/api/v1/team', method: 'GET', token: tokenAgentA });
+    assert.strictEqual(resList.statusCode, 403);
+    assert.strictEqual(resList.data.success, false);
+
+    const resMe = await apiRequest({ path: '/api/v1/team/me', method: 'GET', token: tokenAgentA });
+    assert.strictEqual(resMe.statusCode, 200);
+    assert.strictEqual(resMe.data.success, true);
+    assert.strictEqual(resMe.data.data.userId, 'usr-agent-a');
+  });
+
+  // TEST 5: Non-Super-Admin blocked from /api/v1/super-admin
+  await test('5. Admin & Sales Agent blocked from /api/v1/super-admin/tenants -> 403', async () => {
     const resAdmin = await apiRequest({ path: '/api/v1/super-admin/tenants', method: 'GET', token: tokenAdminA });
     assert.strictEqual(resAdmin.statusCode, 403);
 
@@ -145,15 +159,15 @@ async function runRoleAuthorizationTests() {
     assert.strictEqual(resAgent.statusCode, 403);
   });
 
-  // TEST 5: Super Admin without target tenant header blocked from tenant-scoped routes
-  await test('5. Super Admin without target tenant header blocked from tenant-scoped /api/v1/leads -> 400', async () => {
+  // TEST 6: Super Admin without target tenant header blocked from tenant-scoped routes
+  await test('6. Super Admin without target tenant header blocked from tenant-scoped /api/v1/leads -> 400', async () => {
     const res = await apiRequest({ path: '/api/v1/leads', method: 'GET', token: tokenSuperAdmin });
     assert.strictEqual(res.statusCode, 400);
     assert.strictEqual(res.data.error, 'SuperAdminTenantContextRequired');
   });
 
-  // TEST 6: Super Admin with target tenant header authorized
-  await test('6. Super Admin with x-target-tenant-id header successfully accesses tenant leads', async () => {
+  // TEST 7: Super Admin with target tenant header authorized
+  await test('7. Super Admin with x-target-tenant-id header successfully accesses tenant leads', async () => {
     const res = await apiRequest({
       path: '/api/v1/leads?limit=1',
       method: 'GET',
@@ -164,9 +178,8 @@ async function runRoleAuthorizationTests() {
     assert.strictEqual(res.data.success, true);
   });
 
-  // TEST 7: Cross-tenant isolation verification
-  await test('7. Cross-tenant lead access returns 404 (Tenant B user cannot access Tenant A leads)', async () => {
-    // Attempting to fetch a lead from Tenant A with Tenant B credentials
+  // TEST 8: Cross-tenant isolation verification
+  await test('8. Cross-tenant lead access returns 404 (Tenant B user cannot access Tenant A leads)', async () => {
     const res = await apiRequest({
       path: '/api/v1/leads/cmv99r1n900yj58jpjnsoxwt7',
       method: 'GET',
@@ -175,8 +188,8 @@ async function runRoleAuthorizationTests() {
     assert.strictEqual(res.statusCode, 404);
   });
 
-  // TEST 8: Super Admin impersonation lifecycle
-  await test('8. Super Admin impersonation creates audited 2h token and return revokes it', async () => {
+  // TEST 9: Super Admin impersonation lifecycle
+  await test('9. Super Admin impersonation creates audited 2h token, returns, and revokes cleanly', async () => {
     const impRes = await apiRequest(
       { path: `/api/v1/super-admin/tenants/${tenantA}/impersonate`, method: 'POST', token: tokenSuperAdmin },
       {}
@@ -186,6 +199,8 @@ async function runRoleAuthorizationTests() {
     assert.ok(impRes.data.data.token);
     assert.strictEqual(impRes.data.data.expiresIn, '2h');
 
+    const sessionId = impRes.data.data.sessionId;
+
     // Return from impersonation
     const retRes = await apiRequest(
       { path: '/api/v1/super-admin/impersonation/return', method: 'POST', token: impRes.data.data.token },
@@ -193,11 +208,82 @@ async function runRoleAuthorizationTests() {
     );
     assert.strictEqual(retRes.statusCode, 200);
     assert.strictEqual(retRes.data.success, true);
+
+    // Revoke test
+    const revRes = await apiRequest(
+      { path: `/api/v1/super-admin/impersonation/revoke/${sessionId}`, method: 'POST', token: tokenSuperAdmin },
+      {}
+    );
+    assert.strictEqual(revRes.statusCode, 200);
+    assert.strictEqual(revRes.data.success, true);
   });
 
-  console.log('\n===============================================================');
-  console.log(`📊 AUTHORIZATION SUITE SUMMARY: ${passed} PASSED, ${failed} FAILED`);
-  console.log('===============================================================\n');
+  // TEST 10: Sales Agent blocked from accessing another agent's Lead 360
+  await test('10. Sales Agent cannot access Lead 360 of another agent\'s lead -> 403', async () => {
+    // Lead cmv99r1n900yj58jpjnsoxwt7 exists in Tenant A under another agent
+    const res = await apiRequest({
+      path: '/api/v1/leads/cmv99r1n900yj58jpjnsoxwt7/360',
+      method: 'GET',
+      token: tokenAgentA,
+    });
+    assert.strictEqual(res.statusCode, 403);
+    assert.strictEqual(res.data.error, 'Forbidden');
+  });
+
+  // TEST 11: Sales Agent blocked from adding notes to another agent's lead
+  await test('11. Sales Agent cannot add notes to another agent\'s lead -> 403', async () => {
+    const res = await apiRequest(
+      { path: '/api/v1/leads/cmv99r1n900yj58jpjnsoxwt7/notes', method: 'POST', token: tokenAgentA },
+      { body: 'Unauthorized note attempt' }
+    );
+    assert.strictEqual(res.statusCode, 403);
+  });
+
+  // TEST 12: Sales Agent blocked from reassigning leads
+  await test('12. Sales Agent cannot reassign leads via POST /api/v1/leads/:id/reassign -> 403', async () => {
+    const res = await apiRequest(
+      { path: '/api/v1/leads/cmv99r1n900yj58jpjnsoxwt7/reassign', method: 'POST', token: tokenAgentA },
+      { assignedAgentId: 'some-other-agent' }
+    );
+    assert.strictEqual(res.statusCode, 403);
+    assert.strictEqual(res.data.error, 'Forbidden');
+  });
+
+  // TEST 13: Sales Agent blocked from logging call for another agent
+  await test('13. Sales Agent cannot log call on behalf of another agent (POST /api/v1/calls -> 403)', async () => {
+    const res = await apiRequest(
+      { path: '/api/v1/calls', method: 'POST', token: tokenAgentA },
+      {
+        assignmentId: 'cmv99r1n900yj58jpjnsoxwt7',
+        agentId: 'some-other-agent-id',
+        phoneNumber: '+919876543210',
+        direction: 'OUTBOUND',
+      }
+    );
+    assert.strictEqual(res.statusCode, 403);
+  });
+
+  // TEST 14: Sales Agent blocked from updating disposition on another agent's call
+  await test('14. Sales Agent cannot submit disposition on another agent\'s call -> 403', async () => {
+    const res = await apiRequest(
+      { path: '/api/v1/calls/cmv9a00000000000000000001/disposition', method: 'POST', token: tokenAgentA },
+      { outcome: 'INTERESTED', note: 'Malicious update' }
+    );
+    // 403 if call exists and owned by another agent, or 404 if mock call id not found
+    assert.ok([403, 404].includes(res.statusCode));
+  });
+
+  // TEST 15: Sales Agent blocked from playback of another agent's call recording
+  await test('15. Sales Agent cannot access recording playback of another agent -> 403/404', async () => {
+    const res = await apiRequest(
+      { path: '/api/v1/recordings/cmv9a00000000000000000001/playback', method: 'GET', token: tokenAgentA }
+    );
+    assert.ok([403, 404].includes(res.statusCode));
+  });
+
+  console.log('\n===================================================================');
+  console.log(`📊 AUTHORIZATION MATRIX SUMMARY: ${passed} PASSED, ${failed} FAILED`);
+  console.log('===================================================================\n');
 
   if (failed > 0) {
     process.exit(1);

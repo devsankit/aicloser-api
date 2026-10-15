@@ -378,20 +378,90 @@ superAdminRouter.post('/tenants/:tenantId/users', validateBody(createUserSchema)
   });
 });
 
-// 10. PATCH /tenants/:tenantId/users/:userId - Update user
-superAdminRouter.patch('/tenants/:tenantId/users/:userId', async (req: Request, res: Response) => {
-  const { userId, tenantId } = req.params;
-  const { displayName, role } = req.body;
+const updateUserSchema = z.object({
+  displayName: z.string().trim().min(1).optional(),
+  role: z.enum(['ADMIN', 'MANAGER', 'SALES_AGENT']).optional(),
+  password: z.string().min(6).optional(),
+  phone: z.string().trim().optional(),
+  packageStatus: z.enum(['ACTIVE', 'PAUSED', 'EXPIRED']).optional(),
+});
 
-  const updated = await prisma.appAuthUser.updateMany({
+// 10. PATCH /tenants/:tenantId/users/:userId - Update user with strict validation and password hashing
+superAdminRouter.patch('/tenants/:tenantId/users/:userId', validateBody(updateUserSchema), async (req: Request, res: Response) => {
+  const { userId, tenantId } = req.params;
+  const body = req.body as z.infer<typeof updateUserSchema>;
+
+  const existingUser = await prisma.appAuthUser.findFirst({
     where: { id: String(userId), tenantId: String(tenantId) },
-    data: {
-      ...(displayName ? { displayName } : {}),
-      ...(role ? { role, assignedRole: role } : {}),
-    },
   });
 
-  res.json({ success: true, message: 'User updated', data: updated });
+  if (!existingUser) {
+    res.status(404).json({ success: false, error: 'NotFound', message: 'User not found in this workspace' });
+    return;
+  }
+
+  let passwordData: { passwordSalt: string; passwordHash: string } | {} = {};
+  if (body.password) {
+    const salt = randomBytes(16).toString('hex');
+    const hash = scryptSync(body.password, salt, 64).toString('hex');
+    passwordData = { passwordSalt: salt, passwordHash: hash };
+  }
+
+  const updated = await prisma.appAuthUser.update({
+    where: { id: existingUser.id },
+    data: {
+      ...(body.displayName ? { displayName: body.displayName } : {}),
+      ...(body.phone !== undefined ? { phone: body.phone } : {}),
+      ...(body.role ? { role: body.role as any, assignedRole: body.role as any } : {}),
+      ...(body.packageStatus ? { packageStatus: body.packageStatus as any } : {}),
+      ...passwordData,
+    },
+    select: {
+      id: true,
+      email: true,
+      displayName: true,
+      phone: true,
+      role: true,
+      packageStatus: true,
+      packageExpiresAt: true,
+          },
+  });
+
+  // If role changed to SALES_AGENT, ensure SalesAgentProfile exists
+  if (body.role === 'SALES_AGENT') {
+    const existingProfile = await prisma.salesAgentProfile.findFirst({
+      where: { userId: existingUser.id, tenantId: String(tenantId) },
+    });
+    if (!existingProfile) {
+      const code = 'AG-' + randomUUID().slice(0, 6).toUpperCase();
+      await prisma.salesAgentProfile.create({
+        data: {
+          userId: existingUser.id,
+          tenantId: String(tenantId),
+          agentCode: code,
+          status: 'ACTIVE',
+          canClaimLeads: true,
+        },
+      }).catch(() => undefined);
+    } else if (existingProfile.status === 'SUSPENDED') {
+      await prisma.salesAgentProfile.update({
+        where: { id: existingProfile.id },
+        data: { status: 'ACTIVE', canClaimLeads: true },
+      });
+    }
+  }
+
+  await prisma.salesActivityLog.create({
+    data: {
+      tenantId: String(tenantId),
+      actorUserId: req.user?.userId,
+      action: 'USER_UPDATED_BY_SUPER_ADMIN',
+      note: 'User ' + existingUser.email + ' updated by Super Admin',
+      metadata: { userId: existingUser.id, changes: { ...body, password: body.password ? '[UPDATED]' : undefined } },
+    },
+  }).catch(() => undefined);
+
+  res.json({ success: true, message: 'User updated successfully', data: updated });
 });
 
 // 11. DELETE /tenants/:tenantId/users/:userId - Safe deactivation with audit log (Hard delete only if force=true)
@@ -624,5 +694,29 @@ superAdminRouter.post('/impersonation/return', async (req: Request, res: Respons
     success: true,
     message: 'Returned to canonical Super Admin session',
     data: { token, tenantId: canonicalTenantId },
+  });
+});
+
+
+// 17. POST /impersonation/revoke/:sessionId - Explicitly revoke an impersonation session
+superAdminRouter.post('/impersonation/revoke/:sessionId', async (req: Request, res: Response) => {
+  const { sessionId } = req.params;
+  const actor = req.user!;
+
+  await closeClientSession(String(sessionId), 'REVOKED', 'Explicitly revoked by Super Admin').catch(() => undefined);
+
+  await prisma.salesActivityLog.create({
+    data: {
+      tenantId: actor.tenantId || 'global-admin',
+      actorUserId: actor.userId,
+      action: 'SUPER_ADMIN_IMPERSONATION_REVOKED',
+      note: 'Impersonation session ' + sessionId + ' explicitly revoked by Super Admin',
+      metadata: { actorId: actor.userId, sessionId },
+    },
+  }).catch(() => undefined);
+
+  res.json({
+    success: true,
+    message: 'Impersonation session ' + sessionId + ' successfully revoked',
   });
 });
