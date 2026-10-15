@@ -11,6 +11,10 @@ import { realtimeRouter } from './realtime.js';
 import { mobileRouter } from './mobile.js';
 import { adminUsersRouter, meSessionsRouter } from './client-sessions.js';
 import { customFieldsRouter } from './custom-fields.js';
+import { paymentsRouter } from './payments.js';
+import { reportsRouter } from './reports.js';
+import { teamRouter } from './team.js';
+import { stagesRouter } from './stages.js';
 
 export const v1Router = Router();
 
@@ -27,3 +31,7 @@ v1Router.use('/mobile', mobileRouter);
 v1Router.use('/me', meSessionsRouter);
 v1Router.use('/admin/users', adminUsersRouter);
 v1Router.use('/custom-fields', customFieldsRouter);
+v1Router.use('/payments', paymentsRouter);
+v1Router.use('/reports', reportsRouter);
+v1Router.use('/team', teamRouter);
+v1Router.use('/stages', stagesRouter);

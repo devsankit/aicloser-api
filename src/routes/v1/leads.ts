@@ -188,6 +188,105 @@ leadsRouter.get('/pipeline-aggregates', async (req: Request, res: Response) => {
   res.json({ success: true, data: results });
 });
 
+// GET /pool - Unassigned leads in the Grab Pool
+leadsRouter.get('/pool', async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+
+  const poolLeads = await prisma.salesLeadPoolItem.findMany({
+    where: {
+      tenantId,
+      status: 'OPEN',
+    },
+    take: 50,
+    orderBy: { createdAt: 'desc' },
+  });
+
+  res.json({ success: true, data: poolLeads });
+});
+
+// GET /duplicates - Detect duplicate leads by phone or email
+leadsRouter.get('/duplicates', async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+
+  // Find phones that occur more than once
+  const duplicates = await prisma.$queryRawUnsafe<Array<{ customerPhone: string; count: number }>>(`
+    SELECT "customerPhone", COUNT(*)::int as count
+    FROM "SalesLeadAssignment"
+    WHERE "tenantId" = '${tenantId}'
+    GROUP BY "customerPhone"
+    HAVING COUNT(*) > 1
+    ORDER BY count DESC
+    LIMIT 20;
+  `);
+
+  const results = await Promise.all(
+    duplicates.map(async (d) => {
+      const leads = await prisma.salesLeadAssignment.findMany({
+        where: { tenantId, customerPhone: d.customerPhone },
+        orderBy: { createdAt: 'desc' },
+      });
+      return {
+        phone: d.customerPhone,
+        duplicateCount: d.count,
+        leads,
+      };
+    })
+  );
+
+  res.json({ success: true, data: results });
+});
+
+// POST /merge - Merge secondary duplicate lead into primary
+leadsRouter.post('/merge', async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const { primaryLeadId, secondaryLeadId } = req.body as { primaryLeadId: string; secondaryLeadId: string };
+
+  if (!primaryLeadId || !secondaryLeadId || primaryLeadId === secondaryLeadId) {
+    res.status(400).json({ success: false, error: 'InvalidRequest', message: 'Specify two distinct lead IDs' });
+    return;
+  }
+
+  const [primary, secondary] = await Promise.all([
+    prisma.salesLeadAssignment.findFirst({ where: { id: primaryLeadId, tenantId } }),
+    prisma.salesLeadAssignment.findFirst({ where: { id: secondaryLeadId, tenantId } }),
+  ]);
+
+  if (!primary || !secondary) {
+    res.status(404).json({ success: false, error: 'NotFound', message: 'One or both leads not found' });
+    return;
+  }
+
+  // Transfer calls to primary
+  await prisma.salesMobileCall.updateMany({
+    where: { assignmentId: secondary.id, tenantId },
+    data: { assignmentId: primary.id },
+  });
+
+  // Transfer timeline entries to primary
+  await prisma.salesLeadTimelineEntry.updateMany({
+    where: { leadId: secondary.id, tenantId },
+    data: { leadId: primary.id },
+  });
+
+  // Archive secondary lead
+  await prisma.salesLeadAssignment.delete({
+    where: { id: secondary.id },
+  });
+
+  // Log audit event
+  await prisma.salesActivityLog.create({
+    data: {
+      tenantId,
+      assignmentId: primary.id,
+      actorUserId: req.user?.userId,
+      action: 'LEAD_MERGED',
+      note: `Merged duplicate lead ${secondary.id} (${secondary.customerName}) into this lead`,
+    },
+  });
+
+  res.json({ success: true, message: 'Leads merged successfully', primaryLeadId });
+});
+
 leadsRouter.get('/:id', async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const id = String(req.params.id);
@@ -315,4 +414,174 @@ leadsRouter.delete('/:id', async (req: Request, res: Response) => {
 
   await prisma.salesLeadAssignment.delete({ where: { id } });
   res.json({ success: true, message: 'Lead deleted from workspace' });
+});
+// POST /:id/claim - Closer claims a lead from the Grab Pool
+leadsRouter.post('/:id/claim', async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const id = String(req.params.id);
+
+  const profile = await prisma.salesAgentProfile.findFirst({
+    where: { userId: req.user?.userId, tenantId },
+  });
+
+  if (!profile) {
+    res.status(403).json({ success: false, error: 'Forbidden', message: 'Only active sales closers can claim leads' });
+    return;
+  }
+
+  const lead = await prisma.salesLeadAssignment.findFirst({
+    where: { id, tenantId },
+  });
+
+  if (!lead) {
+    res.status(404).json({ success: false, error: 'NotFound', message: 'Lead not found' });
+    return;
+  }
+
+  if (lead.assignedAgentId && lead.assignedAgentId !== profile.id) {
+    res.status(409).json({ success: false, error: 'Conflict', message: 'This lead has already been claimed by another closer' });
+    return;
+  }
+
+  const updated = await prisma.salesLeadAssignment.update({
+    where: { id: lead.id },
+    data: {
+      assignedAgentId: profile.id,
+    },
+  });
+
+  await prisma.salesActivityLog.create({
+    data: {
+      tenantId,
+      assignmentId: lead.id,
+      actorUserId: req.user?.userId,
+      action: 'LEAD_CLAIMED',
+      note: `Lead claimed from pool by ${req.user?.displayName || 'closer'}`,
+    },
+  });
+
+  res.json({ success: true, data: updated, message: 'Lead claimed successfully' });
+});
+
+// GET /:id/notes - Get internal notes for a lead
+leadsRouter.get('/:id/notes', async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const id = String(req.params.id);
+
+  const [lead, entries] = await Promise.all([
+    prisma.salesLeadAssignment.findFirst({
+      where: { id, tenantId },
+      select: { id: true, notes: true },
+    }),
+    prisma.salesLeadTimelineEntry.findMany({
+      where: { leadId: id, tenantId },
+      orderBy: { createdAt: 'desc' },
+    }),
+  ]);
+
+  if (!lead) {
+    res.status(404).json({ success: false, error: 'NotFound', message: 'Lead not found' });
+    return;
+  }
+
+  res.json({
+    success: true,
+    data: {
+      summaryNotes: lead.notes || '',
+      timelineNotes: entries,
+    },
+  });
+});
+
+// POST /:id/notes - Add an internal note to a lead
+leadsRouter.post('/:id/notes', async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const id = String(req.params.id);
+  const { body } = req.body as { body: string };
+
+  if (!body || !body.trim()) {
+    res.status(400).json({ success: false, error: 'InvalidRequest', message: 'Note content cannot be empty' });
+    return;
+  }
+
+  const entry = await prisma.salesLeadTimelineEntry.create({
+    data: {
+      tenantId,
+      leadId: id,
+      type: 'NOTE',
+      body: body.trim(),
+      userId: req.user?.userId,
+    },
+  });
+
+  res.status(201).json({ success: true, data: entry });
+});
+
+// GET /:id/tasks - Get tasks for a lead
+leadsRouter.get('/:id/tasks', async (req: Request, res: Response) => {
+  const id = String(req.params.id);
+
+  const tasks = await prisma.gxLeadTask.findMany({
+    where: { salesLeadId: id },
+    orderBy: { dueAt: 'asc' },
+  });
+
+  res.json({ success: true, data: tasks });
+});
+
+// POST /:id/tasks - Create task for a lead
+leadsRouter.post('/:id/tasks', async (req: Request, res: Response) => {
+  const id = String(req.params.id);
+  const { title, description, dueAt, priority } = req.body as {
+    title: string;
+    description?: string;
+    dueAt: string;
+    priority?: string;
+  };
+
+  if (!title || !dueAt) {
+    res.status(400).json({ success: false, error: 'InvalidRequest', message: 'Title and due date are required' });
+    return;
+  }
+
+  const task = await prisma.gxLeadTask.create({
+    data: {
+      salesLeadId: id,
+      createdById: req.user?.userId,
+      title: title.trim(),
+      description: description?.trim(),
+      dueAt: new Date(dueAt),
+      priority: (priority || 'NORMAL').toUpperCase(),
+      status: 'OPEN',
+    },
+  });
+
+  res.status(201).json({ success: true, data: task });
+});
+
+// PATCH /:id/tasks/:taskId - Update task status
+leadsRouter.patch('/:id/tasks/:taskId', async (req: Request, res: Response) => {
+  const taskId = String(req.params.taskId);
+  const { status } = req.body as { status: string };
+
+  const task = await prisma.gxLeadTask.update({
+    where: { id: taskId },
+    data: {
+      status: (status || 'OPEN').toUpperCase(),
+      completedAt: status === 'DONE' ? new Date() : null,
+    },
+  });
+
+  res.json({ success: true, data: task });
+});
+
+// DELETE /:id/tasks/:taskId - Delete a task
+leadsRouter.delete('/:id/tasks/:taskId', async (req: Request, res: Response) => {
+  const taskId = String(req.params.taskId);
+
+  await prisma.gxLeadTask.delete({
+    where: { id: taskId },
+  });
+
+  res.json({ success: true, message: 'Task deleted successfully' });
 });
