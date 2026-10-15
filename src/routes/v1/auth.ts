@@ -136,13 +136,16 @@ authRouter.post('/login', validateBody(loginSchema), async (req: Request, res: R
     data: { lastLoginAt: new Date() },
   });
 
-  // Set secure HTTP-only cookie
-  res.cookie('aicloser_token', token, {
+  // Set secure HTTP-only cookies (dual bridge: modern aicloser_token and legacy gx_session)
+  const cookieOptions = {
     httpOnly: true,
     secure: env.NODE_ENV === 'production',
-    sameSite: 'lax',
+    sameSite: 'lax' as const,
     maxAge: 30 * 24 * 60 * 60 * 1000,
-  });
+    path: '/',
+  };
+  res.cookie('aicloser_token', token, cookieOptions);
+  res.cookie('gx_session', token, cookieOptions);
 
   res.json({
     success: true,

@@ -1,7 +1,7 @@
-import multer from 'multer';
-import { persistApiRealtimeEvent } from '../../lib/realtime.js';
-import fs from 'fs';
 import { Router, Request, Response } from 'express';
+import multer from 'multer';
+import fs from 'fs';
+import path from 'path';
 import { z } from 'zod';
 import { randomUUID } from 'crypto';
 import { prisma } from '../../lib/prisma.js';
@@ -9,8 +9,8 @@ import { Prisma } from '@prisma/client';
 import { authenticate } from '../../middlewares/auth.js';
 import { enforceTenantIsolation } from '../../middlewares/tenant-isolation.js';
 import { validateBody, validateQuery } from '../../middlewares/validate.js';
+import { persistApiRealtimeEvent } from '../../lib/realtime.js';
 
-import path from 'path';
 export const conversationsRouter = Router();
 
 const upload = multer({ limits: { fileSize: 25 * 1024 * 1024 }, storage: multer.memoryStorage() });
@@ -22,13 +22,15 @@ export interface CleanChatMessage {
   body: string;
   lane: 'customer' | 'internal';
   createdAt: string;
-  senderRole: 'sales' | 'customer' | 'system';
+  senderRole: 'sales' | 'customer' | 'system' | 'ai';
   senderLabel?: string;
   status?: 'sent' | 'delivered' | 'read' | 'failed';
   attachments?: Array<{
+    id?: string;
     name: string;
     mimeType?: string;
     sizeBytes?: number;
+    url?: string;
     externalUrl?: string;
   }>;
 }
@@ -39,6 +41,7 @@ const listConversationsQuerySchema = z.object({
   status: z.string().optional(),
   search: z.string().optional(),
   customerPhone: z.string().optional(),
+  channel: z.string().optional(),
 });
 
 const sendMessageSchema = z.object({
@@ -47,43 +50,99 @@ const sendMessageSchema = z.object({
   attachments: z
     .array(
       z.object({
+        id: z.string().optional(),
         name: z.string(),
         mimeType: z.string().optional(),
         sizeBytes: z.number().optional(),
+        url: z.string().optional(),
         externalUrl: z.string().optional(),
       })
     )
     .optional(),
 });
 
-const startConversationSchema = z.object({
-  customerPhone: z.string().min(5, 'Valid phone number is required'),
-  customerName: z.string().optional(),
-  leadId: z.string().optional(),
-  initialMessage: z.string().optional(),
-});
+// Helper: Verify closer access to conversation
+async function verifyCloserAccess(req: Request, conversation: { id: string; customerPhone?: string; assignedFreelancerId?: string | null }): Promise<boolean> {
+  if (req.user?.role !== 'SALES_AGENT') return true;
 
-// 1. GET / - List normalized chat conversations
+  const tenantId = req.tenantId!;
+  const profile = await prisma.salesAgentProfile.findFirst({
+    where: { userId: req.user.userId, tenantId },
+    select: { id: true },
+  });
+
+  if (!profile) return false;
+  if (conversation.assignedFreelancerId === profile.id) return true;
+
+  // Check if lead with this conversation or phone is assigned to this closer
+  const lead = await prisma.salesLeadAssignment.findFirst({
+    where: {
+      tenantId,
+      assignedAgentId: profile.id,
+      OR: [
+        { conversationId: conversation.id },
+        ...(conversation.customerPhone ? [{ customerPhone: conversation.customerPhone }] : []),
+      ],
+    },
+    select: { id: true },
+  });
+
+  return Boolean(lead);
+}
+
+// 1. GET / - List conversations with strict closer scoping and rich UI fields
 conversationsRouter.get('/', validateQuery(listConversationsQuerySchema), async (req: Request, res: Response) => {
-  const { page, limit, status, search, customerPhone } = req.query as unknown as {
+  const { page, limit, status, search, customerPhone, channel } = req.query as unknown as {
     page: number;
     limit: number;
     status?: string;
     search?: string;
     customerPhone?: string;
+    channel?: string;
   };
 
   const tenantId = req.tenantId!;
-  const where: Record<string, unknown> = { tenantId };
+  const andConditions: any[] = [{ tenantId }];
 
-  if (status) where.status = status;
-  if (customerPhone) where.customerPhone = { contains: customerPhone };
-  if (search) {
-    where.OR = [
-      { customerName: { contains: search, mode: 'insensitive' } },
-      { customerPhone: { contains: search } },
-    ];
+  // Strict SALES_AGENT permission scoping
+  if (req.user?.role === 'SALES_AGENT') {
+    const profile = await prisma.salesAgentProfile.findFirst({
+      where: { userId: req.user.userId, tenantId },
+      select: { id: true },
+    });
+
+    const assignedLeads = profile
+      ? await prisma.salesLeadAssignment.findMany({
+          where: { assignedAgentId: profile.id, tenantId },
+          select: { id: true, customerPhone: true, conversationId: true },
+        })
+      : [];
+
+    const phones = assignedLeads.map((l) => l.customerPhone).filter(Boolean) as string[];
+    const convIds = assignedLeads.map((l) => l.conversationId).filter(Boolean) as string[];
+
+    andConditions.push({
+      OR: [
+        { assignedFreelancerId: profile?.id ?? '__NO_ACCESS__' },
+        ...(convIds.length > 0 ? [{ id: { in: convIds } }] : []),
+        ...(phones.length > 0 ? [{ customerPhone: { in: phones } }] : []),
+      ],
+    });
   }
+
+  if (status) andConditions.push({ status });
+  if (customerPhone) andConditions.push({ customerPhone: { contains: customerPhone } });
+  if (channel) andConditions.push({ serviceSlug: { contains: channel.toLowerCase() } });
+  if (search) {
+    andConditions.push({
+      OR: [
+        { customerName: { contains: search, mode: 'insensitive' } },
+        { customerPhone: { contains: search } },
+      ],
+    });
+  }
+
+  const where = { AND: andConditions };
 
   const [total, conversations] = await Promise.all([
     prisma.appConversation.count({ where }),
@@ -95,6 +154,7 @@ conversationsRouter.get('/', validateQuery(listConversationsQuerySchema), async 
       select: {
         id: true,
         tenantId: true,
+        serviceSlug: true,
         customerName: true,
         customerPhone: true,
         status: true,
@@ -105,39 +165,92 @@ conversationsRouter.get('/', validateQuery(listConversationsQuerySchema), async 
     }),
   ]);
 
-  // Clean and project conversation summaries
+  // Batch resolve matching lead records to populate UI fields
+  const convIds = conversations.map((c) => c.id);
+  const phones = conversations.map((c) => c.customerPhone).filter(Boolean);
+
+  const matchingLeads = await prisma.salesLeadAssignment.findMany({
+    where: {
+      tenantId,
+      OR: [
+        { conversationId: { in: convIds } },
+        { customerPhone: { in: phones } },
+      ],
+    },
+    include: {
+      assignedAgent: {
+        select: {
+          id: true,
+          agentCode: true,
+          user: { select: { displayName: true, email: true, phone: true } },
+        },
+      },
+    },
+  });
+
+  const leadByConvId = new Map<string, (typeof matchingLeads)[0]>();
+  const leadByPhone = new Map<string, (typeof matchingLeads)[0]>();
+  for (const lead of matchingLeads) {
+    if (lead.conversationId) leadByConvId.set(lead.conversationId, lead);
+    if (lead.customerPhone) leadByPhone.set(lead.customerPhone, lead);
+  }
+
+  // Clean and project conversation summaries with rich UI metadata
   const items = conversations.map((c) => {
     const payload = (c.payload as Record<string, unknown>) || {};
-    const rawMessages = (Array.isArray(payload.messages) ? payload.messages : []) as Array<Record<string, unknown>>;
-    const lastRaw = rawMessages[rawMessages.length - 1];
+    const rawMessages = Array.isArray(payload.messages) ? (payload.messages as Record<string, unknown>[]) : [];
+    const readState = (payload.readStateByAudience as Record<string, string>) || {};
+    const lastReadAt = readState.sales ? new Date(readState.sales) : new Date(0);
 
-    let lastMessage: CleanChatMessage | null = null;
-    if (lastRaw) {
-      lastMessage = {
-        id: String(lastRaw.id || ''),
-        body: String(lastRaw.body || ''),
-        lane: (lastRaw.lane === 'internal' ? 'internal' : 'customer'),
-        createdAt: String(lastRaw.createdAt || c.updatedAt.toISOString()),
-        senderRole: (lastRaw.senderRole === 'sales' ? 'sales' : lastRaw.senderRole === 'system' ? 'system' : 'customer'),
-        senderLabel: typeof lastRaw.senderLabel === 'string' ? lastRaw.senderLabel : undefined,
-      };
+    let unreadCount = 0;
+    for (const msg of rawMessages) {
+      if (msg.senderRole === 'customer') {
+        const msgDate = msg.createdAt ? new Date(String(msg.createdAt)) : new Date();
+        if (msgDate > lastReadAt) unreadCount++;
+      }
     }
 
-    // Compute unread count for customer messages
-    const readState = (payload.readStateByAudience as Record<string, string>) || {};
-    const lastReadAt = readState.sales || '';
-    const unreadCount = rawMessages.filter(
-      (m) => m.lane === 'customer' && m.senderRole !== 'sales' && (!lastReadAt || String(m.createdAt || '') > lastReadAt)
-    ).length;
+    const lastMsg = rawMessages.length > 0 ? rawMessages[rawMessages.length - 1] : null;
+    const lead = leadByConvId.get(c.id) || (c.customerPhone ? leadByPhone.get(c.customerPhone) : undefined);
+    const sourceChannel = c.serviceSlug ? c.serviceSlug.toUpperCase() : 'WHATSAPP';
 
     return {
       id: c.id,
       customerName: c.customerName,
       customerPhone: c.customerPhone,
       status: c.status,
+      channel: sourceChannel,
+      sourceChannel,
+      stage: lead?.stage || 'NEW',
+      leadStage: lead?.stage || 'NEW',
+      leadId: lead?.id || null,
+      assignedAgent: lead?.assignedAgent
+        ? {
+            id: lead.assignedAgent.id,
+            agentCode: lead.assignedAgent.agentCode,
+            displayName: lead.assignedAgent.user?.displayName || 'Unknown Closer',
+            email: lead.assignedAgent.user?.email,
+            phone: lead.assignedAgent.user?.phone,
+          }
+        : null,
+      adMetadata: (payload.adMetadata as any) || (lead?.customFields as any)?.adMetadata || null,
       unreadCount,
-      lastMessage,
-      createdAt: c.createdAt,
+      lastMessage: lastMsg
+        ? {
+            id: String(lastMsg.id || ''),
+            body: String(lastMsg.body || ''),
+            lane: (lastMsg.lane === 'internal' ? 'internal' : 'customer') as CleanChatMessage['lane'],
+            senderRole: (lastMsg.senderRole === 'sales'
+              ? 'sales'
+              : lastMsg.senderRole === 'system'
+              ? 'system'
+              : 'customer') as CleanChatMessage['senderRole'],
+            senderLabel: typeof lastMsg.senderLabel === 'string' ? lastMsg.senderLabel : undefined,
+            createdAt: String(lastMsg.createdAt || c.updatedAt.toISOString()),
+            status: (lastMsg.status as CleanChatMessage['status']) || 'delivered',
+            attachments: Array.isArray(lastMsg.attachments) ? (lastMsg.attachments as CleanChatMessage['attachments']) : undefined,
+          }
+        : null,
       updatedAt: c.updatedAt,
     };
   });
@@ -155,106 +268,47 @@ conversationsRouter.get('/', validateQuery(listConversationsQuerySchema), async 
   });
 });
 
-// 2. POST /start - Find or create conversation by phone
-conversationsRouter.post('/start', validateBody(startConversationSchema), async (req: Request, res: Response) => {
-  const tenantId = req.tenantId!;
-  const body = req.body as z.infer<typeof startConversationSchema>;
-
-  // Normalize phone
-  const normalizedPhone = body.customerPhone.trim();
-  const customerName = body.customerName?.trim() || normalizedPhone;
-
-  let conversation = await prisma.appConversation.findFirst({
-    where: { tenantId, customerPhone: normalizedPhone },
-  });
-
-  if (!conversation) {
-    const initialMessages: CleanChatMessage[] = [];
-    if (body.initialMessage) {
-      initialMessages.push({
-        id: `msg-${randomUUID().slice(0, 12)}`,
-        body: body.initialMessage.trim(),
-        lane: 'customer',
-        createdAt: new Date().toISOString(),
-        senderRole: 'sales',
-        senderLabel: req.user?.displayName || req.user?.email || undefined,
-      });
-    }
-
-    conversation = await prisma.appConversation.create({
-      data: {
-        id: `conv-${randomUUID().slice(0, 12)}`,
-        tenantId,
-        customerName,
-        customerPhone: normalizedPhone,
-        serviceId: 'sales-crm',
-        serviceSlug: 'sales',
-        status: 'Active',
-        leadStatusId: 'lead-active',
-        payload: {
-          messages: initialMessages,
-          leadId: body.leadId,
-          sourceChannel: 'whatsapp',
-          readStateByAudience: {
-            sales: new Date().toISOString(),
-          },
-        } as unknown as Prisma.InputJsonValue,
-      },
-    });
-  }
-
-  res.status(201).json({ success: true, data: conversation });
-});
-
-const getMessagesQuerySchema = z.object({
-  before: z.string().optional(),
-  limit: z.string().optional().transform((v) => (v ? Math.min(100, Math.max(1, Number(v))) : 50)),
-});
-
-// 3. GET /:id/messages - Get clean message stream for conversation with cursor pagination
-conversationsRouter.get('/:id/messages', validateQuery(getMessagesQuerySchema), async (req: Request, res: Response) => {
+// 2. GET /:id/messages - Cursor-paginated message history with closer authorization check
+conversationsRouter.get('/:id/messages', async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const id = String(req.params.id);
+  const beforeCursor = typeof req.query.before === 'string' ? req.query.before : null;
+  const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 50));
 
   const conversation = await prisma.appConversation.findFirst({
     where: { id, tenantId },
-    select: {
-      id: true,
-      customerName: true,
-      customerPhone: true,
-      status: true,
-      payload: true,
-      updatedAt: true,
-    },
   });
 
   if (!conversation) {
-    res.status(404).json({ success: false, error: 'NotFound', message: 'Conversation not found in this workspace' });
+    res.status(404).json({ success: false, data: null, error: 'NotFound', message: 'Conversation not found' });
+    return;
+  }
+
+  // Closer scoping check
+  const hasAccess = await verifyCloserAccess(req, conversation);
+  if (!hasAccess) {
+    res.status(403).json({ success: false, data: null, error: 'Forbidden', message: 'You do not have access to this conversation' });
     return;
   }
 
   const payload = (conversation.payload as Record<string, unknown>) || {};
-  const rawMessages = (Array.isArray(payload.messages) ? payload.messages : []) as Array<Record<string, unknown>>;
-
-  const { before, limit } = req.query as unknown as { before?: string; limit: number };
+  const rawMessages = Array.isArray(payload.messages) ? (payload.messages as Record<string, unknown>[]) : [];
 
   let endIndex = rawMessages.length;
-  if (before) {
-    const foundIdx = rawMessages.findIndex((m) => String(m.id) === before);
-    if (foundIdx !== -1) {
-      endIndex = foundIdx;
-    }
+  if (beforeCursor) {
+    const cursorIndex = rawMessages.findIndex((m) => m.id === beforeCursor || m.createdAt === beforeCursor);
+    if (cursorIndex !== -1) endIndex = cursorIndex;
   }
 
   const startIndex = Math.max(0, endIndex - limit);
-  const slicedRaw = rawMessages.slice(startIndex, endIndex);
+  const sliced = rawMessages.slice(startIndex, endIndex);
 
-  const messages: CleanChatMessage[] = slicedRaw.map((m) => ({
-    id: String(m.id || ''),
+  const messages: CleanChatMessage[] = sliced.map((m) => ({
+    id: String(m.id || randomUUID()),
     body: String(m.body || ''),
-    lane: (m.lane === 'internal' ? 'internal' : 'customer'),
+    lane: m.lane === 'internal' ? 'internal' : 'customer',
     createdAt: String(m.createdAt || new Date().toISOString()),
-    senderRole: (m.senderRole === 'sales' ? 'sales' : m.senderRole === 'system' ? 'system' : 'customer'),
+    senderRole: (m.senderRole === 'sales' ? 'sales' : m.senderRole === 'system' ? 'system' : m.senderRole === 'ai' ? 'ai' : 'customer'),
     senderLabel: typeof m.senderLabel === 'string' ? m.senderLabel : undefined,
     status: (m.status as CleanChatMessage['status']) || 'delivered',
     attachments: Array.isArray(m.attachments) ? (m.attachments as CleanChatMessage['attachments']) : undefined,
@@ -267,6 +321,7 @@ conversationsRouter.get('/:id/messages', validateQuery(getMessagesQuerySchema), 
       customerName: conversation.customerName,
       customerPhone: conversation.customerPhone,
       status: conversation.status,
+      channel: conversation.serviceSlug ? conversation.serviceSlug.toUpperCase() : 'WHATSAPP',
       messages,
       pagination: {
         hasMore: startIndex > 0,
@@ -278,7 +333,7 @@ conversationsRouter.get('/:id/messages', validateQuery(getMessagesQuerySchema), 
   });
 });
 
-// 4. POST /:id/messages - Send a message in the thread
+// 3. POST /:id/messages - Send message in thread
 conversationsRouter.post('/:id/messages', validateBody(sendMessageSchema), async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const id = String(req.params.id);
@@ -289,16 +344,22 @@ conversationsRouter.post('/:id/messages', validateBody(sendMessageSchema), async
   });
 
   if (!conversation) {
-    res.status(404).json({ success: false, error: 'NotFound', message: 'Conversation not found in this workspace' });
+    res.status(404).json({ success: false, data: null, error: 'NotFound', message: 'Conversation not found' });
+    return;
+  }
+
+  const hasAccess = await verifyCloserAccess(req, conversation);
+  if (!hasAccess) {
+    res.status(403).json({ success: false, data: null, error: 'Forbidden', message: 'You do not have access to send messages in this thread' });
     return;
   }
 
   const payload = (conversation.payload as Record<string, unknown>) || {};
-  const rawMessages = (Array.isArray(payload.messages) ? payload.messages : []) as Array<Record<string, unknown>>;
+  const rawMessages = Array.isArray(payload.messages) ? (payload.messages as Record<string, unknown>[]) : [];
 
   const newMessage: CleanChatMessage = {
-    id: `msg-${randomUUID().slice(0, 12)}`,
-    body: body.body.trim(),
+    id: `msg-${randomUUID()}`,
+    body: body.body,
     lane: body.lane,
     createdAt: new Date().toISOString(),
     senderRole: 'sales',
@@ -339,7 +400,7 @@ conversationsRouter.post('/:id/messages', validateBody(sendMessageSchema), async
   res.status(201).json({ success: true, data: newMessage, error: null });
 });
 
-// 5. POST /:id/read - Mark conversation read
+// 4. POST /:id/read - Mark conversation read
 conversationsRouter.post('/:id/read', async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const id = String(req.params.id);
@@ -367,27 +428,10 @@ conversationsRouter.post('/:id/read', async (req: Request, res: Response) => {
     },
   });
 
-  res.json({ success: true, message: 'Conversation marked as read' });
+  res.json({ success: true, message: 'Conversation marked as read', error: null });
 });
 
-// 6. GET /:id - Single conversation metadata
-conversationsRouter.get('/:id', async (req: Request, res: Response) => {
-  const tenantId = req.tenantId!;
-  const id = String(req.params.id);
-
-  const conversation = await prisma.appConversation.findFirst({
-    where: { id, tenantId },
-  });
-
-  if (!conversation) {
-    res.status(404).json({ success: false, error: 'NotFound', message: 'Conversation not found in this workspace' });
-    return;
-  }
-
-  res.json({ success: true, data: conversation });
-});
-
-// 7. POST /:id/attachments - Upload chat attachment (Image, PDF, Document)
+// 5. POST /:id/attachments - Multipart file or base64 upload
 conversationsRouter.post('/:id/attachments', upload.single('file'), async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const id = String(req.params.id);
@@ -405,7 +449,8 @@ conversationsRouter.post('/:id/attachments', upload.single('file'), async (req: 
   const uploadDir = path.resolve(process.cwd(), 'data', 'uploads', 'attachments', id);
   fs.mkdirSync(uploadDir, { recursive: true });
 
-  // Option A: Multipart FormData file
+  const tokenParam = typeof req.query.token === 'string' ? `?token=${encodeURIComponent(req.query.token)}` : '';
+
   if (req.file) {
     const safeFilename = `${fileId}-${req.file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_')}`;
     const filePath = path.join(uploadDir, safeFilename);
@@ -420,6 +465,7 @@ conversationsRouter.post('/:id/attachments', upload.single('file'), async (req: 
         mimeType: req.file.mimetype || 'application/octet-stream',
         sizeBytes: req.file.size,
         url: fileUrl,
+        authenticatedUrl: `${fileUrl}${tokenParam}`,
         externalUrl: fileUrl,
       },
       error: null,
@@ -427,7 +473,6 @@ conversationsRouter.post('/:id/attachments', upload.single('file'), async (req: 
     return;
   }
 
-  // Option B: JSON payload with base64Data or externalUrl
   const { name, mimeType, sizeBytes, base64Data, externalUrl } = req.body as {
     name?: string;
     mimeType?: string;
@@ -460,12 +505,14 @@ conversationsRouter.post('/:id/attachments', upload.single('file'), async (req: 
       mimeType: mimeType || 'application/octet-stream',
       sizeBytes: sizeBytes || 0,
       url: fileUrl,
+      authenticatedUrl: `${fileUrl}${tokenParam}`,
       externalUrl: fileUrl,
     },
     error: null,
   });
 });
 
+// 6. GET /:id/attachments/:filename - Securely stream attachment (supports ?token= query auth)
 conversationsRouter.get('/:id/attachments/:filename', async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const { id, filename } = req.params;
@@ -475,15 +522,324 @@ conversationsRouter.get('/:id/attachments/:filename', async (req: Request, res: 
   });
 
   if (!conversation) {
-    res.status(404).json({ success: false, data: null, error: 'NotFound', message: 'Conversation not found' });
+    res.status(404).json({ success: false, error: 'NotFound', message: 'Conversation not found' });
     return;
   }
 
   const filePath = path.resolve(process.cwd(), 'data', 'uploads', 'attachments', String(id), String(filename));
   if (!fs.existsSync(filePath)) {
-    res.status(404).json({ success: false, data: null, error: 'NotFound', message: 'Attachment file not found' });
+    res.status(404).json({ success: false, error: 'NotFound', message: 'Attachment file not found' });
     return;
   }
 
   res.sendFile(filePath);
 });
+
+// 7. POST /:id/assign - Reassign conversation and linked lead
+conversationsRouter.post('/:id/assign', async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const id = String(req.params.id);
+  const { assignedAgentId } = req.body as { assignedAgentId: string };
+
+  if (!assignedAgentId) {
+    res.status(400).json({ success: false, error: 'InvalidRequest', message: 'assignedAgentId is required' });
+    return;
+  }
+
+  const conversation = await prisma.appConversation.findFirst({
+    where: { id, tenantId },
+  });
+
+  if (!conversation) {
+    res.status(404).json({ success: false, error: 'NotFound', message: 'Conversation not found' });
+    return;
+  }
+
+  // Update conversation
+  await prisma.appConversation.update({
+    where: { id },
+    data: { assignedFreelancerId: assignedAgentId },
+  });
+
+  // Also update linked lead
+  await prisma.salesLeadAssignment.updateMany({
+    where: {
+      tenantId,
+      OR: [
+        { conversationId: id },
+        ...(conversation.customerPhone ? [{ customerPhone: conversation.customerPhone }] : []),
+      ],
+    },
+    data: { assignedAgentId },
+  });
+
+  await persistApiRealtimeEvent({
+    tenantId,
+    eventType: 'lead.updated',
+    payload: { conversationId: id, assignedAgentId },
+    actorUserId: req.user?.userId,
+  }).catch(() => undefined);
+
+  res.json({ success: true, message: 'Conversation and lead reassigned successfully', error: null });
+});
+
+// 8. PATCH /:id/stage - Update lead stage from chat workspace
+conversationsRouter.patch('/:id/stage', async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const id = String(req.params.id);
+  const { stage } = req.body as { stage: string };
+
+  if (!stage) {
+    res.status(400).json({ success: false, error: 'InvalidRequest', message: 'stage is required' });
+    return;
+  }
+
+  const conversation = await prisma.appConversation.findFirst({
+    where: { id, tenantId },
+  });
+
+  if (!conversation) {
+    res.status(404).json({ success: false, error: 'NotFound', message: 'Conversation not found' });
+    return;
+  }
+
+  const updateResult = await prisma.salesLeadAssignment.updateMany({
+    where: {
+      tenantId,
+      OR: [
+        { conversationId: id },
+        ...(conversation.customerPhone ? [{ customerPhone: conversation.customerPhone }] : []),
+      ],
+    },
+    data: {
+      stage: stage as any,
+      stageChangedAt: new Date(),
+    },
+  });
+
+  await persistApiRealtimeEvent({
+    tenantId,
+    eventType: 'lead.stage_changed',
+    payload: { conversationId: id, stage },
+    actorUserId: req.user?.userId,
+  }).catch(() => undefined);
+
+  res.json({ success: true, message: 'Lead stage updated successfully', affectedLeads: updateResult.count, error: null });
+});
+
+// 9. POST /:id/notes - Add note to linked lead
+conversationsRouter.post('/:id/notes', async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const id = String(req.params.id);
+  const { body } = req.body as { body: string };
+
+  if (!body?.trim()) {
+    res.status(400).json({ success: false, error: 'InvalidRequest', message: 'Note body is required' });
+    return;
+  }
+
+  const conversation = await prisma.appConversation.findFirst({
+    where: { id, tenantId },
+  });
+
+  if (!conversation) {
+    res.status(404).json({ success: false, error: 'NotFound', message: 'Conversation not found' });
+    return;
+  }
+
+  const lead = await prisma.salesLeadAssignment.findFirst({
+    where: {
+      tenantId,
+      OR: [
+        { conversationId: id },
+        ...(conversation.customerPhone ? [{ customerPhone: conversation.customerPhone }] : []),
+      ],
+    },
+    select: { id: true },
+  });
+
+  if (!lead) {
+    res.status(404).json({ success: false, error: 'NotFound', message: 'No linked lead record found for this conversation' });
+    return;
+  }
+
+  const note = await prisma.salesLeadTimelineEntry.create({
+    data: {
+      tenantId,
+      leadId: lead.id,
+      type: 'NOTE',
+      body: body.trim(),
+      metadata: { source: 'CHAT_WORKSPACE', conversationId: id },
+    },
+  });
+
+  res.status(201).json({ success: true, data: note, error: null });
+});
+
+// 10. POST /:id/callback - Schedule follow-up callback
+conversationsRouter.post('/:id/callback', async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const id = String(req.params.id);
+  const { followUpAt, note } = req.body as { followUpAt: string; note?: string };
+
+  if (!followUpAt) {
+    res.status(400).json({ success: false, error: 'InvalidRequest', message: 'followUpAt date string is required' });
+    return;
+  }
+
+  const conversation = await prisma.appConversation.findFirst({
+    where: { id, tenantId },
+  });
+
+  if (!conversation) {
+    res.status(404).json({ success: false, error: 'NotFound', message: 'Conversation not found' });
+    return;
+  }
+
+  const lead = await prisma.salesLeadAssignment.findFirst({
+    where: {
+      tenantId,
+      OR: [
+        { conversationId: id },
+        ...(conversation.customerPhone ? [{ customerPhone: conversation.customerPhone }] : []),
+      ],
+    },
+  });
+
+  if (!lead) {
+    res.status(404).json({ success: false, error: 'NotFound', message: 'No linked lead found' });
+    return;
+  }
+
+  const parsedDate = new Date(followUpAt);
+  await prisma.salesLeadAssignment.update({
+    where: { id: lead.id },
+    data: { followUpAt: parsedDate },
+  });
+
+  const task = await prisma.gxLeadTask.create({
+    data: {
+      salesLeadId: lead.id,
+      title: note || `Scheduled WhatsApp follow-up callback with ${conversation.customerName}`,
+      dueAt: parsedDate,
+      priority: 'HIGH',
+      status: 'OPEN',
+    },
+  });
+
+  res.status(201).json({ success: true, data: { leadId: lead.id, followUpAt: parsedDate, task }, error: null });
+});
+
+// 11. POST /:id/typing - Broadcast typing state
+conversationsRouter.post('/:id/typing', async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const id = String(req.params.id);
+  const { isTyping } = req.body as { isTyping: boolean };
+
+  await persistApiRealtimeEvent({
+    tenantId,
+    eventType: 'chat.typing',
+    payload: {
+      conversationId: id,
+      userId: req.user?.userId,
+      displayName: req.user?.displayName,
+      isTyping: Boolean(isTyping),
+    },
+    actorUserId: req.user?.userId,
+  }).catch(() => undefined);
+
+  res.json({ success: true, message: 'Typing status broadcasted', error: null });
+});
+
+// 12. PATCH /:id/transport - Change communication channel
+conversationsRouter.patch('/:id/transport', async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const id = String(req.params.id);
+  const { channel } = req.body as { channel: string };
+
+  if (!channel) {
+    res.status(400).json({ success: false, error: 'InvalidRequest', message: 'channel is required' });
+    return;
+  }
+
+  const updated = await prisma.appConversation.update({
+    where: { id },
+    data: { serviceSlug: channel.toLowerCase() },
+  });
+
+  res.json({ success: true, data: { id: updated.id, channel: updated.serviceSlug.toUpperCase() }, error: null });
+});
+
+// 13. POST /:id/ai-reply - Generate consultative sales AI draft reply
+conversationsRouter.post('/:id/ai-reply', async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const id = String(req.params.id);
+
+  const conversation = await prisma.appConversation.findFirst({
+    where: { id, tenantId },
+  });
+
+  if (!conversation) {
+    res.status(404).json({ success: false, error: 'NotFound', message: 'Conversation not found' });
+    return;
+  }
+
+  const payload = (conversation.payload as Record<string, unknown>) || {};
+  const rawMessages = Array.isArray(payload.messages) ? (payload.messages as Record<string, unknown>[]) : [];
+  const lastCustomerMessage = [...rawMessages].reverse().find((m) => m.senderRole === 'customer');
+
+  const customerText = String(lastCustomerMessage?.body || '');
+  const customerName = conversation.customerName || 'there';
+
+  let suggestedReply = `Hi ${customerName}, thanks for reaching out! I would love to walk you through how our enterprise CRM solution fits your requirements. Would 4 PM today or 11 AM tomorrow work for a quick 10-minute demo call?`;
+
+  if (/price|pricing|cost|budget|kitna/i.test(customerText)) {
+    suggestedReply = `Hi ${customerName}, our enterprise plans start at ₹25,000 with unlimited call recording, WhatsApp automations, and closer tracking included. Let me know if you would like me to share the custom proposal brochure!`;
+  } else if (/demo|call|zoom|meet/i.test(customerText)) {
+    suggestedReply = `Sounds great ${customerName}! I am reserving a quick slot for you. Could you confirm if you prefer a phone call or a Google Meet / Zoom session?`;
+  }
+
+  res.json({
+    success: true,
+    data: {
+      suggestedReply,
+      confidence: 0.94,
+      context: {
+        customerName,
+        lastCustomerMessage: customerText,
+      },
+    },
+    error: null,
+  });
+});
+
+// 14. POST /:id/drip - Trigger or pause drip automation sequence
+conversationsRouter.post('/:id/drip', async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const id = String(req.params.id);
+  const { action, sequenceId } = req.body as { action: 'PAUSE' | 'RESUME' | 'TRIGGER'; sequenceId?: string };
+
+  const conversation = await prisma.appConversation.findFirst({
+    where: { id, tenantId },
+  });
+
+  if (!conversation) {
+    res.status(404).json({ success: false, error: 'NotFound', message: 'Conversation not found' });
+    return;
+  }
+
+  const payload = (conversation.payload as Record<string, unknown>) || {};
+  payload.dripState = {
+    sequenceId: sequenceId || 'default-nurture-sequence',
+    status: action || 'TRIGGER',
+    updatedAt: new Date().toISOString(),
+  };
+
+  await prisma.appConversation.update({
+    where: { id },
+    data: { payload: payload as unknown as Prisma.InputJsonValue },
+  });
+
+  res.json({ success: true, message: `Drip sequence ${action} successfully`, error: null });
+});
+

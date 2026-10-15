@@ -300,29 +300,37 @@ leadsRouter.get('/:id/360', async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const id = String(req.params.id);
 
-  const [lead, timeline, tasks, calls, customFieldsDef] = await Promise.all([
-    prisma.salesLeadAssignment.findFirst({
-      where: { id, tenantId },
-      include: {
-        assignedAgent: {
-          select: {
-            id: true,
-            agentCode: true,
-            user: { select: { id: true, displayName: true, email: true, phone: true } },
-          },
+  // 1. Strict Tenant Isolation: verify lead exists in tenant first
+  const lead = await prisma.salesLeadAssignment.findFirst({
+    where: { id, tenantId },
+    include: {
+      assignedAgent: {
+        select: {
+          id: true,
+          agentCode: true,
+          user: { select: { id: true, displayName: true, email: true, phone: true } },
         },
       },
-    }),
+    },
+  });
+
+  if (!lead) {
+    res.status(404).json({ success: false, data: null, error: 'NotFound', message: 'Lead not found in this workspace' });
+    return;
+  }
+
+  // 2. Fetch all child resources strictly isolated to this verified lead
+  const [timeline, tasks, calls, customFieldsDef] = await Promise.all([
     prisma.salesLeadTimelineEntry.findMany({
-      where: { leadId: id, tenantId },
+      where: { leadId: lead.id, tenantId },
       orderBy: { createdAt: 'desc' },
     }),
     prisma.gxLeadTask.findMany({
-      where: { salesLeadId: id },
+      where: { salesLeadId: lead.id },
       orderBy: { dueAt: 'asc' },
     }),
     prisma.salesMobileCall.findMany({
-      where: { assignmentId: id, tenantId },
+      where: { assignmentId: lead.id, tenantId },
       orderBy: { startedAt: 'desc' },
       take: 20,
     }),
@@ -332,12 +340,7 @@ leadsRouter.get('/:id/360', async (req: Request, res: Response) => {
     }),
   ]);
 
-  if (!lead) {
-    res.status(404).json({ success: false, data: null, error: 'NotFound', message: 'Lead not found in this workspace' });
-    return;
-  }
-
-  // 1. Prioritize direct conversationId on lead, fallback to phone
+  // 3. Direct conversation relation prioritized, fallback to phone
   let conversation = null;
   if (lead.conversationId) {
     conversation = await prisma.appConversation.findFirst({
@@ -358,7 +361,7 @@ leadsRouter.get('/:id/360', async (req: Request, res: Response) => {
     }
   }
 
-  // 2. Prioritize payments associated directly with this leadId in customFields, fallback to customerPhone
+  // 4. Payments directly linked to lead in customFields, fallback to customerPhone
   const payments = await prisma.upiPaymentLink.findMany({
     where: {
       tenantId,
