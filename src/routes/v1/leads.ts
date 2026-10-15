@@ -120,6 +120,55 @@ leadsRouter.post('/', validateBody(createLeadSchema), async (req: Request, res: 
     return;
   }
 
+  // Tenant-scoped deduplication check: prevent duplicate leads for the same phone number
+  const rawPhone = body.customerPhone?.trim() || "";
+  const cleanDigits = rawPhone.replace(/\D/g, "");
+  const last10 = cleanDigits.length >= 10 ? cleanDigits.slice(-10) : cleanDigits;
+
+  if (last10 && last10.length >= 7) {
+    const existing = await prisma.salesLeadAssignment.findFirst({
+      where: {
+        tenantId,
+        OR: [
+          { customerPhone: body.customerPhone },
+          { customerPhone: { contains: last10 } },
+          ...(body.customerEmail ? [{ customerEmail: body.customerEmail }] : []),
+        ],
+      },
+    });
+
+    if (existing) {
+      // Enrich existing lead with any new notes / metadata without creating a duplicate row
+      const updated = await prisma.salesLeadAssignment.update({
+        where: { id: existing.id },
+        data: {
+          lastContactedAt: new Date(),
+          ...(body.notes ? { notes: existing.notes ? (existing.notes + "\n---\n" + body.notes) : body.notes } : {}),
+          ...(body.budgetAmount ? { budgetAmount: body.budgetAmount } : {}),
+        },
+      });
+
+      await prisma.salesActivityLog.create({
+        data: {
+          tenantId,
+          assignmentId: existing.id,
+          actorUserId: req.user?.userId,
+          action: "LEAD_DEDUPLICATED",
+          note: "Incoming lead for " + body.customerName + " (" + body.customerPhone + ") deduplicated against existing lead ID " + existing.id,
+        },
+      });
+
+      res.status(200).json({
+        success: true,
+        deduplicated: true,
+        message: "Lead already exists for this phone number in your workspace and was updated.",
+        data: updated,
+        error: null,
+      });
+      return;
+    }
+  }
+
   const lead = await prisma.salesLeadAssignment.create({
     data: {
       tenantId, // Root ownership strictly enforced
