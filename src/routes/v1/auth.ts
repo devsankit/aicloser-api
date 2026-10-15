@@ -1,5 +1,5 @@
 import { Router, Request, Response } from 'express';
-import { scryptSync, timingSafeEqual } from 'node:crypto';
+import { scryptSync, timingSafeEqual, randomUUID } from 'node:crypto';
 import jwt from 'jsonwebtoken';
 import { z } from 'zod';
 import { prisma } from '../../lib/prisma.js';
@@ -44,7 +44,7 @@ function invalidCredentials(res: Response) {
 
 authRouter.post('/login', validateBody(loginSchema), async (req: Request, res: Response) => {
   const { identifier, password, clientType, deviceId, deviceName, platform, appVersion } = req.body;
-  const installationId = req.body.installationId || req.header('x-installation-id') || null;
+  const installationId = req.body.installationId || req.header('x-installation-id') || (clientType === 'DESKTOP' ? 'web-session-' + randomUUID().slice(0, 12) : null);
 
   // Search user by email or phone
   const user = await prisma.appAuthUser.findFirst({
@@ -151,6 +151,7 @@ authRouter.post('/login', validateBody(loginSchema), async (req: Request, res: R
       user: userPayload,
       resumed: clientSession.resumed,
     },
+    error: null,
   });
 });
 

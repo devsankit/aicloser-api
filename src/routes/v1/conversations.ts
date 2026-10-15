@@ -1,3 +1,4 @@
+import fs from 'fs';
 import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import { randomUUID } from 'crypto';
@@ -7,6 +8,7 @@ import { authenticate } from '../../middlewares/auth.js';
 import { enforceTenantIsolation } from '../../middlewares/tenant-isolation.js';
 import { validateBody, validateQuery } from '../../middlewares/validate.js';
 
+import path from 'path';
 export const conversationsRouter = Router();
 
 conversationsRouter.use(authenticate, enforceTenantIsolation);
@@ -138,15 +140,14 @@ conversationsRouter.get('/', validateQuery(listConversationsQuerySchema), async 
 
   res.json({
     success: true,
-    data: {
-      conversations: items,
-      pagination: {
-        total,
-        page,
-        limit,
-        totalPages: Math.ceil(total / limit),
-      },
+    data: items,
+    pagination: {
+      total,
+      page,
+      limit,
+      totalPages: Math.ceil(total / limit),
     },
+    error: null,
   });
 });
 
@@ -201,8 +202,13 @@ conversationsRouter.post('/start', validateBody(startConversationSchema), async 
   res.status(201).json({ success: true, data: conversation });
 });
 
-// 3. GET /:id/messages - Get clean message stream for conversation
-conversationsRouter.get('/:id/messages', async (req: Request, res: Response) => {
+const getMessagesQuerySchema = z.object({
+  before: z.string().optional(),
+  limit: z.string().optional().transform((v) => (v ? Math.min(100, Math.max(1, Number(v))) : 50)),
+});
+
+// 3. GET /:id/messages - Get clean message stream for conversation with cursor pagination
+conversationsRouter.get('/:id/messages', validateQuery(getMessagesQuerySchema), async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const id = String(req.params.id);
 
@@ -226,7 +232,20 @@ conversationsRouter.get('/:id/messages', async (req: Request, res: Response) => 
   const payload = (conversation.payload as Record<string, unknown>) || {};
   const rawMessages = (Array.isArray(payload.messages) ? payload.messages : []) as Array<Record<string, unknown>>;
 
-  const messages: CleanChatMessage[] = rawMessages.map((m) => ({
+  const { before, limit } = req.query as unknown as { before?: string; limit: number };
+
+  let endIndex = rawMessages.length;
+  if (before) {
+    const foundIdx = rawMessages.findIndex((m) => String(m.id) === before);
+    if (foundIdx !== -1) {
+      endIndex = foundIdx;
+    }
+  }
+
+  const startIndex = Math.max(0, endIndex - limit);
+  const slicedRaw = rawMessages.slice(startIndex, endIndex);
+
+  const messages: CleanChatMessage[] = slicedRaw.map((m) => ({
     id: String(m.id || ''),
     body: String(m.body || ''),
     lane: (m.lane === 'internal' ? 'internal' : 'customer'),
@@ -245,7 +264,13 @@ conversationsRouter.get('/:id/messages', async (req: Request, res: Response) => 
       customerPhone: conversation.customerPhone,
       status: conversation.status,
       messages,
+      pagination: {
+        hasMore: startIndex > 0,
+        nextCursor: startIndex > 0 && messages.length > 0 ? messages[0].id : null,
+        totalInThread: rawMessages.length,
+      },
     },
+    error: null,
   });
 });
 
@@ -344,4 +369,79 @@ conversationsRouter.get('/:id', async (req: Request, res: Response) => {
   }
 
   res.json({ success: true, data: conversation });
+});
+
+// 7. POST /:id/attachments - Upload chat attachment (Image, PDF, Document)
+conversationsRouter.post('/:id/attachments', async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const id = String(req.params.id);
+  const { name, mimeType, sizeBytes, base64Data, externalUrl } = req.body as {
+    name: string;
+    mimeType?: string;
+    sizeBytes?: number;
+    base64Data?: string;
+    externalUrl?: string;
+  };
+
+  if (!name) {
+    res.status(400).json({ success: false, data: null, error: 'InvalidRequest', message: 'Attachment name is required' });
+    return;
+  }
+
+  const conversation = await prisma.appConversation.findFirst({
+    where: { id, tenantId },
+  });
+
+  if (!conversation) {
+    res.status(404).json({ success: false, data: null, error: 'NotFound', message: 'Conversation not found' });
+    return;
+  }
+
+  const fileId = `att-${randomUUID().slice(0, 10)}`;
+  let fileUrl = externalUrl || '';
+
+  if (base64Data) {
+    const uploadDir = path.resolve(process.cwd(), 'data', 'uploads', 'attachments', id);
+    fs.mkdirSync(uploadDir, { recursive: true });
+    const safeFilename = `${fileId}-${name.replace(/[^a-zA-Z0-9._-]/g, '_')}`;
+    const filePath = path.join(uploadDir, safeFilename);
+    const buffer = Buffer.from(base64Data.replace(/^data:.*,/, ''), 'base64');
+    fs.writeFileSync(filePath, buffer);
+    fileUrl = `https://api.aicloser.in/api/v1/conversations/${id}/attachments/${safeFilename}`;
+  }
+
+  res.status(201).json({
+    success: true,
+    data: {
+      id: fileId,
+      name,
+      mimeType: mimeType || 'application/octet-stream',
+      sizeBytes: sizeBytes || 0,
+      url: fileUrl,
+    },
+    error: null,
+  });
+});
+
+// 8. GET /:id/attachments/:filename - Securely stream/preview chat attachment
+conversationsRouter.get('/:id/attachments/:filename', async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const { id, filename } = req.params;
+
+  const conversation = await prisma.appConversation.findFirst({
+    where: { id: String(id), tenantId },
+  });
+
+  if (!conversation) {
+    res.status(404).json({ success: false, data: null, error: 'NotFound', message: 'Conversation not found' });
+    return;
+  }
+
+  const filePath = path.resolve(process.cwd(), 'data', 'uploads', 'attachments', String(id), String(filename));
+  if (!fs.existsSync(filePath)) {
+    res.status(404).json({ success: false, data: null, error: 'NotFound', message: 'Attachment file not found' });
+    return;
+  }
+
+  res.sendFile(filePath);
 });

@@ -15,14 +15,32 @@ export function createServer() {
   // 1. Security Headers
   app.use(helmet());
 
-  // 2. CORS Allowlist
-  const allowedOrigins = env.CORS_ORIGIN.split(',').map((o) => o.trim());
+  // 2. Exact CORS Allowlist (Safe for credentials: true)
+  const defaultAllowedOrigins = [
+    'https://app.aicloser.in',
+    'https://aicloser.in',
+    'https://app.aicloser.com',
+    'https://aicloser.com',
+    'http://localhost:3000',
+    'http://localhost:3010',
+    'http://localhost:3050',
+    'http://localhost:5173',
+    'http://127.0.0.1:3000',
+    'http://127.0.0.1:3010',
+    'http://127.0.0.1:3050',
+    'http://127.0.0.1:5173',
+  ];
+
+  const envOrigins = env.CORS_ORIGIN === '*' ? [] : env.CORS_ORIGIN.split(',').map((o) => o.trim()).filter(Boolean);
+  const allowedOrigins = Array.from(new Set([...defaultAllowedOrigins, ...envOrigins]));
+
   app.use(
     cors({
       origin: (origin, callback) => {
-        if (!origin || allowedOrigins.includes('*') || allowedOrigins.includes(origin)) {
+        if (!origin || allowedOrigins.includes(origin)) {
           callback(null, true);
         } else {
+          logger.warn(`Blocked CORS request from origin: ${origin}`);
           callback(new Error(`Origin ${origin} not allowed by CORS`));
         }
       },
@@ -36,7 +54,7 @@ export function createServer() {
     limit: 300,
     standardHeaders: 'draft-7',
     legacyHeaders: false,
-    message: { success: false, error: 'TooManyRequests', message: 'Rate limit exceeded. Please try again later.' },
+    message: { success: false, data: null, error: 'TooManyRequests', message: 'Rate limit exceeded. Please try again later.' },
   });
   app.use(limiter);
 
@@ -68,6 +86,7 @@ export function createServer() {
   app.use((req: Request, res: Response) => {
     res.status(404).json({
       success: false,
+      data: null,
       error: 'NotFound',
       message: `Cannot ${req.method} ${req.path}`,
     });
@@ -85,6 +104,7 @@ export function createServer() {
 
     res.status(500).json({
       success: false,
+      data: null,
       error: 'InternalServerError',
       message: env.NODE_ENV === 'production' ? 'An unexpected error occurred' : err.message,
     });

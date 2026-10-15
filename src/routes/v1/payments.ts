@@ -61,15 +61,14 @@ paymentsRouter.get('/', validateQuery(listPaymentsQuerySchema), async (req: Requ
 
   res.json({
     success: true,
-    data: {
-      payments,
-      pagination: {
-        total,
-        page,
-        limit,
-        totalPages: Math.ceil(total / limit),
-      },
+    data: payments,
+    pagination: {
+      total,
+      page,
+      limit,
+      totalPages: Math.ceil(total / limit),
     },
+    error: null,
   });
 });
 

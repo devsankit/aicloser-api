@@ -77,15 +77,14 @@ leadsRouter.get('/', validateQuery(listLeadsQuerySchema), async (req: Request, r
 
   res.json({
     success: true,
-    data: {
-      leads,
-      pagination: {
-        total,
-        page,
-        limit,
-        totalPages: Math.ceil(total / limit),
-      },
+    data: leads,
+    pagination: {
+      total,
+      page,
+      limit,
+      totalPages: Math.ceil(total / limit),
     },
+    error: null,
   });
 });
 
@@ -287,6 +286,81 @@ leadsRouter.post('/merge', async (req: Request, res: Response) => {
   res.json({ success: true, message: 'Leads merged successfully', primaryLeadId });
 });
 
+
+// GET /:id/360 - Unified Lead 360 view
+leadsRouter.get('/:id/360', async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const id = String(req.params.id);
+
+  const [lead, timeline, tasks, calls, customFieldsDef] = await Promise.all([
+    prisma.salesLeadAssignment.findFirst({
+      where: { id, tenantId },
+      include: {
+        assignedAgent: {
+          select: {
+            id: true,
+            agentCode: true,
+            user: { select: { id: true, displayName: true, email: true, phone: true } },
+          },
+        },
+      },
+    }),
+    prisma.salesLeadTimelineEntry.findMany({
+      where: { leadId: id, tenantId },
+      orderBy: { createdAt: 'desc' },
+    }),
+    prisma.gxLeadTask.findMany({
+      where: { salesLeadId: id },
+      orderBy: { dueAt: 'asc' },
+    }),
+    prisma.salesMobileCall.findMany({
+      where: { assignmentId: id, tenantId },
+      orderBy: { startedAt: 'desc' },
+      take: 20,
+    }),
+    prisma.customFieldDefinition.findMany({
+      where: { tenantId },
+      orderBy: { createdAt: 'asc' },
+    }),
+  ]);
+
+  if (!lead) {
+    res.status(404).json({ success: false, data: null, error: 'NotFound', message: 'Lead not found in this workspace' });
+    return;
+  }
+
+  // Find associated conversation by customerPhone
+  const conversation = lead.customerPhone ? await prisma.appConversation.findFirst({
+    where: { tenantId, customerPhone: lead.customerPhone },
+    select: { id: true, status: true, updatedAt: true, payload: true },
+  }) : null;
+
+  // Find associated payments by customerPhone
+  const payments = await prisma.upiPaymentLink.findMany({
+    where: { tenantId, customerPhone: lead.customerPhone },
+    orderBy: { id: 'desc' },
+    take: 10,
+  });
+
+  res.json({
+    success: true,
+    data: {
+      lead,
+      timeline,
+      tasks,
+      calls,
+      conversation: conversation ? {
+        id: conversation.id,
+        status: conversation.status,
+        updatedAt: conversation.updatedAt,
+      } : null,
+      payments,
+      customFieldsDefinition: customFieldsDef,
+    },
+    error: null,
+  });
+});
+
 leadsRouter.get('/:id', async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const id = String(req.params.id);
@@ -333,11 +407,16 @@ leadsRouter.get('/:id', async (req: Request, res: Response) => {
 
 const updateLeadSchema = z.object({
   stage: z.nativeEnum(SalesLeadStage).optional(),
+  kanbanPosition: z.number().optional(),
   priority: z.string().optional(),
   notes: z.string().optional(),
   followUpAt: z.string().datetime().optional(),
   budgetAmount: z.number().optional(),
   assignedAgentId: z.string().optional(),
+  customFields: z.record(z.unknown()).optional(),
+  lostReason: z.string().optional().nullable(),
+  lostReasonNotes: z.string().optional().nullable(),
+  isDndActive: z.boolean().optional(),
 });
 
 leadsRouter.patch('/:id', validateBody(updateLeadSchema), async (req: Request, res: Response) => {

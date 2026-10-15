@@ -8,18 +8,28 @@ export async function authenticate(req: Request, res: Response, next: NextFuncti
   try {
     let token: string | null = null;
 
+    // 1. Check Authorization Bearer header
     const authHeader = req.headers.authorization;
     if (authHeader && authHeader.startsWith('Bearer ')) {
       token = authHeader.substring(7).trim();
+    } 
+    // 2. Check query string (Critical for native EventSource SSE which cannot send headers)
+    else if (typeof req.query?.token === 'string' && req.query.token.trim()) {
+      token = req.query.token.trim();
+    } else if (typeof req.query?.accessToken === 'string' && req.query.accessToken.trim()) {
+      token = req.query.accessToken.trim();
+    }
+    // 3. Check HTTP-only cookies
+    else if (req.cookies?.aicloser_token) {
+      token = req.cookies.aicloser_token;
     } else if (req.cookies?.gx_session) {
       token = req.cookies.gx_session;
-    } else if (req.cookies?.aicloser_token) {
-      token = req.cookies.aicloser_token;
     }
 
     if (!token) {
       res.status(401).json({
         success: false,
+        data: null,
         error: 'Unauthorized',
         message: 'Authentication token missing or invalid',
       });
@@ -31,6 +41,7 @@ export async function authenticate(req: Request, res: Response, next: NextFuncti
     if (!decoded.userId || !decoded.role) {
       res.status(401).json({
         success: false,
+        data: null,
         error: 'Unauthorized',
         message: 'Malformed token claims',
       });
@@ -42,6 +53,7 @@ export async function authenticate(req: Request, res: Response, next: NextFuncti
       if (!clientSession || clientSession.status !== 'ACTIVE' || clientSession.userId !== decoded.userId) {
         res.status(401).json({
           success: false,
+          data: null,
           error: 'SessionRevoked',
           message: 'This client session is no longer active',
         });
@@ -54,6 +66,7 @@ export async function authenticate(req: Request, res: Response, next: NextFuncti
   } catch (err: unknown) {
     res.status(401).json({
       success: false,
+      data: null,
       error: 'Unauthorized',
       message: err instanceof Error ? err.message : 'Invalid session token',
     });
