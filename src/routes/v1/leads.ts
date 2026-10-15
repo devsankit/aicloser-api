@@ -351,29 +351,51 @@ leadsRouter.post('/merge', async (req: Request, res: Response) => {
 });
 
 
-// GET /:id/360 - Unified Lead 360 view
-leadsRouter.get('/:id/360', async (req: Request, res: Response) => {
+async function verifyLeadAccess(leadId: string, req: Request) {
   const tenantId = req.tenantId!;
-  const id = String(req.params.id);
+  const user = req.user!;
 
-  // 1. Strict Tenant Isolation: verify lead exists in tenant first
   const lead = await prisma.salesLeadAssignment.findFirst({
-    where: { id, tenantId },
+    where: { id: leadId, tenantId },
     include: {
       assignedAgent: {
         select: {
           id: true,
           agentCode: true,
+          userId: true,
           user: { select: { id: true, displayName: true, email: true, phone: true } },
         },
       },
     },
   });
 
-  if (!lead) {
-    res.status(404).json({ success: false, data: null, error: 'NotFound', message: 'Lead not found in this workspace' });
+  if (!lead) return { ok: false as const, status: 404, error: 'NotFound', message: 'Lead not found in this workspace' };
+
+  // Closer scoping: SALES_AGENT can only access leads assigned to them
+  if (user.role === 'SALES_AGENT') {
+    const profile = await prisma.salesAgentProfile.findFirst({
+      where: { userId: user.userId, tenantId },
+      select: { id: true },
+    });
+    if (!profile || lead.assignedAgentId !== profile.id) {
+      return { ok: false as const, status: 403, error: 'Forbidden', message: 'You are not authorized to access this lead' };
+    }
+  }
+
+  return { ok: true as const, lead };
+}
+
+// GET /:id/360 - Unified Lead 360 view
+leadsRouter.get('/:id/360', async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const id = String(req.params.id);
+
+  const check = await verifyLeadAccess(id, req);
+  if (!check.ok) {
+    res.status(check.status).json({ success: false, data: null, error: check.error, message: check.message });
     return;
   }
+  const lead = check.lead;
 
   // 2. Fetch all child resources strictly isolated to this verified lead
   const [timeline, tasks, calls, customFieldsDef] = await Promise.all([
@@ -475,17 +497,14 @@ leadsRouter.get('/:id', async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const id = String(req.params.id);
 
-  const where: Record<string, unknown> = { id, tenantId };
-  if (req.user?.role === 'SALES_AGENT') {
-    const profile = await prisma.salesAgentProfile.findFirst({
-      where: { userId: req.user.userId, tenantId },
-      select: { id: true },
-    });
-    where.assignedAgentId = profile?.id ?? '__NO_ACCESS__';
+  const check = await verifyLeadAccess(id, req);
+  if (!check.ok) {
+    res.status(check.status).json({ success: false, data: null, error: check.error, message: check.message });
+    return;
   }
 
   const lead = await prisma.salesLeadAssignment.findFirst({
-    where,
+    where: { id: check.lead.id, tenantId },
     include: {
       assignedAgent: {
         select: {
@@ -691,26 +710,21 @@ leadsRouter.get('/:id/notes', async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const id = String(req.params.id);
 
-  const [lead, entries] = await Promise.all([
-    prisma.salesLeadAssignment.findFirst({
-      where: { id, tenantId },
-      select: { id: true, notes: true },
-    }),
-    prisma.salesLeadTimelineEntry.findMany({
-      where: { leadId: id, tenantId },
-      orderBy: { createdAt: 'desc' },
-    }),
-  ]);
-
-  if (!lead) {
-    res.status(404).json({ success: false, error: 'NotFound', message: 'Lead not found' });
+  const check = await verifyLeadAccess(id, req);
+  if (!check.ok) {
+    res.status(check.status).json({ success: false, error: check.error, message: check.message });
     return;
   }
+
+  const entries = await prisma.salesLeadTimelineEntry.findMany({
+    where: { leadId: check.lead.id, tenantId },
+    orderBy: { createdAt: 'desc' },
+  });
 
   res.json({
     success: true,
     data: {
-      summaryNotes: lead.notes || '',
+      summaryNotes: check.lead.notes || '',
       timelineNotes: entries,
     },
   });
@@ -727,10 +741,16 @@ leadsRouter.post('/:id/notes', async (req: Request, res: Response) => {
     return;
   }
 
+  const check = await verifyLeadAccess(id, req);
+  if (!check.ok) {
+    res.status(check.status).json({ success: false, error: check.error, message: check.message });
+    return;
+  }
+
   const entry = await prisma.salesLeadTimelineEntry.create({
     data: {
       tenantId,
-      leadId: id,
+      leadId: check.lead.id,
       type: 'NOTE',
       body: body.trim(),
       userId: req.user?.userId,
@@ -744,8 +764,14 @@ leadsRouter.post('/:id/notes', async (req: Request, res: Response) => {
 leadsRouter.get('/:id/tasks', async (req: Request, res: Response) => {
   const id = String(req.params.id);
 
+  const check = await verifyLeadAccess(id, req);
+  if (!check.ok) {
+    res.status(check.status).json({ success: false, error: check.error, message: check.message });
+    return;
+  }
+
   const tasks = await prisma.gxLeadTask.findMany({
-    where: { salesLeadId: id },
+    where: { salesLeadId: check.lead.id },
     orderBy: { dueAt: 'asc' },
   });
 
@@ -767,9 +793,15 @@ leadsRouter.post('/:id/tasks', async (req: Request, res: Response) => {
     return;
   }
 
+  const check = await verifyLeadAccess(id, req);
+  if (!check.ok) {
+    res.status(check.status).json({ success: false, error: check.error, message: check.message });
+    return;
+  }
+
   const task = await prisma.gxLeadTask.create({
     data: {
-      salesLeadId: id,
+      salesLeadId: check.lead.id,
       createdById: req.user?.userId,
       title: title.trim(),
       description: description?.trim(),
@@ -784,8 +816,23 @@ leadsRouter.post('/:id/tasks', async (req: Request, res: Response) => {
 
 // PATCH /:id/tasks/:taskId - Update task status
 leadsRouter.patch('/:id/tasks/:taskId', async (req: Request, res: Response) => {
+  const id = String(req.params.id);
   const taskId = String(req.params.taskId);
   const { status } = req.body as { status: string };
+
+  const check = await verifyLeadAccess(id, req);
+  if (!check.ok) {
+    res.status(check.status).json({ success: false, error: check.error, message: check.message });
+    return;
+  }
+
+  const existingTask = await prisma.gxLeadTask.findFirst({
+    where: { id: taskId, salesLeadId: check.lead.id },
+  });
+  if (!existingTask) {
+    res.status(404).json({ success: false, error: 'NotFound', message: 'Task not found on this lead' });
+    return;
+  }
 
   const task = await prisma.gxLeadTask.update({
     where: { id: taskId },
@@ -800,7 +847,22 @@ leadsRouter.patch('/:id/tasks/:taskId', async (req: Request, res: Response) => {
 
 // DELETE /:id/tasks/:taskId - Delete a task
 leadsRouter.delete('/:id/tasks/:taskId', async (req: Request, res: Response) => {
+  const id = String(req.params.id);
   const taskId = String(req.params.taskId);
+
+  const check = await verifyLeadAccess(id, req);
+  if (!check.ok) {
+    res.status(check.status).json({ success: false, error: check.error, message: check.message });
+    return;
+  }
+
+  const existingTask = await prisma.gxLeadTask.findFirst({
+    where: { id: taskId, salesLeadId: check.lead.id },
+  });
+  if (!existingTask) {
+    res.status(404).json({ success: false, error: 'NotFound', message: 'Task not found on this lead' });
+    return;
+  }
 
   await prisma.gxLeadTask.delete({
     where: { id: taskId },

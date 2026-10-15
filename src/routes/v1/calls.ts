@@ -227,6 +227,18 @@ callsRouter.post('/:id/disposition', validateBody(dispositionSchema), async (req
     return;
   }
 
+  // Ownership verification: SALES_AGENT can only set disposition on their own calls
+  if (req.user?.role === 'SALES_AGENT') {
+    const profile = await prisma.salesAgentProfile.findFirst({
+      where: { userId: req.user.userId, tenantId },
+      select: { id: true },
+    });
+    if (!profile || call.agentId !== profile.id) {
+      res.status(403).json({ success: false, error: 'Forbidden', message: 'You are not authorized to update this call' });
+      return;
+    }
+  }
+
   const updatedCall = await prisma.salesMobileCall.update({
     where: { id: call.id },
     data: {
@@ -298,6 +310,18 @@ callsRouter.post('/:id/discard', async (req: Request, res: Response) => {
   if (!call) {
     res.status(404).json({ success: false, error: 'NotFound', message: 'Call not found in this workspace' });
     return;
+  }
+
+  // Ownership verification: SALES_AGENT can only set disposition on their own calls
+  if (req.user?.role === 'SALES_AGENT') {
+    const profile = await prisma.salesAgentProfile.findFirst({
+      where: { userId: req.user.userId, tenantId },
+      select: { id: true },
+    });
+    if (!profile || call.agentId !== profile.id) {
+      res.status(403).json({ success: false, error: 'Forbidden', message: 'You are not authorized to update this call' });
+      return;
+    }
   }
 
   const updatedCall = await prisma.salesMobileCall.update({
