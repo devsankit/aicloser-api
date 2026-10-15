@@ -255,7 +255,7 @@ async function runAcceptanceSuite() {
 
     // Verify exactly 1 lead exists in the workspace for this phone
     const verifyRes = await apiRequest(
-      { path: `/api/v1/leads?search=${testPhone}`, method: 'GET', token: tokenAdminA }
+      { path: '/api/v1/leads?search=' + encodeURIComponent(testPhone), method: 'GET', token: tokenAdminA }
     );
     assert.strictEqual(verifyRes.statusCode, 200);
     assert.strictEqual(Array.isArray(verifyRes.data.data), true);
@@ -308,3 +308,4 @@ runAcceptanceSuite().catch((err) => {
   console.error('Fatal test error:', err);
   process.exit(1);
 });
+

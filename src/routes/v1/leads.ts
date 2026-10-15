@@ -51,10 +51,13 @@ leadsRouter.get('/', validateQuery(listLeadsQuerySchema), async (req: Request, r
   }
 
   if (search) {
+    const trimmed = search.trim();
+    const phoneVariation = trimmed.startsWith('+') ? trimmed : `+${trimmed}`;
     where.OR = [
-      { customerName: { contains: search, mode: 'insensitive' } },
-      { customerPhone: { contains: search } },
-      { customerEmail: { contains: search, mode: 'insensitive' } },
+      { customerName: { contains: trimmed, mode: 'insensitive' } },
+      { customerPhone: { contains: trimmed } },
+      { customerPhone: { contains: phoneVariation } },
+      { customerEmail: { contains: trimmed, mode: 'insensitive' } },
     ];
   }
 
@@ -1024,3 +1027,4 @@ leadsRouter.post('/:id/reassign', requirePermissions(PERM_LEADS_REASSIGN), valid
     message: `Lead successfully reassigned to ${targetAgent.user.displayName || targetAgent.agentCode}`,
   });
 });
+
