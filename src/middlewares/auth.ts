@@ -3,6 +3,7 @@ import jwt from 'jsonwebtoken';
 import { env } from '../config/env.js';
 import { AuthenticatedUser } from '../types/auth.js';
 import { getActiveClientSession } from '../lib/client-sessions.js';
+import { prisma } from '../lib/prisma.js';
 
 export async function authenticate(req: Request, res: Response, next: NextFunction): Promise<void> {
   try {
@@ -38,20 +39,31 @@ export async function authenticate(req: Request, res: Response, next: NextFuncti
 
     let decoded: any = null;
 
-    // Try primary JWT secret first
+    // Cryptographic signature verification - NO UNVERIFIED DECODE FALLBACK ALLOWED
     try {
       decoded = jwt.verify(token, env.JWT_SECRET) as AuthenticatedUser;
     } catch (e) {
-      // Fallback: try secondary/legacy session secrets if available
-      const fallbackSecret = process.env.GIGXOMI_SESSION_SECRET || 'gigxomi-staging-session-secret';
-      try {
-        decoded = jwt.verify(token, fallbackSecret);
-      } catch (e2) {
-        // As a safe fallback for cross-system token parsing:
-        decoded = jwt.decode(token);
-        if (!decoded || !decoded.userId) {
-          throw new Error('Invalid token signature and payload');
+      const fallbackSecret = process.env.GIGXOMI_SESSION_SECRET;
+      if (fallbackSecret) {
+        try {
+          decoded = jwt.verify(token, fallbackSecret) as AuthenticatedUser;
+        } catch {
+          res.status(401).json({
+            success: false,
+            data: null,
+            error: 'InvalidTokenSignature',
+            message: 'Authentication token signature verification failed',
+          });
+          return;
         }
+      } else {
+        res.status(401).json({
+          success: false,
+          data: null,
+          error: 'InvalidTokenSignature',
+          message: 'Authentication token signature verification failed',
+        });
+        return;
       }
     }
 
@@ -91,6 +103,47 @@ export async function authenticate(req: Request, res: Response, next: NextFuncti
           message: 'This client session is no longer active',
         });
         return;
+      }
+    }
+
+    // Database authority check (prevent deactivated users or locked workspaces from accessing API)
+    if (authenticatedUser.userId) {
+      const dbUser = await prisma.appAuthUser.findUnique({
+        where: { id: authenticatedUser.userId },
+        select: {
+          packageStatus: true,
+          role: true,
+          tenantId: true,
+          AicloserWorkspace: { select: { status: true } },
+        },
+      });
+
+      if (dbUser) {
+        if (dbUser.packageStatus === 'PAUSED' || dbUser.packageStatus === 'EXPIRED') {
+          res.status(403).json({
+            success: false,
+            data: null,
+            error: 'AccountSuspended',
+            message: 'Your user account is suspended or expired. Contact your administrator.',
+          });
+          return;
+        }
+
+        if (dbUser.AicloserWorkspace && (dbUser.AicloserWorkspace.status === 'SUSPENDED' || dbUser.AicloserWorkspace.status === 'LOCKED')) {
+          res.status(403).json({
+            success: false,
+            data: null,
+            error: 'WorkspaceLocked',
+            message: `Workspace is ${dbUser.AicloserWorkspace.status.toLowerCase()}. Access is restricted.`,
+          });
+          return;
+        }
+
+        // Canonical server authority takes precedence over client token claims
+        authenticatedUser.role = (dbUser.role as any) || authenticatedUser.role;
+        if (dbUser.tenantId) {
+          authenticatedUser.tenantId = dbUser.tenantId;
+        }
       }
     }
 

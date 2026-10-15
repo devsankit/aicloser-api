@@ -169,12 +169,54 @@ integrationsRouter.post('/whatsapp/channels/:id/register-phone', requireRoles('A
     return;
   }
 
-  res.json({
-    success: true,
-    message: `Phone ${channel.displayPhoneNumber} registered with Meta WhatsApp Cloud API`,
-    data: { id: channel.id, status: 'ACTIVE', verified: true },
-    error: null,
-  });
+  if (!channel.encryptedAccessToken || !channel.phoneNumberId) {
+    res.status(400).json({
+      success: false,
+      error: 'ChannelNotConfigured',
+      message: 'Channel lacks Meta access token or phone number ID. Reconnect WhatsApp Business account.',
+    });
+    return;
+  }
+
+  try {
+    const response = await fetch(`https://graph.facebook.com/v21.0/${channel.phoneNumberId}/register`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${channel.encryptedAccessToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ messaging_product: 'whatsapp', pin }),
+    });
+
+    const metaData = (await response.json()) as any;
+    if (!response.ok) {
+      res.status(response.status).json({
+        success: false,
+        error: 'MetaRegistrationFailed',
+        message: metaData?.error?.message || 'Meta registration failed',
+        data: metaData,
+      });
+      return;
+    }
+
+    await prisma.whatsAppChannel.update({
+      where: { id: channel.id },
+      data: { status: 'ACTIVE' },
+    });
+
+    res.json({
+      success: true,
+      message: `Phone ${channel.displayPhoneNumber} successfully registered with Meta Cloud API`,
+      data: { id: channel.id, status: 'ACTIVE', verified: true },
+      error: null,
+    });
+  } catch (err: unknown) {
+    res.status(502).json({
+      success: false,
+      error: 'MetaGatewayError',
+      message: err instanceof Error ? err.message : 'Failed to reach Meta registration endpoint',
+    });
+  }
 });
 
 // POST /whatsapp/channels/:id/subscribe-webhook - Subscribe WABA to webhook
@@ -292,20 +334,64 @@ integrationsRouter.post('/whatsapp/messages', validateBody(sendWhatsAppMessageSc
     orderBy: { isDefault: 'desc' },
   });
 
-  const wamid = `wamid.${Date.now()}.${Math.random().toString(36).slice(2, 9)}`;
+  if (!channel || !channel.encryptedAccessToken || !channel.phoneNumberId) {
+    res.status(400).json({
+      success: false,
+      error: 'WhatsAppNotConfigured',
+      message: 'No active WhatsApp Business channel configured. Connect a verified WhatsApp Business Account first.',
+    });
+    return;
+  }
 
-  res.status(200).json({
-    success: true,
-    data: {
-      messageId: wamid,
-      recipientPhone,
-      status: 'SENT',
-      channelId: channel?.id || 'simulated-channel',
-      sentAt: new Date().toISOString(),
-      conversationId: conversationId || null,
-    },
-    error: null,
-  });
+  try {
+    const metaUrl = `https://graph.facebook.com/v21.0/${channel.phoneNumberId}/messages`;
+    const response = await fetch(metaUrl, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${channel.encryptedAccessToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        messaging_product: 'whatsapp',
+        recipient_type: 'individual',
+        to: recipientPhone.replace(/[^0-9]/g, ''),
+        type: 'text',
+        text: { preview_url: false, body },
+      }),
+    });
+
+    const metaData = (await response.json()) as any;
+    if (!response.ok) {
+      res.status(response.status).json({
+        success: false,
+        error: 'MetaApiError',
+        message: metaData?.error?.message || 'Meta Cloud API rejected message',
+        data: metaData,
+      });
+      return;
+    }
+
+    const realWamid = metaData.messages?.[0]?.id;
+
+    res.status(200).json({
+      success: true,
+      data: {
+        messageId: realWamid,
+        recipientPhone,
+        status: 'SENT',
+        channelId: channel.id,
+        sentAt: new Date().toISOString(),
+        conversationId: conversationId || null,
+      },
+      error: null,
+    });
+  } catch (err: unknown) {
+    res.status(502).json({
+      success: false,
+      error: 'MetaGatewayError',
+      message: err instanceof Error ? err.message : 'Failed to connect to Meta WhatsApp Graph API',
+    });
+  }
 });
 
 // GET /whatsapp/media/:mediaId - Proxy media download

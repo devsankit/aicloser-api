@@ -177,22 +177,43 @@ leadsRouter.post('/', validateBody(createLeadSchema), async (req: Request, res: 
     }
   }
 
-  const lead = await prisma.salesLeadAssignment.create({
-    data: {
-      tenantId, // Root ownership strictly enforced
-      customerName: body.customerName,
-      customerPhone: body.customerPhone,
-      customerEmail: body.customerEmail,
-      assignedAgentId: body.assignedAgentId,
-      createdById: req.user?.userId,
-      serviceInterest: body.serviceInterest,
-      segment: body.segment,
-      priority: body.priority,
-      notes: body.notes,
-      stage: body.stage,
-      budgetAmount: body.budgetAmount,
-    },
-  });
+  let lead;
+  try {
+    lead = await prisma.salesLeadAssignment.create({
+      data: {
+        tenantId, // Root ownership strictly enforced
+        customerName: body.customerName,
+        customerPhone: body.customerPhone,
+        customerEmail: body.customerEmail,
+        assignedAgentId: agent.id, // canonicalized profile ID
+        createdById: req.user?.userId,
+        serviceInterest: body.serviceInterest,
+        segment: body.segment,
+        priority: body.priority,
+        notes: body.notes,
+        stage: body.stage,
+        budgetAmount: body.budgetAmount,
+      },
+    });
+  } catch (err: any) {
+    if (err?.code === 'P2002' || err?.message?.includes('idx_salesleadassignment_tenant_phone')) {
+      // Race-condition resilience: return existing record if concurrently inserted
+      const existing = await prisma.salesLeadAssignment.findFirst({
+        where: { tenantId, customerPhone: body.customerPhone },
+      });
+      if (existing) {
+        res.status(200).json({
+          success: true,
+          data: existing,
+          deduplicated: true,
+          message: 'Lead already exists in workspace; enriched existing record',
+          error: null,
+        });
+        return;
+      }
+    }
+    throw err;
+  }
 
   // Also log activity log under this tenant
   await prisma.salesActivityLog.create({

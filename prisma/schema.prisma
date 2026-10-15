@@ -174,7 +174,7 @@ model SalesLeadAssignment {
   @@index([tenantId, createdAt])
   @@index([tenantId, stage])
   @@index([tenantId, stage, kanbanPosition])
-  @@index([tenantId, customerPhone])
+  @@unique([tenantId, customerPhone], map: "idx_salesleadassignment_tenant_phone")
   @@index([tenantId, conversationId])
   @@index([assignedAgentId, stage])
   @@index([leadId])
