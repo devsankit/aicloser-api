@@ -788,6 +788,79 @@ leadsRouter.post('/:id/notes', async (req: Request, res: Response) => {
   res.status(201).json({ success: true, data: entry });
 });
 
+// PATCH /:id/notes/:noteId - Edit a timeline note
+leadsRouter.patch('/:id/notes/:noteId', async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const id = String(req.params.id);
+  const noteId = String(req.params.noteId);
+  const { body } = req.body as { body?: string };
+
+  if (!body || !body.trim()) {
+    res.status(400).json({ success: false, error: 'InvalidRequest', message: 'Note content cannot be empty' });
+    return;
+  }
+
+  const check = await verifyLeadAccess(id, req);
+  if (!check.ok) {
+    res.status(check.status).json({ success: false, error: check.error, message: check.message });
+    return;
+  }
+
+  const existingNote = await prisma.salesLeadTimelineEntry.findFirst({
+    where: { id: noteId, leadId: check.lead.id, tenantId },
+  });
+
+  if (!existingNote) {
+    res.status(404).json({ success: false, error: 'NotFound', message: 'Note not found' });
+    return;
+  }
+
+  if (req.user?.role === 'SALES_AGENT' && existingNote.userId && existingNote.userId !== req.user.userId) {
+    res.status(403).json({ success: false, error: 'Forbidden', message: 'Cannot edit a note created by another user' });
+    return;
+  }
+
+  const updated = await prisma.salesLeadTimelineEntry.update({
+    where: { id: noteId },
+    data: { body: body.trim() },
+  });
+
+  res.json({ success: true, message: 'Note updated successfully', data: updated });
+});
+
+// DELETE /:id/notes/:noteId - Delete a timeline note
+leadsRouter.delete('/:id/notes/:noteId', async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const id = String(req.params.id);
+  const noteId = String(req.params.noteId);
+
+  const check = await verifyLeadAccess(id, req);
+  if (!check.ok) {
+    res.status(check.status).json({ success: false, error: check.error, message: check.message });
+    return;
+  }
+
+  const existingNote = await prisma.salesLeadTimelineEntry.findFirst({
+    where: { id: noteId, leadId: check.lead.id, tenantId },
+  });
+
+  if (!existingNote) {
+    res.status(404).json({ success: false, error: 'NotFound', message: 'Note not found' });
+    return;
+  }
+
+  if (req.user?.role === 'SALES_AGENT' && existingNote.userId && existingNote.userId !== req.user.userId) {
+    res.status(403).json({ success: false, error: 'Forbidden', message: 'Cannot delete a note created by another user' });
+    return;
+  }
+
+  await prisma.salesLeadTimelineEntry.delete({
+    where: { id: noteId },
+  });
+
+  res.json({ success: true, message: 'Note deleted successfully', data: { deletedNoteId: noteId } });
+});
+
 // GET /:id/tasks - Get tasks for a lead
 leadsRouter.get('/:id/tasks', async (req: Request, res: Response) => {
   const id = String(req.params.id);
@@ -1027,4 +1100,5 @@ leadsRouter.post('/:id/reassign', requirePermissions(PERM_LEADS_REASSIGN), valid
     message: `Lead successfully reassigned to ${targetAgent.user.displayName || targetAgent.agentCode}`,
   });
 });
+
 
