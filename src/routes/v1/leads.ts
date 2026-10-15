@@ -792,3 +792,60 @@ leadsRouter.delete('/:id/tasks/:taskId', async (req: Request, res: Response) => 
 
   res.json({ success: true, message: 'Task deleted successfully' });
 });
+
+// GET /api/v1/leads/delta - High-efficiency delta sync for mobile and web offline sync
+leadsRouter.get('/delta', async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const since = req.query.since ? String(req.query.since) : undefined;
+  const limit = Math.min(100, Math.max(1, Number(req.query.limit || 50)));
+
+  const where: any = { tenantId };
+
+  if (since) {
+    const sinceDate = new Date(since);
+    if (!isNaN(sinceDate.getTime())) {
+      where.updatedAt = { gt: sinceDate };
+    }
+  }
+
+  // Closer scoping
+  if (req.user?.role === 'SALES_AGENT') {
+    const profile = await prisma.salesAgentProfile.findFirst({
+      where: { userId: req.user.userId, tenantId },
+      select: { id: true },
+    });
+    where.assignedAgentId = profile?.id ?? '__NO_ACCESS__';
+  }
+
+  const rows = await prisma.salesLeadAssignment.findMany({
+    where,
+    take: limit + 1,
+    orderBy: { updatedAt: 'asc' },
+    include: {
+      assignedAgent: {
+        select: {
+          id: true,
+          agentCode: true,
+          user: { select: { displayName: true } },
+        },
+      },
+    },
+  });
+
+  const hasMore = rows.length > limit;
+  const leads = hasMore ? rows.slice(0, limit) : rows;
+  const lastLead = leads[leads.length - 1];
+  const nextSyncCursor = lastLead?.updatedAt?.toISOString() || since || new Date().toISOString();
+
+  res.json({
+    success: true,
+    data: {
+      leads,
+      hasMore,
+      nextSyncCursor,
+      count: leads.length,
+      serverTime: new Date().toISOString(),
+    },
+    error: null,
+  });
+});

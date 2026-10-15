@@ -48,6 +48,17 @@ recordingsRouter.post('/init', validateBody(initSchema), async (req: Request, re
     return;
   }
 
+  // Device ownership validation
+  if (input.deviceId) {
+    const device = await prisma.salesMobileDevice.findFirst({
+      where: { deviceId: input.deviceId, tenantId },
+    });
+    if (!device) {
+      res.status(403).json({ success: false, error: 'UnregisteredDevice', message: 'Device not registered in this workspace' });
+      return;
+    }
+  }
+
   const objectKey = `${safePart(tenantId)}/calls/${safePart(call.id)}/${safePart(input.clientUploadId)}`;
   const upload = await prisma.callRecordingUpload.create({
     data: {

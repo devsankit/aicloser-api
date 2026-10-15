@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import { Prisma } from '@prisma/client';
@@ -256,6 +257,34 @@ mobileRouter.post('/offline-events/sync', validateBody(syncSchema), async (req: 
           const rawRecordingStatus = typeof event.payload.recordingStatus === 'string' ? event.payload.recordingStatus : call.recordingStatus;
           const recordingStatus = allowed.includes(rawRecordingStatus as (typeof allowed)[number]) ? rawRecordingStatus as (typeof allowed)[number] : call.recordingStatus;
           await tx.salesMobileCall.update({ where: { id: call.id }, data: { status: 'COMPLETED', endedAt: typeof event.payload.endedAt === 'string' ? new Date(event.payload.endedAt) : new Date(), durationSeconds: typeof event.payload.durationSeconds === 'number' ? Math.max(0, Math.trunc(event.payload.durationSeconds)) : call.durationSeconds, recordingStatus } });
+        } else if (event.type === 'DISPOSITION_SUBMIT') {
+          const callId = typeof event.payload.callId === 'string' ? event.payload.callId : '';
+          const outcome = typeof event.payload.outcome === 'string' ? event.payload.outcome : 'COMPLETED';
+          const note = typeof event.payload.note === 'string' ? event.payload.note : '';
+          const leadId = typeof event.payload.leadId === 'string' ? event.payload.leadId : '';
+          if (callId) {
+            await tx.salesMobileCall.updateMany({ where: { id: callId, tenantId }, data: { outcome, note } });
+          }
+          if (leadId) {
+            await tx.salesLeadAssignment.updateMany({ where: { id: leadId, tenantId }, data: { lastCallDisposition: outcome, lastContactedAt: new Date() } });
+          }
+        } else if (event.type === 'LEAD_UPDATE') {
+          const leadId = typeof event.payload.leadId === 'string' ? event.payload.leadId : '';
+          const stage = typeof event.payload.stage === 'string' ? event.payload.stage : undefined;
+          const notes = typeof event.payload.notes === 'string' ? event.payload.notes : undefined;
+          if (leadId) {
+            await tx.salesLeadAssignment.updateMany({ where: { id: leadId, tenantId }, data: { ...(stage ? { stage: stage as any, stageChangedAt: new Date() } : {}), ...(notes ? { notes } : {}), lastContactedAt: new Date() } });
+          }
+        } else if (event.type === 'CALL_DISCARD') {
+          const callId = typeof event.payload.callId === 'string' ? event.payload.callId : '';
+          if (callId) {
+            await tx.salesMobileCall.updateMany({ where: { id: callId, tenantId }, data: { outcome: 'DISCARDED_PERSONAL' } });
+          }
+        } else if (event.type === 'RECORDING_RETRY') {
+          const uploadId = typeof event.payload.uploadId === 'string' ? event.payload.uploadId : '';
+          if (uploadId) {
+            await tx.callRecordingUpload.updateMany({ where: { id: uploadId, tenantId }, data: { status: 'LOCAL_PENDING' } });
+          }
         }
         const result = { accepted: true, appliedType: event.type };
         return tx.salesMobileOfflineEvent.update({ where: { id: row.id }, data: { status: 'SYNCED', result, processedAt: new Date(), error: null } });
@@ -268,4 +297,128 @@ mobileRouter.post('/offline-events/sync', validateBody(syncSchema), async (req: 
     }
   }
   res.json({ success: results.every((item) => item.ok), data: { results } });
+});
+
+const bootstrapSchema = z.object({
+  appVersion: z.string().optional(),
+  deviceId: z.string().optional(),
+});
+
+mobileRouter.post('/bootstrap', validateBody(bootstrapSchema), async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const userId = req.user!.userId;
+  const input = req.body as z.infer<typeof bootstrapSchema>;
+
+  const [workspace, agent, user] = await Promise.all([
+    prisma.aicloserWorkspace.findUnique({
+      where: { id: tenantId },
+      select: { id: true, name: true, slug: true, status: true, planTier: true, maxSeats: true },
+    }),
+    prisma.salesAgentProfile.findFirst({
+      where: { userId, tenantId },
+      include: {
+        mobileDevices: {
+          where: { isActive: true },
+          take: 5,
+        },
+      },
+    }),
+    prisma.user.findUnique({
+      where: { id: userId },
+      select: { id: true, email: true, displayName: true, role: true },
+    }),
+  ]);
+
+  if (!workspace) {
+    res.status(404).json({ success: false, error: 'NotFound', message: 'Workspace not found' });
+    return;
+  }
+
+  const minAppVersion = '1.0.26';
+  const forceUpdate = false;
+
+  res.json({
+    success: true,
+    data: {
+      user,
+      agent,
+      workspace,
+      policy: {
+        minAppVersion,
+        forceUpdate,
+        recordingRequired: true,
+        heartbeatIntervalSeconds: 60,
+        deltaSyncIntervalSeconds: 30,
+        allowedCallDirections: ['INCOMING', 'OUTGOING'],
+      },
+      serverTime: new Date().toISOString(),
+    },
+    error: null,
+  });
+});
+
+const pushTokenSchema = z.object({
+  token: z.string().min(10).max(500),
+  platform: z.enum(['android', 'ios']).default('android'),
+  deviceId: z.string().optional(),
+});
+
+mobileRouter.post('/push-token', validateBody(pushTokenSchema), async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const userId = req.user!.userId;
+  const input = req.body as z.infer<typeof pushTokenSchema>;
+
+  const tokenHash = crypto.createHash('sha256').update(input.token).digest('hex');
+
+  const pushToken = await prisma.mobilePushToken.upsert({
+    where: { tokenHash },
+    create: {
+      id: crypto.randomUUID(),
+      userId,
+      tenantId,
+      token: input.token,
+      tokenHash,
+      platform: input.platform,
+      provider: 'fcm',
+      role: req.user?.role,
+    },
+    update: {
+      userId,
+      tenantId,
+      updatedAt: new Date(),
+      disabledAt: null,
+    },
+  });
+
+  res.json({ success: true, data: { id: pushToken.id, registeredAt: pushToken.updatedAt }, error: null });
+});
+
+const diagnosticsSchema = z.object({
+  deviceId: z.string().min(1),
+  appVersion: z.string().optional(),
+  logType: z.string().min(1).max(80),
+  message: z.string().optional(),
+  metadata: z.record(z.any()).optional(),
+});
+
+mobileRouter.post('/diagnostics', validateBody(diagnosticsSchema), async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const input = req.body as z.infer<typeof diagnosticsSchema>;
+
+  await prisma.salesActivityLog.create({
+    data: {
+      tenantId,
+      actorUserId: req.user?.userId,
+      action: 'MOBILE_DIAGNOSTICS_REPORT',
+      note: 'Device ' + input.deviceId + ' reported [' + input.logType + ']: ' + (input.message || 'No description'),
+      metadata: {
+        deviceId: input.deviceId,
+        appVersion: input.appVersion,
+        logType: input.logType,
+        ...(input.metadata || {}),
+      },
+    },
+  }).catch(() => undefined);
+
+  res.json({ success: true, message: 'Diagnostic event recorded', loggedAt: new Date().toISOString() });
 });

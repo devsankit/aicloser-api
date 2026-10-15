@@ -4,7 +4,7 @@ import { prisma } from '../../lib/prisma.js';
 import { authenticate } from '../../middlewares/auth.js';
 import { enforceTenantIsolation } from '../../middlewares/tenant-isolation.js';
 import { validateBody, validateQuery } from '../../middlewares/validate.js';
-import { SalesMobileCallDirection, SalesMobileCallStatus } from '@prisma/client';
+import { SalesMobileCallDirection, SalesMobileCallStatus, SalesLeadStage } from '@prisma/client';
 import { Prisma } from '@prisma/client';
 import { persistApiRealtimeEvent } from '../../lib/realtime.js';
 
@@ -203,4 +203,110 @@ callsRouter.post('/:id/end', validateBody(endCallSchema), async (req: Request, r
     payload: { callId: call.id, status: call.status, durationSeconds: call.durationSeconds, recordingStatus: call.recordingStatus },
   }).catch(() => undefined);
   res.json({ success: true, data: call });
+});
+
+const dispositionSchema = z.object({
+  outcome: z.string().min(1, 'Outcome/disposition is required'),
+  note: z.string().optional(),
+  nextFollowUpAt: z.string().optional(),
+  stage: z.nativeEnum(SalesLeadStage).optional(),
+});
+
+callsRouter.post('/:id/disposition', validateBody(dispositionSchema), async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const id = String(req.params.id);
+  const body = req.body as { outcome: string; note?: string; nextFollowUpAt?: string; stage?: SalesLeadStage };
+
+  const call = await prisma.salesMobileCall.findFirst({
+    where: { id, tenantId },
+    include: { assignment: true },
+  });
+
+  if (!call) {
+    res.status(404).json({ success: false, error: 'NotFound', message: 'Call not found in this workspace' });
+    return;
+  }
+
+  const updatedCall = await prisma.salesMobileCall.update({
+    where: { id: call.id },
+    data: {
+      outcome: body.outcome,
+      note: body.note ? (call.note ? `${call.note}\n---\n${body.note}` : body.note) : call.note,
+      nextFollowUpAt: body.nextFollowUpAt ? new Date(body.nextFollowUpAt) : call.nextFollowUpAt,
+    },
+  });
+
+  // Update the Sun (Lead)
+  if (call.assignmentId) {
+    const nextDate = body.nextFollowUpAt ? new Date(body.nextFollowUpAt) : undefined;
+    await prisma.salesLeadAssignment.update({
+      where: { id: call.assignmentId },
+      data: {
+        lastCallDisposition: body.outcome,
+        lastCallDurationSec: call.durationSeconds || 0,
+        totalCallsCount: { increment: 1 },
+        lastContactedAt: new Date(),
+        ...(nextDate && !isNaN(nextDate.getTime()) ? { followUpAt: nextDate } : {}),
+        ...(body.stage ? { stage: body.stage, stageChangedAt: new Date() } : {}),
+      },
+    });
+
+    if (nextDate && !isNaN(nextDate.getTime())) {
+      await prisma.gxLeadTask.create({
+        data: {
+          salesLeadId: call.assignmentId,
+          title: body.note || `Follow-up call with ${call.assignment?.customerName || call.phoneNumber}`,
+          dueAt: nextDate,
+          priority: 'HIGH',
+          status: 'OPEN',
+        },
+      }).catch(() => undefined);
+    }
+
+    await prisma.salesActivityLog.create({
+      data: {
+        tenantId,
+        assignmentId: call.assignmentId,
+        actorUserId: req.user?.userId,
+        action: 'CALL_DISPOSITION_SUBMITTED',
+        note: `Disposition "${body.outcome}" submitted for call ${call.phoneNumber}`,
+        metadata: { callId: call.id, outcome: body.outcome, note: body.note || '' },
+      },
+    });
+  }
+
+  await persistApiRealtimeEvent({
+    tenantId,
+    actorUserId: req.user?.userId,
+    audienceRoles: ['SUPER_ADMIN', 'ADMIN', 'MANAGER', 'SALES_AGENT'],
+    eventType: 'call.disposition_saved',
+    payload: { callId: call.id, leadId: call.assignmentId, outcome: body.outcome },
+  }).catch(() => undefined);
+
+  res.json({ success: true, data: updatedCall, error: null });
+});
+
+callsRouter.post('/:id/discard', async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const id = String(req.params.id);
+  const { reason } = req.body as { reason?: string };
+
+  const call = await prisma.salesMobileCall.findFirst({
+    where: { id, tenantId },
+  });
+
+  if (!call) {
+    res.status(404).json({ success: false, error: 'NotFound', message: 'Call not found in this workspace' });
+    return;
+  }
+
+  const updatedCall = await prisma.salesMobileCall.update({
+    where: { id: call.id },
+    data: {
+      outcome: 'DISCARDED_PERSONAL',
+      note: reason ? `Discarded: ${reason}` : 'Discarded personal/accidental call',
+    },
+  });
+
+  res.json({ success: true, message: 'Call marked as discarded from CRM metrics', data: updatedCall, error: null });
 });
