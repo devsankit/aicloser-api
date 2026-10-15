@@ -8,7 +8,7 @@ import { authenticate } from '../../middlewares/auth.js';
 import { requireRoles } from '../../middlewares/rbac.js';
 import { logger } from '../../lib/logger.js';
 import { AuthenticatedUser } from '../../types/auth.js';
-import { validateBody } from '../../middlewares/validate.js';
+import { validateBody, validateQuery } from '../../middlewares/validate.js';
 import { acquireClientSession, closeClientSession } from '../../lib/client-sessions.js';
 
 export const superAdminRouter = Router();
@@ -16,22 +16,60 @@ export const superAdminRouter = Router();
 // Strictly restricted to SUPER_ADMIN role only
 superAdminRouter.use(authenticate, requireRoles('SUPER_ADMIN'));
 
-// 1. GET /tenants - List all workspaces
-superAdminRouter.get('/tenants', async (req: Request, res: Response) => {
-  logger.info('Super Admin listed all canonical workspaces', { actorId: req.user?.userId });
+// ==========================================
+// 1. WORKSPACES (TENANTS)
+// ==========================================
 
-  const workspaces = await prisma.aicloserWorkspace.findMany({
-    orderBy: { createdAt: 'desc' },
-    include: {
-      _count: {
-        select: {
-          users: true,
-          leads: true,
-          mobileCalls: true,
+const listTenantsQuerySchema = z.object({
+  page: z.coerce.number().int().min(1).default(1),
+  limit: z.coerce.number().int().min(1).max(100).default(50),
+  search: z.string().trim().optional(),
+  status: z.enum(['ACTIVE', 'SUSPENDED', 'LOCKED']).optional(),
+  planTier: z.enum(['FREE', 'STARTER', 'GROWTH', 'PRO', 'AGENCY', 'ENTERPRISE']).optional(),
+});
+
+// GET /tenants - List workspaces with pagination and filtering
+superAdminRouter.get('/tenants', validateQuery(listTenantsQuerySchema), async (req: Request, res: Response) => {
+  const { page, limit, search, status, planTier } = req.query as unknown as z.infer<typeof listTenantsQuerySchema>;
+
+  logger.info('Super Admin listed workspaces', { actorId: req.user?.userId, page, limit, search, status });
+
+  const where: Record<string, unknown> = {};
+
+  if (status) {
+    where.status = status;
+  }
+
+  if (planTier) {
+    where.planTier = planTier;
+  }
+
+  if (search) {
+    where.OR = [
+      { name: { contains: search, mode: 'insensitive' } },
+      { id: { contains: search, mode: 'insensitive' } },
+      { slug: { contains: search, mode: 'insensitive' } },
+    ];
+  }
+
+  const [total, workspaces] = await Promise.all([
+    prisma.aicloserWorkspace.count({ where }),
+    prisma.aicloserWorkspace.findMany({
+      where,
+      skip: (page - 1) * limit,
+      take: limit,
+      orderBy: { createdAt: 'desc' },
+      include: {
+        _count: {
+          select: {
+            users: true,
+            leads: true,
+            mobileCalls: true,
+          },
         },
       },
-    },
-  });
+    }),
+  ]);
 
   res.json({
     success: true,
@@ -51,10 +89,17 @@ superAdminRouter.get('/tenants', async (req: Request, res: Response) => {
       createdAt: w.createdAt,
       updatedAt: w.updatedAt,
     })),
+    pagination: {
+      total,
+      page,
+      limit,
+      totalPages: Math.ceil(total / limit),
+    },
+    error: null,
   });
 });
 
-// 2. GET /tenants/:id - Workspace detail
+// GET /tenants/:id - Workspace detail
 superAdminRouter.get('/tenants/:id', async (req: Request, res: Response) => {
   const { id } = req.params;
 
@@ -67,6 +112,8 @@ superAdminRouter.get('/tenants/:id', async (req: Request, res: Response) => {
           email: true,
           displayName: true,
           role: true,
+          packageStatus: true,
+          packageExpiresAt: true,
           createdAt: true,
         },
       },
@@ -76,6 +123,14 @@ superAdminRouter.get('/tenants/:id', async (req: Request, res: Response) => {
           agentCode: true,
           status: true,
           canClaimLeads: true,
+        },
+      },
+      _count: {
+        select: {
+          users: true,
+          leads: true,
+          mobileCalls: true,
+          conversations: true,
         },
       },
     },
@@ -89,7 +144,7 @@ superAdminRouter.get('/tenants/:id', async (req: Request, res: Response) => {
   res.json({ success: true, data: workspace });
 });
 
-// 3. GET /tenants/:id/plan - Workspace plan info
+// GET /tenants/:id/plan - Workspace plan info
 superAdminRouter.get('/tenants/:id/plan', async (req: Request, res: Response) => {
   const { id } = req.params;
 
@@ -111,94 +166,150 @@ superAdminRouter.get('/tenants/:id/plan', async (req: Request, res: Response) =>
   }
 
   const activeSeats = await prisma.appAuthUser.count({
-    where: { tenantId: String(id) },
+    where: { tenantId: String(id), packageStatus: 'ACTIVE' },
   });
+
+  const settings = (workspace.settings as Record<string, any>) || {};
 
   res.json({
     success: true,
     data: {
       tenantId: workspace.id,
+      name: workspace.name,
       planTier: workspace.planTier,
       seatLimit: workspace.maxSeats,
       activeSeats,
       status: workspace.status,
+      subscriptionExpiresAt: settings.subscriptionExpiresAt || settings.expiresAt || null,
       settings: workspace.settings,
     },
+    error: null,
   });
 });
 
-// 4. PATCH /tenants/:id/plan - Change plan tier
-superAdminRouter.patch('/tenants/:id/plan', async (req: Request, res: Response) => {
+// ==========================================
+// 2. WORKSPACE MUTATIONS (STRICT ZOD VALIDATION)
+// ==========================================
+
+const updatePlanSchema = z.object({
+  planTier: z.enum(['FREE', 'STARTER', 'GROWTH', 'PRO', 'AGENCY', 'ENTERPRISE'], {
+    errorMap: () => ({ message: 'planTier must be one of: FREE, STARTER, GROWTH, PRO, AGENCY, ENTERPRISE' }),
+  }),
+});
+
+// PATCH /tenants/:id/plan - Change plan tier
+superAdminRouter.patch('/tenants/:id/plan', validateBody(updatePlanSchema), async (req: Request, res: Response) => {
   const { id } = req.params;
-  const { planTier } = req.body as { planTier: string };
+  const { planTier } = req.body as z.infer<typeof updatePlanSchema>;
+
+  const workspace = await prisma.aicloserWorkspace.findUnique({
+    where: { id: String(id) },
+  });
+
+  if (!workspace) {
+    res.status(404).json({ success: false, error: 'NotFound', message: 'Workspace not found' });
+    return;
+  }
 
   const updated = await prisma.aicloserWorkspace.update({
-    where: { id: String(id) },
-    data: { planTier: planTier.toUpperCase(), updatedAt: new Date() },
+    where: { id: workspace.id },
+    data: { planTier, updatedAt: new Date() },
   });
 
   await prisma.salesActivityLog.create({
     data: {
-      tenantId: String(id),
+      tenantId: workspace.id,
       actorUserId: req.user?.userId,
       action: 'PLAN_TIER_CHANGED',
-      note: `Plan tier updated to ${planTier.toUpperCase()} by Super Admin`,
-      metadata: { planTier: planTier.toUpperCase() },
+      note: `Plan tier updated to ${planTier} by Super Admin`,
+      metadata: { planTier, previousTier: workspace.planTier },
     },
   }).catch(() => undefined);
 
-  res.json({ success: true, message: 'Plan updated successfully', data: updated });
+  res.json({ success: true, message: `Plan tier updated to ${planTier}`, data: updated });
 });
 
-// 5. PATCH /tenants/:id/status - Suspend / activate workspace
-superAdminRouter.patch('/tenants/:id/status', async (req: Request, res: Response) => {
+const updateStatusSchema = z.object({
+  status: z.enum(['ACTIVE', 'SUSPENDED', 'LOCKED'], {
+    errorMap: () => ({ message: 'status must be one of: ACTIVE, SUSPENDED, LOCKED' }),
+  }),
+  reason: z.string().trim().optional(),
+});
+
+// PATCH /tenants/:id/status - Suspend / activate / lock workspace
+superAdminRouter.patch('/tenants/:id/status', validateBody(updateStatusSchema), async (req: Request, res: Response) => {
   const { id } = req.params;
-  const { status } = req.body as { status: 'ACTIVE' | 'SUSPENDED' | 'LOCKED' };
+  const { status, reason } = req.body as z.infer<typeof updateStatusSchema>;
+
+  const workspace = await prisma.aicloserWorkspace.findUnique({
+    where: { id: String(id) },
+  });
+
+  if (!workspace) {
+    res.status(404).json({ success: false, error: 'NotFound', message: 'Workspace not found' });
+    return;
+  }
 
   const updated = await prisma.aicloserWorkspace.update({
-    where: { id: String(id) },
+    where: { id: workspace.id },
     data: { status, updatedAt: new Date() },
   });
 
   await prisma.salesActivityLog.create({
     data: {
-      tenantId: String(id),
+      tenantId: workspace.id,
       actorUserId: req.user?.userId,
       action: 'WORKSPACE_STATUS_CHANGED',
-      note: `Workspace status changed to ${status} by Super Admin`,
-      metadata: { status },
+      note: `Workspace status changed to ${status} by Super Admin${reason ? `: ${reason}` : ''}`,
+      metadata: { status, previousStatus: workspace.status, reason },
     },
   }).catch(() => undefined);
 
   res.json({ success: true, message: `Workspace status updated to ${status}`, data: updated });
 });
 
-// 6. PATCH /tenants/:id/seats - Change seat limit
-superAdminRouter.patch('/tenants/:id/seats', async (req: Request, res: Response) => {
+const updateSeatsSchema = z.object({
+  maxSeats: z.number({ invalid_type_error: 'maxSeats must be a number' })
+    .int('maxSeats must be an integer')
+    .min(1, 'maxSeats must be at least 1')
+    .max(1000, 'maxSeats cannot exceed 1000'),
+});
+
+// PATCH /tenants/:id/seats - Change seat limit
+superAdminRouter.patch('/tenants/:id/seats', validateBody(updateSeatsSchema), async (req: Request, res: Response) => {
   const { id } = req.params;
-  const { maxSeats } = req.body as { maxSeats: number };
+  const { maxSeats } = req.body as z.infer<typeof updateSeatsSchema>;
+
+  const workspace = await prisma.aicloserWorkspace.findUnique({
+    where: { id: String(id) },
+  });
+
+  if (!workspace) {
+    res.status(404).json({ success: false, error: 'NotFound', message: 'Workspace not found' });
+    return;
+  }
 
   const updated = await prisma.aicloserWorkspace.update({
-    where: { id: String(id) },
-    data: { maxSeats: Number(maxSeats), updatedAt: new Date() },
+    where: { id: workspace.id },
+    data: { maxSeats, updatedAt: new Date() },
   });
 
   await prisma.salesActivityLog.create({
     data: {
-      tenantId: String(id),
+      tenantId: workspace.id,
       actorUserId: req.user?.userId,
       action: 'SEAT_LIMIT_CHANGED',
       note: `Seat quota updated to ${maxSeats} by Super Admin`,
-      metadata: { maxSeats: Number(maxSeats) },
+      metadata: { maxSeats, previousMaxSeats: workspace.maxSeats },
     },
   }).catch(() => undefined);
 
   res.json({ success: true, message: `Seat quota set to ${maxSeats}`, data: updated });
 });
 
-// 7. PATCH /tenants/:tenantId/expiry - Extend / set plan expiry date (Real Database Update)
+// PATCH /tenants/:tenantId/expiry - Extend / set plan expiry date (Real Database Update)
 const expirySchema = z.object({
-  expiresAt: z.string().datetime({ message: 'Valid ISO datetime required' }),
+  expiresAt: z.string().datetime({ message: 'Valid ISO datetime required (e.g. 2026-12-31T23:59:59.000Z)' }),
 });
 
 superAdminRouter.patch('/tenants/:tenantId/expiry', validateBody(expirySchema), async (req: Request, res: Response) => {
@@ -256,34 +367,84 @@ superAdminRouter.patch('/tenants/:tenantId/expiry', validateBody(expirySchema), 
   });
 });
 
-// 8. GET /tenants/:tenantId/users - List users
-superAdminRouter.get('/tenants/:tenantId/users', async (req: Request, res: Response) => {
-  const { tenantId } = req.params;
+// ==========================================
+// 3. WORKSPACE USERS (PAGINATION & MANAGEMENT)
+// ==========================================
 
-  const users = await prisma.appAuthUser.findMany({
-    where: { tenantId: String(tenantId) },
-    select: {
-      id: true,
-      email: true,
-      phone: true,
-      displayName: true,
-      role: true,
-      packageStatus: true,
-      packageExpiresAt: true,
-      createdAt: true,
-    },
-    orderBy: { createdAt: 'desc' },
-  });
-
-  res.json({ success: true, data: users });
+const listWorkspaceUsersQuerySchema = z.object({
+  page: z.coerce.number().int().min(1).default(1),
+  limit: z.coerce.number().int().min(1).max(100).default(25),
+  search: z.string().trim().optional(),
+  role: z.enum(['ADMIN', 'MANAGER', 'SALES_AGENT']).optional(),
+  status: z.enum(['ACTIVE', 'PAUSED', 'EXPIRED']).optional(),
 });
 
-// 9. POST /tenants/:tenantId/users - Add user with real password hashing and agent profile
+// GET /tenants/:tenantId/users - List users with pagination and filtering
+superAdminRouter.get('/tenants/:tenantId/users', validateQuery(listWorkspaceUsersQuerySchema), async (req: Request, res: Response) => {
+  const { tenantId } = req.params;
+  const { page, limit, search, role, status } = req.query as unknown as z.infer<typeof listWorkspaceUsersQuerySchema>;
+
+  const where: Record<string, unknown> = {
+    tenantId: String(tenantId),
+  };
+
+  if (role) {
+    where.role = role;
+  }
+
+  if (status) {
+    where.packageStatus = status;
+  }
+
+  if (search) {
+    where.OR = [
+      { displayName: { contains: search, mode: 'insensitive' } },
+      { email: { contains: search, mode: 'insensitive' } },
+      { phone: { contains: search } },
+    ];
+  }
+
+  const [total, users] = await Promise.all([
+    prisma.appAuthUser.count({ where }),
+    prisma.appAuthUser.findMany({
+      where,
+      skip: (page - 1) * limit,
+      take: limit,
+      select: {
+        id: true,
+        email: true,
+        phone: true,
+        displayName: true,
+        role: true,
+        packageStatus: true,
+        packageExpiresAt: true,
+        createdAt: true,
+      },
+      orderBy: { createdAt: 'desc' },
+    }),
+  ]);
+
+  res.json({
+    success: true,
+    data: users,
+    pagination: {
+      total,
+      page,
+      limit,
+      totalPages: Math.ceil(total / limit),
+    },
+    error: null,
+  });
+});
+
+// POST /tenants/:tenantId/users - Add user with real password hashing and agent profile
 const createUserSchema = z.object({
-  email: z.string().trim().email(),
-  displayName: z.string().trim().min(1),
-  role: z.enum(['ADMIN', 'MANAGER', 'SALES_AGENT']),
-  password: z.string().min(6).optional(),
+  email: z.string().trim().email('Valid email address required'),
+  displayName: z.string().trim().min(1, 'Display name cannot be empty'),
+  role: z.enum(['ADMIN', 'MANAGER', 'SALES_AGENT'], {
+    errorMap: () => ({ message: 'role must be one of: ADMIN, MANAGER, SALES_AGENT' }),
+  }),
+  password: z.string().min(6, 'Password must be at least 6 characters').optional(),
   phone: z.string().trim().optional(),
 });
 
@@ -301,7 +462,7 @@ superAdminRouter.post('/tenants/:tenantId/users', validateBody(createUserSchema)
   }
 
   // Check seat capacity
-  const currentSeats = await prisma.appAuthUser.count({ where: { tenantId: String(tenantId) } });
+  const currentSeats = await prisma.appAuthUser.count({ where: { tenantId: String(tenantId), packageStatus: 'ACTIVE' } });
   if (currentSeats >= workspace.maxSeats) {
     res.status(403).json({
       success: false,
@@ -381,12 +542,12 @@ superAdminRouter.post('/tenants/:tenantId/users', validateBody(createUserSchema)
 const updateUserSchema = z.object({
   displayName: z.string().trim().min(1).optional(),
   role: z.enum(['ADMIN', 'MANAGER', 'SALES_AGENT']).optional(),
-  password: z.string().min(6).optional(),
+  password: z.string().min(6, 'Password must be at least 6 characters').optional(),
   phone: z.string().trim().optional(),
   packageStatus: z.enum(['ACTIVE', 'PAUSED', 'EXPIRED']).optional(),
 });
 
-// 10. PATCH /tenants/:tenantId/users/:userId - Update user with strict validation and password hashing
+// PATCH /tenants/:tenantId/users/:userId - Update user with strict validation and password hashing
 superAdminRouter.patch('/tenants/:tenantId/users/:userId', validateBody(updateUserSchema), async (req: Request, res: Response) => {
   const { userId, tenantId } = req.params;
   const body = req.body as z.infer<typeof updateUserSchema>;
@@ -424,7 +585,7 @@ superAdminRouter.patch('/tenants/:tenantId/users/:userId', validateBody(updateUs
       role: true,
       packageStatus: true,
       packageExpiresAt: true,
-          },
+    },
   });
 
   // If role changed to SALES_AGENT, ensure SalesAgentProfile exists
@@ -464,7 +625,7 @@ superAdminRouter.patch('/tenants/:tenantId/users/:userId', validateBody(updateUs
   res.json({ success: true, message: 'User updated successfully', data: updated });
 });
 
-// 11. DELETE /tenants/:tenantId/users/:userId - Safe deactivation with audit log (Hard delete only if force=true)
+// DELETE /tenants/:tenantId/users/:userId - Safe deactivation with audit log (Hard delete only if force=true)
 superAdminRouter.delete('/tenants/:tenantId/users/:userId', async (req: Request, res: Response) => {
   const { userId, tenantId } = req.params;
   const force = req.query.force === 'true';
@@ -532,35 +693,99 @@ superAdminRouter.delete('/tenants/:tenantId/users/:userId', async (req: Request,
   });
 });
 
-// 12. GET /telemetry - System wide metrics
+// ==========================================
+// 4. TELEMETRY & SYSTEM HEALTH
+// ==========================================
+
+// GET /telemetry - System wide metrics with breakdowns
 superAdminRouter.get('/telemetry', async (req: Request, res: Response) => {
-  const [totalWorkspaces, totalUsers, totalLeads, totalCalls] = await Promise.all([
+  const [
+    totalWorkspaces,
+    activeWorkspaces,
+    suspendedWorkspaces,
+    lockedWorkspaces,
+    totalUsers,
+    activeUsers,
+    totalLeads,
+    totalCalls,
+    workspacesByTier,
+  ] = await Promise.all([
     prisma.aicloserWorkspace.count(),
+    prisma.aicloserWorkspace.count({ where: { status: 'ACTIVE' } }),
+    prisma.aicloserWorkspace.count({ where: { status: 'SUSPENDED' } }),
+    prisma.aicloserWorkspace.count({ where: { status: 'LOCKED' } }),
     prisma.appAuthUser.count(),
+    prisma.appAuthUser.count({ where: { packageStatus: 'ACTIVE' } }),
     prisma.salesLeadAssignment.count(),
     prisma.salesMobileCall.count(),
+    prisma.aicloserWorkspace.groupBy({
+      by: ['planTier'],
+      _count: true,
+    }),
   ]);
 
   res.json({
     success: true,
     data: {
-      workspaces: totalWorkspaces,
-      users: totalUsers,
-      leads: totalLeads,
-      calls: totalCalls,
-      serverMemoryMb: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
-      uptimeSeconds: Math.round(process.uptime()),
+      workspaces: {
+        total: totalWorkspaces,
+        active: activeWorkspaces,
+        suspended: suspendedWorkspaces,
+        locked: lockedWorkspaces,
+        byTier: workspacesByTier.map((t) => ({ tier: t.planTier, count: t._count })),
+      },
+      users: {
+        total: totalUsers,
+        active: activeUsers,
+      },
+      leads: { total: totalLeads },
+      calls: { total: totalCalls },
+      system: {
+        serverMemoryMb: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
+        uptimeSeconds: Math.round(process.uptime()),
+        nodeVersion: process.version,
+      },
     },
+    error: null,
   });
 });
 
-// 13. GET /feedback - Real user feedback list
-superAdminRouter.get('/feedback', async (req: Request, res: Response) => {
-  const logs = await prisma.salesActivityLog.findMany({
-    where: { action: { contains: 'FEEDBACK' } },
-    orderBy: { createdAt: 'desc' },
-    take: 50,
-  });
+// ==========================================
+// 5. FEEDBACK & RESOLUTION
+// ==========================================
+
+const listFeedbackQuerySchema = z.object({
+  page: z.coerce.number().int().min(1).default(1),
+  limit: z.coerce.number().int().min(1).max(100).default(25),
+  tenantId: z.string().trim().optional(),
+  search: z.string().trim().optional(),
+});
+
+// GET /feedback - Paginated user feedback with search & filtering
+superAdminRouter.get('/feedback', validateQuery(listFeedbackQuerySchema), async (req: Request, res: Response) => {
+  const { page, limit, tenantId, search } = req.query as unknown as z.infer<typeof listFeedbackQuerySchema>;
+
+  const where: Record<string, unknown> = {
+    action: { contains: 'FEEDBACK' },
+  };
+
+  if (tenantId) {
+    where.tenantId = tenantId;
+  }
+
+  if (search) {
+    where.note = { contains: search, mode: 'insensitive' };
+  }
+
+  const [total, logs] = await Promise.all([
+    prisma.salesActivityLog.count({ where }),
+    prisma.salesActivityLog.findMany({
+      where,
+      skip: (page - 1) * limit,
+      take: limit,
+      orderBy: { createdAt: 'desc' },
+    }),
+  ]);
 
   res.json({
     success: true,
@@ -572,15 +797,49 @@ superAdminRouter.get('/feedback', async (req: Request, res: Response) => {
       metadata: l.metadata,
       createdAt: l.createdAt,
     })),
+    pagination: {
+      total,
+      page,
+      limit,
+      totalPages: Math.ceil(total / limit),
+    },
+    error: null,
   });
 });
 
-// 14. PATCH /feedback/:id - Resolve feedback
-superAdminRouter.patch('/feedback/:id', async (req: Request, res: Response) => {
-  res.json({ success: true, message: 'Feedback marked as resolved' });
+const resolveFeedbackSchema = z.object({
+  resolutionNote: z.string().trim().min(1).optional(),
 });
 
-// 15. POST /tenants/:tenantId/impersonate - Audited session with explicit tracking
+// PATCH /feedback/:id - Resolve feedback with audit trail
+superAdminRouter.patch('/feedback/:id', validateBody(resolveFeedbackSchema), async (req: Request, res: Response) => {
+  const { id } = req.params;
+  const { resolutionNote } = req.body as z.infer<typeof resolveFeedbackSchema>;
+
+  const existingLog = await prisma.salesActivityLog.findUnique({
+    where: { id: String(id) },
+  });
+
+  if (existingLog) {
+    await prisma.salesActivityLog.create({
+      data: {
+        tenantId: existingLog.tenantId,
+        actorUserId: req.user?.userId,
+        action: 'FEEDBACK_RESOLVED',
+        note: `Feedback ${id} marked resolved by Super Admin${resolutionNote ? `: ${resolutionNote}` : ''}`,
+        metadata: { feedbackId: id, resolutionNote },
+      },
+    }).catch(() => undefined);
+  }
+
+  res.json({ success: true, message: 'Feedback marked as resolved', id });
+});
+
+// ==========================================
+// 6. IMPERSONATION (AUDITED)
+// ==========================================
+
+// POST /tenants/:tenantId/impersonate - Audited session with explicit tracking
 superAdminRouter.post('/tenants/:tenantId/impersonate', async (req: Request, res: Response) => {
   const { tenantId } = req.params;
   const actor = req.user!;
@@ -650,7 +909,7 @@ superAdminRouter.post('/tenants/:tenantId/impersonate', async (req: Request, res
   });
 });
 
-// 16. POST /impersonation/return - Return to Super Admin canonical context with audit log
+// POST /impersonation/return - Return to Super Admin canonical context with audit log
 superAdminRouter.post('/impersonation/return', async (req: Request, res: Response) => {
   const actor = req.user!;
 
@@ -697,8 +956,7 @@ superAdminRouter.post('/impersonation/return', async (req: Request, res: Respons
   });
 });
 
-
-// 17. POST /impersonation/revoke/:sessionId - Explicitly revoke an impersonation session
+// POST /impersonation/revoke/:sessionId - Explicitly revoke an impersonation session
 superAdminRouter.post('/impersonation/revoke/:sessionId', async (req: Request, res: Response) => {
   const { sessionId } = req.params;
   const actor = req.user!;
