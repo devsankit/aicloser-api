@@ -106,9 +106,15 @@ leadsRouter.post('/', validateBody(createLeadSchema), async (req: Request, res: 
   const tenantId = req.tenantId!;
   const body = req.body;
 
-  // Verify that the assigned agent belongs to the same tenant
+  // Verify that the assigned agent belongs to the same tenant (resolving SalesAgentProfile.id or User.id)
   const agent = await prisma.salesAgentProfile.findFirst({
-    where: { id: body.assignedAgentId, tenantId },
+    where: {
+      tenantId,
+      OR: [
+        { id: body.assignedAgentId },
+        { userId: body.assignedAgentId },
+      ],
+    },
   });
 
   if (!agent) {
@@ -135,6 +141,7 @@ leadsRouter.post('/', validateBody(createLeadSchema), async (req: Request, res: 
           ...(body.customerEmail ? [{ customerEmail: body.customerEmail }] : []),
         ],
       },
+      orderBy: [{ stage: 'desc' }, { createdAt: 'asc' }],
     });
 
     if (existing) {
@@ -553,21 +560,30 @@ leadsRouter.patch('/:id', validateBody(updateLeadSchema), async (req: Request, r
     }
   }
 
-  // If reassigning (admin/manager), verify target agent belongs to same tenant
+  // If reassigning (admin/manager), verify target agent belongs to same tenant (resolving SalesAgentProfile.id or User.id)
+  let targetAgentId: string | undefined = undefined;
   if (body.assignedAgentId && body.assignedAgentId !== existing.assignedAgentId) {
     const targetAgent = await prisma.salesAgentProfile.findFirst({
-      where: { id: body.assignedAgentId, tenantId },
+      where: {
+        tenantId,
+        OR: [
+          { id: body.assignedAgentId },
+          { userId: body.assignedAgentId },
+        ],
+      },
     });
     if (!targetAgent) {
       res.status(400).json({ success: false, error: 'InvalidAgent', message: 'Target agent not in workspace' });
       return;
     }
+    targetAgentId = targetAgent.id;
   }
 
   const updated = await prisma.salesLeadAssignment.update({
     where: { id },
     data: {
       ...body,
+      ...(targetAgentId ? { assignedAgentId: targetAgentId } : {}),
       followUpAt: body.followUpAt ? new Date(body.followUpAt) : undefined,
     },
   });

@@ -43,12 +43,22 @@ webhooksRouter.post(['/meta', '/whatsapp'], verifyWebhookSignature, async (req: 
     const channelId = value.metadata?.phone_number_id;
 
     // Map channel to tenant
+    if (!channelId) {
+      console.warn('[Webhook Quarantine] Received event with missing phoneNumberId. Rejecting.');
+      return;
+    }
+
     const channel = await prisma.whatsAppChannel.findFirst({
       where: { phoneNumberId: channelId },
       select: { tenantId: true, id: true },
     });
 
-    const tenantId = channel?.tenantId || 'tenant-the-storage-test-1d01dda2';
+    if (!channel || !channel.tenantId) {
+      console.warn('[Webhook Quarantine] Unmapped WhatsApp channel phoneNumberId: ' + channelId + '. Quarantining event.');
+      return;
+    }
+
+    const tenantId = channel.tenantId;
 
     // 1. Handle incoming message
     if (value.messages?.length) {
@@ -121,6 +131,10 @@ webhooksRouter.post(['/meta', '/whatsapp'], verifyWebhookSignature, async (req: 
         const last10 = normalizedPhone.replace(/\D/g, '').slice(-10);
         let lead = await prisma.salesLeadAssignment.findFirst({
           where: { tenantId, customerPhone: { contains: last10 } },
+          orderBy: [
+            { stage: 'desc' },
+            { createdAt: 'asc' },
+          ],
         });
 
         if (lead) {

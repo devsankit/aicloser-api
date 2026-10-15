@@ -121,13 +121,12 @@ mobileRouter.post('/contacts', validateBody(mobileContactsRequestSchema), async 
       const existing = await prisma.salesLeadAssignment.findFirst({
         where: {
           tenantId,
-          assignedAgentId: agent.id,
           OR: [
             { customerPhone: e164Phone },
             ...(email ? [{ customerEmail: email }] : []),
           ],
         },
-        orderBy: { updatedAt: 'desc' },
+        orderBy: [{ stage: 'desc' }, { createdAt: 'asc' }],
         select: { id: true, customerName: true, customerPhone: true, customerEmail: true, stage: true, tags: true, notes: true },
       });
 
