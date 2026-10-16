@@ -240,9 +240,30 @@ stagesRouter.delete('/:id', requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN'), asy
   }
 
   // Check if active leads exist in this stage
-  const leadsInStage = await prisma.salesLeadAssignment.count({
-    where: { tenantId, stage: target.key as any },
-  });
+  // Check if active leads exist in this stage
+  const validStages = [
+    'NEW', 'CONTACTED', 'QUALIFIED', 'QUOTE_SENT', 'PAYMENT_PENDING',
+    'PAID', 'HANDOFF', 'CLOSED', 'LOST', 'CONVERTED_FREE', 'ASSIGNED',
+    'INTERESTED', 'WEBINAR_INVITED', 'WEBINAR_ATTENDED', 'FOLLOW_UP',
+    'NEGOTIATION', 'CLOSED_WON', 'CLOSED_LOST', 'NOT_REACHABLE', 'RECYCLED'
+  ];
+
+  let leadsInStage = 0;
+  if (validStages.includes(target.key)) {
+    leadsInStage = await prisma.salesLeadAssignment.count({
+      where: { tenantId, stage: target.key as any },
+    });
+  } else {
+    leadsInStage = await prisma.salesLeadAssignment.count({
+      where: {
+        tenantId,
+        customFields: {
+          path: ['customStage'],
+          equals: target.key,
+        },
+      },
+    });
+  }
 
   if (leadsInStage > 0) {
     res.status(409).json({
