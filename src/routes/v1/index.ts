@@ -21,6 +21,10 @@ import { workspaceRouter } from './workspace.js';
 import { integrationsRouter } from './integrations.js';
 import { marketingRouter } from './marketing.js';
 import { aiRouter } from './ai.js';
+import { formsRouter } from './forms.js';
+import { automationsRouter } from './automations.js';
+import { payoutsRouter } from './payouts.js';
+import { referralsRouter } from './referrals.js';
 
 export const v1Router = Router();
 
@@ -43,6 +47,12 @@ v1Router.use('/reports', reportsRouter);
 v1Router.use('/team', teamRouter);
 v1Router.use('/stages', stagesRouter);
 v1Router.use('/tasks', tasksRouter);
+
+// Phase 3 Extensions: Forms, Automations, Payouts & Referrals
+v1Router.use('/forms', formsRouter);
+v1Router.use('/automations', automationsRouter);
+v1Router.use('/payouts', payoutsRouter);
+v1Router.use('/referrals', referralsRouter);
 
 // Workspace Plan & Entitlements
 v1Router.use('/workspace', workspaceRouter);
