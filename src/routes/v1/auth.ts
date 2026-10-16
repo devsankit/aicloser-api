@@ -236,56 +236,70 @@ authRouter.post('/signup', validateBody(signupSchema), async (req: Request, res:
   const salt = randomBytes(16).toString('hex');
   const hash = scryptSync(password, salt, 64).toString('hex');
 
-  // 1. Create Workspace
-  const workspace = await prisma.aicloserWorkspace.create({
-    data: {
-      id: workspaceId,
-      name: companyName,
-      slug: workspaceSlug,
-      planTier: 'STARTER',
-      status: 'ACTIVE',
-      settings: {
-        industry: industry || 'B2B Sales',
-        teamSize: teamSize || '1-10',
-        roundRobinSettings: {
-          enabled: true,
-          mode: 'STRICT_ROUND_ROBIN',
-          maxActiveLeadsPerCloser: 50,
-          lastAssignedAgentId: null,
-        },
-        sourceDistributionRules: [],
-        security: {
-          maskCustomerPhone: false,
-        },
-        aiBotConfig: {
-          enabled: false,
-          personaPrompt: 'You are an elite B2B consultative closer.',
-          trainingQA: [],
-          objectionHandlers: [],
+  const planTierSelected = req.body.planTier || 'STARTER';
+
+  // Atomic transactional provisioning: Workspace + Owner User + Owner Profile
+  const { workspace, user } = await prisma.$transaction(async (tx) => {
+    const ws = await tx.aicloserWorkspace.create({
+      data: {
+        id: workspaceId,
+        name: companyName,
+        slug: workspaceSlug,
+        planTier: planTierSelected,
+        status: 'ACTIVE',
+        settings: {
+          industry: industry || 'B2B Sales',
+          teamSize: teamSize || '1-10',
+          roundRobinSettings: {
+            enabled: true,
+            mode: 'STRICT_ROUND_ROBIN',
+            maxActiveLeadsPerCloser: 50,
+            lastAssignedAgentId: null,
+          },
+          sourceDistributionRules: [],
+          security: {
+            maskCustomerPhone: false,
+          },
+          aiBotConfig: {
+            enabled: false,
+            personaPrompt: 'You are an elite B2B consultative closer.',
+            trainingQA: [],
+            objectionHandlers: [],
+          },
         },
       },
-    },
-  });
+    });
 
-  // 2. Create Owner User (Role: ADMIN)
-  const user = await prisma.appAuthUser.create({
-    data: {
-      id: userId,
-      role: 'ADMIN',
-      assignedRole: 'ADMIN',
-      tenantId: workspace.id,
-      displayName: adminName,
-      email: normalizedEmail,
-      phone: normalizedPhone,
-      passwordSalt: salt,
-      passwordHash: hash,
-      otpCode: '000000',
-      packageStatus: 'ACTIVE',
-      packageName: 'STARTER',
-    },
-  });
+    const usr = await tx.appAuthUser.create({
+      data: {
+        id: userId,
+        role: 'ADMIN',
+        assignedRole: 'ADMIN',
+        tenantId: ws.id,
+        displayName: adminName,
+        email: normalizedEmail,
+        phone: normalizedPhone,
+        passwordSalt: salt,
+        passwordHash: hash,
+        otpCode: '000000',
+        packageStatus: 'ACTIVE',
+        packageName: planTierSelected,
+      },
+    });
 
-  // 3. Default Pipeline Stages are persisted in workspace settings
+    const adminCode = 'OWNER-' + Math.random().toString(36).slice(2, 7).toUpperCase();
+    await tx.salesAgentProfile.create({
+      data: {
+        userId: usr.id,
+        tenantId: ws.id,
+        agentCode: adminCode,
+        status: 'ACTIVE',
+        canClaimLeads: false, // Strict admin exclusion from round robin
+      },
+    });
+
+    return { workspace: ws, user: usr };
+  });
 
   // 4. Issue session JWT
   const userPayload: AuthenticatedUser = {

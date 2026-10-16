@@ -1,3 +1,4 @@
+import { maskPhoneNumber, isPhoneMaskingRequired } from '../../lib/phone-mask.js';
 import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import { prisma } from '../../lib/prisma.js';
@@ -165,8 +166,19 @@ callsRouter.get('/', validateQuery(listCallsQuerySchema), async (req: Request, r
   for (const upload of recordingUploads) {
     if (!recordingByCallId.has(upload.callId)) recordingByCallId.set(upload.callId, upload.id);
   }
+  const wsSettingsForCalls = await prisma.aicloserWorkspace.findUnique({
+    where: { id: tenantId },
+    select: { settings: true },
+  });
+  const shouldMask = isPhoneMaskingRequired(req.user, wsSettingsForCalls?.settings as Record<string, any>);
+
   const enrichedCalls = calls.map((call) => ({
     ...call,
+    phoneNumber: shouldMask ? maskPhoneNumber(call.phoneNumber, true) : call.phoneNumber,
+    assignment: call.assignment ? {
+      ...call.assignment,
+      customerPhone: shouldMask ? maskPhoneNumber(call.assignment.customerPhone, true) : call.assignment.customerPhone,
+    } : null,
     recordingUploadId: recordingByCallId.get(call.id) ?? null,
     hasRecording: Boolean(recordingByCallId.get(call.id)),
   }));

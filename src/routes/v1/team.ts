@@ -309,12 +309,44 @@ teamRouter.patch('/:id/manager', requirePermissions(PERM_TEAM_MANAGE), validateB
 
     const managerProfile = await prisma.salesAgentProfile.findFirst({
       where: { id: managerProfileId, tenantId },
-      include: { user: { select: { displayName: true } } },
+      include: { user: { select: { displayName: true, role: true } } },
     });
 
     if (!managerProfile) {
       res.status(404).json({ success: false, error: 'NotFound', message: 'Reporting manager profile not found in workspace' });
       return;
+    }
+
+    // Role validation: reporting manager must have role MANAGER, ADMIN, or SUPER_ADMIN
+    if (managerProfile.user.role !== 'MANAGER' && managerProfile.user.role !== 'ADMIN' && managerProfile.user.role !== 'SUPER_ADMIN') {
+      res.status(400).json({
+        success: false,
+        error: 'InvalidManagerRole',
+        message: 'The selected reporting manager must hold role MANAGER or ADMIN',
+      });
+      return;
+    }
+
+    // Cycle detection: traverse ancestor tree to ensure no circular loop
+    let currentAncestorId: string | null = managerProfile.parentAgentId;
+    const visitedHierarchy = new Set<string>([profile.id, managerProfile.id]);
+
+    while (currentAncestorId) {
+      if (visitedHierarchy.has(currentAncestorId)) {
+        res.status(400).json({
+          success: false,
+          error: 'HierarchyCycleDetected',
+          message: 'Circular reporting chain detected. An agent cannot report to their subordinate or form a loop.',
+        });
+        return;
+      }
+      visitedHierarchy.add(currentAncestorId);
+
+      const ancestor = await prisma.salesAgentProfile.findUnique({
+        where: { id: currentAncestorId },
+        select: { parentAgentId: true },
+      });
+      currentAncestorId = ancestor?.parentAgentId || null;
     }
   }
 

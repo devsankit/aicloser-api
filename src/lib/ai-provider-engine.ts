@@ -1,3 +1,4 @@
+import { decryptSecret } from './crypto-vault.js';
 import { prisma } from './prisma.js';
 import { logger } from './logger.js';
 
@@ -288,7 +289,7 @@ export async function generateAiCloserReply(params: {
     const pStart = Date.now();
     try {
       if (provider.id === 'groq') {
-        const apiKey = provider.apiKey || process.env.GROQ_API_KEY;
+        const apiKey = (provider.apiKey ? decryptSecret(provider.apiKey) : null) || process.env.GROQ_API_KEY;
         if (!apiKey) continue;
         const text = await callGroq(apiKey, provider.model, systemPrompt, messageText, provider.timeoutMs || 4000);
         return {
@@ -305,7 +306,7 @@ export async function generateAiCloserReply(params: {
       }
 
       if (provider.id === 'gemini') {
-        const apiKey = provider.apiKey || process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
+        const apiKey = (provider.apiKey ? decryptSecret(provider.apiKey) : null) || process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
         if (!apiKey) continue;
         const text = await callGemini(apiKey, provider.model, systemPrompt, messageText, provider.timeoutMs || 4000);
         return {
@@ -322,7 +323,7 @@ export async function generateAiCloserReply(params: {
       }
 
       if (provider.id === 'openai') {
-        const apiKey = provider.apiKey || process.env.OPENAI_API_KEY;
+        const apiKey = (provider.apiKey ? decryptSecret(provider.apiKey) : null) || process.env.OPENAI_API_KEY;
         if (!apiKey) continue;
         const text = await callOpenAI(apiKey, provider.model, systemPrompt, messageText, provider.timeoutMs || 4000);
         return {

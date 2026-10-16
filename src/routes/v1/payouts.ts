@@ -156,7 +156,32 @@ payoutsRouter.patch('/:id/approve', requireRoles('ADMIN', 'SUPER_ADMIN', 'MANAGE
   });
 
   if (!payout) {
-    res.status(404).json({ ok: false, success: false, error: 'PayoutNotFound' });
+    res.status(404).json({ ok: false, success: false, error: 'PayoutNotFound', message: 'Payout not found' });
+    return;
+  }
+
+  // 1. State transition validation
+  if (payout.status !== 'REQUESTED') {
+    res.status(400).json({
+      ok: false,
+      success: false,
+      error: 'InvalidStateTransition',
+      message: `Only REQUESTED payouts can be approved. Current status: ${payout.status}`,
+    });
+    return;
+  }
+
+  // 2. Self-approval prevention
+  const callerProfile = await prisma.salesAgentProfile.findFirst({
+    where: { tenantId, userId: req.user!.userId },
+  });
+  if (callerProfile && payout.agentId === callerProfile.id) {
+    res.status(403).json({
+      ok: false,
+      success: false,
+      error: 'SelfApprovalForbidden',
+      message: 'You cannot approve your own payout request. An independent administrator must review and approve.',
+    });
     return;
   }
 
@@ -168,6 +193,17 @@ payoutsRouter.patch('/:id/approve', requireRoles('ADMIN', 'SUPER_ADMIN', 'MANAGE
       paidAt: new Date(),
     },
   });
+
+  // 3. Audit actor logging
+  await prisma.salesActivityLog.create({
+    data: {
+      tenantId,
+      actorUserId: req.user?.userId,
+      action: 'PAYOUT_APPROVED',
+      note: `Payout of ₹${payout.amount} approved by ${req.user?.displayName}`,
+      metadata: { payoutId: payout.id, agentId: payout.agentId, amount: Number(payout.amount) },
+    },
+  }).catch(() => undefined);
 
   res.json({ ok: true, success: true, data: updated, payout: updated });
 });
@@ -182,7 +218,17 @@ payoutsRouter.patch('/:id/reject', requireRoles('ADMIN', 'SUPER_ADMIN', 'MANAGER
   });
 
   if (!payout) {
-    res.status(404).json({ ok: false, success: false, error: 'PayoutNotFound' });
+    res.status(404).json({ ok: false, success: false, error: 'PayoutNotFound', message: 'Payout not found' });
+    return;
+  }
+
+  if (payout.status !== 'REQUESTED') {
+    res.status(400).json({
+      ok: false,
+      success: false,
+      error: 'InvalidStateTransition',
+      message: `Only REQUESTED payouts can be rejected. Current status: ${payout.status}`,
+    });
     return;
   }
 
@@ -193,6 +239,16 @@ payoutsRouter.patch('/:id/reject', requireRoles('ADMIN', 'SUPER_ADMIN', 'MANAGER
       note: reason ? `${payout.note || ''} (Rejected: ${reason})` : payout.note,
     },
   });
+
+  await prisma.salesActivityLog.create({
+    data: {
+      tenantId,
+      actorUserId: req.user?.userId,
+      action: 'PAYOUT_REJECTED',
+      note: `Payout of ₹${payout.amount} rejected by ${req.user?.displayName}: ${reason || 'No reason provided'}`,
+      metadata: { payoutId: payout.id, agentId: payout.agentId, reason },
+    },
+  }).catch(() => undefined);
 
   res.json({ ok: true, success: true, data: updated, payout: updated });
 });

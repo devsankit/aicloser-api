@@ -1,3 +1,4 @@
+import { encryptSecret, decryptSecret, maskApiKey } from '../../lib/crypto-vault.js';
 import { generateAiCloserReply, testAiProvider, DEFAULT_AI_PROVIDERS, AiProviderConfig } from '../../lib/ai-provider-engine.js';
 import { Router, Request, Response } from 'express';
 import { z } from 'zod';
@@ -770,15 +771,19 @@ aiRouter.get('/providers', async (req: Request, res: Response) => {
   const settings = (workspace?.settings as Record<string, any>) || {};
   const customProviders = Array.isArray(settings.aiProviders) ? settings.aiProviders : DEFAULT_AI_PROVIDERS;
 
-  const sanitized = customProviders.map((p: AiProviderConfig) => ({
-    id: p.id,
-    name: p.name,
-    enabled: p.enabled !== false,
-    model: p.model,
-    priority: p.priority,
-    timeoutMs: p.timeoutMs,
-    isConfigured: p.id === 'fallback' || Boolean(p.apiKey || process.env[`${p.id.toUpperCase()}_API_KEY`] || (p.id === 'gemini' && process.env.GOOGLE_API_KEY)),
-  }));
+  const sanitized = customProviders.map((p: AiProviderConfig) => {
+    const rawKey = p.apiKey ? decryptSecret(p.apiKey) : null;
+    return {
+      id: p.id,
+      name: p.name,
+      enabled: p.enabled !== false,
+      model: p.model,
+      priority: p.priority,
+      timeoutMs: p.timeoutMs,
+      maskedApiKey: maskApiKey(rawKey),
+      isConfigured: p.id === 'fallback' || Boolean(rawKey || process.env[`${p.id.toUpperCase()}_API_KEY`] || (p.id === 'gemini' && process.env.GOOGLE_API_KEY)),
+    };
+  });
 
   res.json({
     success: true,
@@ -828,7 +833,7 @@ aiRouter.patch('/providers', requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN'), va
         ...currentProviders[idx],
         ...update,
         // preserve existing key if not supplied or empty
-        apiKey: update.apiKey !== undefined ? (update.apiKey.trim() || null) : currentProviders[idx].apiKey,
+        apiKey: update.apiKey !== undefined ? (update.apiKey.trim() ? encryptSecret(update.apiKey.trim()) : null) : currentProviders[idx].apiKey,
       };
     } else {
       const def = DEFAULT_AI_PROVIDERS.find((p) => p.id === update.id);

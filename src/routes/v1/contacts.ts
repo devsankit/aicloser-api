@@ -1,3 +1,4 @@
+import { maskPhoneNumber, isPhoneMaskingRequired } from '../../lib/phone-mask.js';
 import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import { Prisma } from '@prisma/client';
@@ -53,15 +54,26 @@ contactsRouter.get('/', validateQuery(listContactsQuerySchema), async (req: Requ
     }),
   ]);
 
+  const wsSettingsForContacts = await prisma.aicloserWorkspace.findUnique({
+    where: { id: tenantId },
+    select: { settings: true },
+  });
+  const shouldMask = isPhoneMaskingRequired(req.user, wsSettingsForContacts?.settings as Record<string, any>);
+
+  const sanitizedContacts = shouldMask
+    ? contacts.map((c) => ({ ...c, e164Phone: maskPhoneNumber(c.e164Phone, true) }))
+    : contacts;
+
   res.json({
     success: true,
     data: {
-      contacts,
+      contacts: sanitizedContacts,
       pagination: {
         total,
         page,
         limit,
         totalPages: Math.ceil(total / limit),
+        hasMore: total > page * limit,
       },
     },
     error: null,

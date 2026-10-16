@@ -106,10 +106,56 @@ export async function assignLeadToNextCloser(params: {
 
   const sourceRules: SourceRule[] = settings.sourceDistributionRules || [];
 
-  // Check source-specific rule
+  // Check source-specific rule (only if enabled)
   const matchedRule = sourceRules.find(
-    (r) => r.source.toUpperCase() === source.toUpperCase()
+    (r) => r.source.toUpperCase() === source.toUpperCase() && (r as any).enabled !== false
   );
+
+  // Enforce maxDailyLeads quota for this source if configured
+  if (matchedRule?.maxDailyLeads && matchedRule.maxDailyLeads > 0) {
+    const startOfDay = new Date();
+    startOfDay.setHours(0, 0, 0, 0);
+
+    const todayCount = await prisma.salesLeadAssignment.count({
+      where: {
+        tenantId,
+        source: { equals: source, mode: 'insensitive' },
+        createdAt: { gte: startOfDay },
+      },
+    });
+
+    if (todayCount > matchedRule.maxDailyLeads) {
+      // Quota exceeded: route to pool so lead is preserved
+      await prisma.salesLeadPoolItem.create({
+        data: {
+          tenantId,
+          source,
+          customerName: lead.customerName || 'Inbound Lead',
+          customerPhone: lead.customerPhone,
+          customerEmail: lead.customerEmail,
+          status: 'OPEN',
+          convertedAssignmentId: lead.id,
+        },
+      }).catch(() => undefined);
+
+      await prisma.salesLeadAssignment.update({
+        where: { id: lead.id },
+        data: { stage: 'NEW', updatedAt: new Date() },
+      });
+
+      return {
+        assigned: false,
+        leadId: lead.id,
+        assignedAgentId: null,
+        agentName: null,
+        stage: 'NEW',
+        distributionMode: 'DAILY_QUOTA_CAP',
+        source,
+        sentToPool: true,
+        reason: `Source ${source} reached daily cap of ${matchedRule.maxDailyLeads} leads`,
+      };
+    }
+  }
 
   // If rule says POOL, move lead to grab pool instead of direct agent assignment
   if (matchedRule?.action === 'POOL') {

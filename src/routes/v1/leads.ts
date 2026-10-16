@@ -1,3 +1,4 @@
+import { upsertCompanyLead, normalizePhoneNumber } from '../../lib/lead-upsert-pipeline.js';
 import { logger } from '../../lib/logger.js';
 import { maskPhoneNumber, isPhoneMaskingRequired } from '../../lib/phone-mask.js';
 import { assignLeadToNextCloser } from '../../lib/lead-assignment-engine.js';
@@ -529,38 +530,65 @@ leadsRouter.get('/:id/360', async (req: Request, res: Response) => {
     : [];
   const lastMessage = rawMessages.length > 0 ? rawMessages[rawMessages.length - 1] : null;
 
+  const raw360Data = {
+    lead,
+    assignedAgent: lead.assignedAgent ? {
+      id: lead.assignedAgent.id,
+      agentCode: lead.assignedAgent.agentCode,
+      displayName: lead.assignedAgent.user?.displayName,
+      email: lead.assignedAgent.user?.email,
+      phone: lead.assignedAgent.user?.phone,
+    } : null,
+    timelineNotes: timeline,
+    timeline,
+    tasks,
+    callLogs: enrichedCalls,
+    calls: enrichedCalls,
+    activeConversation: conversation ? {
+      id: conversation.id,
+      status: conversation.status,
+      updatedAt: conversation.updatedAt,
+      unreadCount: 0,
+      lastMessage,
+    } : null,
+    conversation: conversation ? {
+      id: conversation.id,
+      status: conversation.status,
+      updatedAt: conversation.updatedAt,
+    } : null,
+    payments,
+    customFieldDefinitions: customFieldsDef,
+    customFieldsDefinition: customFieldsDef,
+  };
+
+  const wsFor360 = await prisma.aicloserWorkspace.findUnique({
+    where: { id: tenantId },
+    select: { settings: true },
+  });
+  if (isPhoneMaskingRequired(req.user, wsFor360?.settings as Record<string, any>)) {
+    if (raw360Data.lead) {
+      raw360Data.lead = {
+        ...raw360Data.lead,
+        customerPhone: maskPhoneNumber(raw360Data.lead.customerPhone, true),
+      };
+    }
+    if (raw360Data.callLogs) {
+      raw360Data.callLogs = raw360Data.callLogs.map((c: any) => ({
+        ...c,
+        phoneNumber: maskPhoneNumber(c.phoneNumber, true),
+      }));
+    }
+    if (raw360Data.calls) {
+      raw360Data.calls = raw360Data.calls.map((c: any) => ({
+        ...c,
+        phoneNumber: maskPhoneNumber(c.phoneNumber, true),
+      }));
+    }
+  }
+
   res.json({
     success: true,
-    data: {
-      lead,
-      assignedAgent: lead.assignedAgent ? {
-        id: lead.assignedAgent.id,
-        agentCode: lead.assignedAgent.agentCode,
-        displayName: lead.assignedAgent.user?.displayName,
-        email: lead.assignedAgent.user?.email,
-        phone: lead.assignedAgent.user?.phone,
-      } : null,
-      timelineNotes: timeline,
-      timeline,
-      tasks,
-      callLogs: enrichedCalls,
-      calls: enrichedCalls,
-      activeConversation: conversation ? {
-        id: conversation.id,
-        status: conversation.status,
-        updatedAt: conversation.updatedAt,
-        unreadCount: 0,
-        lastMessage,
-      } : null,
-      conversation: conversation ? {
-        id: conversation.id,
-        status: conversation.status,
-        updatedAt: conversation.updatedAt,
-      } : null,
-      payments,
-      customFieldDefinitions: customFieldsDef,
-      customFieldsDefinition: customFieldsDef,
-    },
+    data: raw360Data,
     error: null,
   });
 });
@@ -1397,105 +1425,31 @@ leadsRouter.post('/import', requirePermissions(PERM_LEADS_REASSIGN), validateBod
   }
 
   for (const row of rows) {
-    const rawPhone = String(row.customerPhone || '').replace(/\D/g, '');
-    const normalizedPhone = rawPhone.length === 10 ? `+91${rawPhone}` : (rawPhone ? `+${rawPhone}` : null);
-    const last10 = rawPhone.slice(-10);
-
-    // 1. Deduplication check
-    let existing = null;
-    if (last10) {
-      existing = await prisma.salesLeadAssignment.findFirst({
-        where: { tenantId, customerPhone: { contains: last10 } },
-      });
-    } else if (row.customerEmail) {
-      existing = await prisma.salesLeadAssignment.findFirst({
-        where: { tenantId, customerEmail: { equals: row.customerEmail.toLowerCase().trim(), mode: 'insensitive' } },
-      });
-    }
-
-    if (existing) {
-      if (duplicateAction === 'SKIP') {
-        skippedDuplicates++;
-        continue;
-      }
-
-      if (duplicateAction === 'UPDATE' || duplicateAction === 'OVERWRITE') {
-        await prisma.salesLeadAssignment.update({
-          where: { id: existing.id },
-          data: {
-            serviceInterest: row.serviceInterest || existing.serviceInterest,
-            budgetAmount: row.budgetAmount !== undefined ? row.budgetAmount : existing.budgetAmount,
-            notes: row.notes ? `${existing.notes || ''}\n[Import Update]: ${row.notes}` : existing.notes,
-            lastContactedAt: new Date(),
-          },
-        });
-        updatedCount++;
-        continue;
-      }
-    }
-
-    // 2. Synchronize to MarketingContact
-    if (normalizedPhone || row.customerEmail) {
-      await prisma.marketingContact.upsert({
-        where: {
-          tenantId_e164Phone: {
-            tenantId,
-            e164Phone: normalizedPhone || `+9100000${Math.random().toString().slice(2, 7)}`,
-          },
-        },
-        create: {
-          tenantId,
-          fullName: row.customerName,
-          e164Phone: normalizedPhone || `+9100000${Math.random().toString().slice(2, 7)}`,
-          email: row.customerEmail || null,
-          source: upperSource,
-        },
-        update: {
-          fullName: row.customerName,
-          email: row.customerEmail || undefined,
-        },
-      }).catch(() => undefined);
-    }
-
-    // 3. Create SalesLeadAssignment in Pipeline
-    const newLead = await prisma.salesLeadAssignment.create({
-      data: {
-        tenantId,
-        assignedAgentId: fallbackAgent.id,
-        createdById: req.user?.userId,
-        customerName: row.customerName,
-        customerPhone: normalizedPhone,
-        customerEmail: row.customerEmail ? row.customerEmail.toLowerCase().trim() : null,
-        source: upperSource,
-        serviceInterest: row.serviceInterest || null,
-        budgetAmount: row.budgetAmount !== undefined ? row.budgetAmount : null,
-        notes: row.notes || `Imported from ${upperSource}`,
-        customFields: row.customFields || {},
-        stage: 'NEW',
-      },
+    const res = await upsertCompanyLead({
+      tenantId,
+      customerName: row.customerName,
+      customerPhone: row.customerPhone,
+      customerEmail: row.customerEmail,
+      serviceInterest: row.serviceInterest,
+      budgetAmount: row.budgetAmount,
+      notes: row.notes,
+      customFields: row.customFields,
+      source: upperSource,
+      duplicateAction: duplicateAction as any,
+      actorUserId: req.user?.userId,
     });
 
-    createdCount++;
+    if (res.wasCreated) createdCount++;
+    else if (res.wasUpdated) updatedCount++;
+    else skippedDuplicates++;
 
-    // 4. Trigger Source-Wise Assignment Engine
-    try {
-      const assignment = await assignLeadToNextCloser({
-        tenantId,
-        leadId: newLead.id,
-        source: upperSource,
-        actorUserId: req.user?.userId,
+    if (sampleAssignments.length < 10 && res.lead) {
+      sampleAssignments.push({
+        leadId: res.lead.id,
+        customerName: res.lead.customerName,
+        stage: res.lead.stage,
+        assignedAgentId: res.lead.assignedAgentId,
       });
-
-      if (sampleAssignments.length < 10) {
-        sampleAssignments.push({
-          leadId: newLead.id,
-          customerName: newLead.customerName,
-          stage: assignment.stage,
-          assignedAgentId: assignment.assignedAgentId,
-        });
-      }
-    } catch (assignErr) {
-      logger.warn('Import lead assignment error', { leadId: newLead.id, error: String(assignErr) });
     }
   }
 
@@ -1733,20 +1687,32 @@ leadsRouter.post('/intake/webhook/:sourceKey', async (req: Request, res: Respons
 // GET /whatsapp-desktop/status & POST /whatsapp-desktop/sync
 leadsRouter.get('/whatsapp-desktop/status', async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
-  const [totalConversations, totalContacts] = await Promise.all([
+  const [channel, activeSessions, totalConversations, totalContacts] = await Promise.all([
+    prisma.whatsAppChannel.findFirst({
+      where: { tenantId },
+      select: { status: true, displayPhoneNumber: true, verifiedName: true, lastSyncedAt: true, phoneNumberId: true },
+    }),
+    prisma.appClientSession.count({
+      where: { tenantId, status: 'ACTIVE' },
+    }),
     prisma.appConversation.count({ where: { tenantId, serviceSlug: 'whatsapp' } }),
     prisma.marketingContact.count({ where: { tenantId } }),
   ]);
 
+  const clientStatus = channel ? channel.status : (activeSessions > 0 ? 'CONNECTED' : 'NOT_CONFIGURED');
+
   res.json({
     success: true,
     data: {
-      clientStatus: 'CONNECTED',
+      clientStatus,
+      isConfigured: Boolean(channel),
+      phoneNumber: channel?.displayPhoneNumber || null,
+      verifiedName: channel?.verifiedName || null,
       sessionName: 'WhatsApp Linked Device Desktop Gateway',
       totalSyncedChats: totalConversations,
       totalSyncedContacts: totalContacts,
-      lastSyncHeartbeat: new Date().toISOString(),
-      qrScanRequired: false,
+      lastSyncHeartbeat: channel?.lastSyncedAt?.toISOString() || new Date().toISOString(),
+      qrScanRequired: clientStatus !== 'ACTIVE' && clientStatus !== 'CONNECTED',
     },
     error: null,
   });

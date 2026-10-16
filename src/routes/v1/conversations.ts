@@ -1,3 +1,4 @@
+import { maskPhoneNumber, isPhoneMaskingRequired } from '../../lib/phone-mask.js';
 import { Router, Request, Response } from 'express';
 import multer from 'multer';
 import fs from 'fs';
@@ -214,6 +215,12 @@ conversationsRouter.get('/', validateQuery(listConversationsQuerySchema), async 
     if (lead.customerPhone) leadByPhone.set(lead.customerPhone, lead);
   }
 
+  const wsSettingsForConv = await prisma.aicloserWorkspace.findUnique({
+    where: { id: tenantId },
+    select: { settings: true },
+  });
+  const shouldMask = isPhoneMaskingRequired(req.user, wsSettingsForConv?.settings as Record<string, any>);
+
   // Clean and project conversation summaries with rich UI metadata
   const items = conversations.map((c) => {
     const payload = (c.payload as Record<string, unknown>) || {};
@@ -235,14 +242,16 @@ conversationsRouter.get('/', validateQuery(listConversationsQuerySchema), async 
 
     return {
       id: c.id,
+      tenantId: c.tenantId,
       customerName: c.customerName,
-      customerPhone: c.customerPhone,
+      customerPhone: shouldMask ? maskPhoneNumber(c.customerPhone, true) : c.customerPhone,
       status: c.status,
       channel: sourceChannel,
       sourceChannel,
       stage: lead?.stage || 'NEW',
       leadStage: lead?.stage || 'NEW',
       leadId: lead?.id || null,
+      assignmentId: lead?.id || null,
       assignedAgent: lead?.assignedAgent
         ? {
             id: lead.assignedAgent.id,
@@ -277,11 +286,14 @@ conversationsRouter.get('/', validateQuery(listConversationsQuerySchema), async 
   res.json({
     success: true,
     data: items,
+    conversations: items,
     pagination: {
       total,
       page,
       limit,
       totalPages: Math.ceil(total / limit),
+      hasMore: total > page * limit,
+      nextCursor: items.length > 0 ? items[items.length - 1].id : null,
     },
     error: null,
   });
