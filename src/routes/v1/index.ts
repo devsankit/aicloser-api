@@ -25,6 +25,7 @@ import { formsRouter } from './forms.js';
 import { automationsRouter } from './automations.js';
 import { payoutsRouter } from './payouts.js';
 import { referralsRouter } from './referrals.js';
+import { roundRobinRouter } from './round-robin.js';
 
 export const v1Router = Router();
 
@@ -48,6 +49,10 @@ v1Router.use('/team', teamRouter);
 v1Router.use('/stages', stagesRouter);
 v1Router.use('/tasks', tasksRouter);
 
+// Lead Assignment & Distribution Engine
+v1Router.use('/round-robin', roundRobinRouter);
+v1Router.use('/leads/round-robin', roundRobinRouter);
+
 // Phase 3 Extensions: Forms, Automations, Payouts & Referrals
 v1Router.use('/forms', formsRouter);
 v1Router.use('/automations', automationsRouter);
@@ -64,5 +69,5 @@ v1Router.use('/integrations/google-drive', googleDriveRouter);
 // Marketing, Campaigns & Templates
 v1Router.use('/marketing', marketingRouter);
 
-// Dedicated AI Engine (Consultative Reply, Lead Scoring, Transcribe, Objection Handling, Copilot)
+// Dedicated AI Engine (Consultative Reply, Lead Scoring, Transcribe, Objection Handling, Copilot, Bot)
 v1Router.use('/ai', aiRouter);

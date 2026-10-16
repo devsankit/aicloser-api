@@ -90,6 +90,34 @@ stagesRouter.get('/', async (req: Request, res: Response) => {
   });
 });
 
+// 2. GET /status-labels - Get status labels and metadata dictionary
+stagesRouter.get('/status-labels', async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const stages = await getWorkspaceStages(tenantId);
+
+  const labels: Record<string, string> = {};
+  const map: Record<string, { label: string; color: string; probability: number }> = {};
+
+  for (const st of stages) {
+    labels[st.key] = st.label;
+    map[st.key] = {
+      label: st.label,
+      color: st.color,
+      probability: st.probability,
+    };
+  }
+
+  res.json({
+    success: true,
+    data: {
+      labels,
+      map,
+      stages,
+    },
+    error: null,
+  });
+});
+
 const createStageSchema = z.object({
   label: z.string().trim().min(1, 'Stage label is required').max(60),
   color: z.string().trim().regex(/^#([0-9A-F]{3}){1,2}$/i, 'Valid hex color code required (e.g. #3B82F6)').default('#3B82F6'),
@@ -97,7 +125,7 @@ const createStageSchema = z.object({
   key: z.string().trim().min(1).max(40).optional(),
 });
 
-// 2. POST / - Create a new custom pipeline status/stage (Admin / Manager only)
+// 3. POST / - Create a new custom pipeline status/stage (Admin / Manager only)
 stagesRouter.post('/', requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN'), validateBody(createStageSchema), async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const body = req.body as z.infer<typeof createStageSchema>;
@@ -153,7 +181,7 @@ const bulkUpdateStagesSchema = z.array(
   })
 ).min(1, 'At least one stage configuration is required');
 
-// 3. PUT / - Bulk update and reorder stages (Admin / Manager only)
+// 4. PUT / - Bulk update and reorder stages (Admin / Manager only)
 stagesRouter.put('/', requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN'), validateBody(bulkUpdateStagesSchema), async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const newStages = req.body as PipelineStageConfig[];
@@ -174,6 +202,71 @@ stagesRouter.put('/', requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN'), validateB
   });
 });
 
+// 5. POST /reorder - Dedicated reorder endpoint accepting stageIds or full objects
+const reorderSchema = z.object({
+  stageIds: z.array(z.string()).optional(),
+  stages: z.array(z.any()).optional(),
+});
+
+stagesRouter.post('/reorder', requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN'), validateBody(reorderSchema), async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const { stageIds, stages } = req.body as { stageIds?: string[]; stages?: PipelineStageConfig[] };
+
+  const currentStages = await getWorkspaceStages(tenantId);
+
+  let reordered: PipelineStageConfig[] = [];
+
+  if (Array.isArray(stageIds) && stageIds.length > 0) {
+    const stageMap = new Map(currentStages.map((s) => [s.id, s]));
+    // Also map by key for fallback
+    currentStages.forEach((s) => stageMap.set(s.key, s));
+
+    const matched: PipelineStageConfig[] = [];
+    const seenIds = new Set<string>();
+
+    for (const sid of stageIds) {
+      const found = stageMap.get(sid);
+      if (found && !seenIds.has(found.id)) {
+        seenIds.add(found.id);
+        matched.push(found);
+      }
+    }
+
+    // Append any unmentioned stages to prevent accidental deletion
+    for (const st of currentStages) {
+      if (!seenIds.has(st.id)) {
+        matched.push(st);
+      }
+    }
+
+    reordered = matched.map((s, idx) => ({
+      ...s,
+      position: idx + 1,
+    }));
+  } else if (Array.isArray(stages) && stages.length > 0) {
+    reordered = stages.map((s, idx) => ({
+      ...s,
+      position: idx + 1,
+    }));
+  } else {
+    res.status(400).json({
+      success: false,
+      error: 'BadRequest',
+      message: 'Provide stageIds array or stages array to reorder',
+    });
+    return;
+  }
+
+  await saveWorkspaceStages(tenantId, reordered);
+
+  res.json({
+    success: true,
+    message: 'Pipeline stages reordered successfully',
+    data: reordered,
+    error: null,
+  });
+});
+
 const patchStageSchema = z.object({
   label: z.string().trim().min(1).max(60).optional(),
   color: z.string().trim().regex(/^#([0-9A-F]{3}){1,2}$/i, 'Valid hex color required').optional(),
@@ -181,7 +274,7 @@ const patchStageSchema = z.object({
   position: z.number().int().min(1).optional(),
 });
 
-// 4. PATCH /:id - Update single stage properties (Admin / Manager only)
+// 6. PATCH /:id - Update single stage properties (Admin / Manager only)
 stagesRouter.patch('/:id', requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN'), validateBody(patchStageSchema), async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const id = String(req.params.id);
@@ -215,7 +308,7 @@ stagesRouter.patch('/:id', requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN'), vali
   });
 });
 
-// 5. DELETE /:id - Delete a custom stage (Admin / Manager only)
+// 7. DELETE /:id - Delete a custom stage (Admin / Manager only)
 stagesRouter.delete('/:id', requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN'), async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const id = String(req.params.id);
@@ -239,7 +332,6 @@ stagesRouter.delete('/:id', requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN'), asy
     return;
   }
 
-  // Check if active leads exist in this stage
   // Check if active leads exist in this stage
   const validStages = [
     'NEW', 'CONTACTED', 'QUALIFIED', 'QUOTE_SENT', 'PAYMENT_PENDING',
@@ -285,7 +377,7 @@ stagesRouter.delete('/:id', requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN'), asy
   });
 });
 
-// 6. POST /reset - Reset workspace pipeline stages to system defaults (Admin / Manager only)
+// 8. POST /reset - Reset workspace pipeline stages to system defaults (Admin / Super Admin only)
 stagesRouter.post('/reset', requireRoles('ADMIN', 'SUPER_ADMIN'), async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   await saveWorkspaceStages(tenantId, DEFAULT_PIPELINE_STAGES);
@@ -297,4 +389,3 @@ stagesRouter.post('/reset', requireRoles('ADMIN', 'SUPER_ADMIN'), async (req: Re
     error: null,
   });
 });
-

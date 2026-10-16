@@ -9,6 +9,7 @@ import { Prisma } from '@prisma/client';
 import { authenticate } from '../../middlewares/auth.js';
 import { enforceTenantIsolation } from '../../middlewares/tenant-isolation.js';
 import { validateBody, validateQuery } from '../../middlewares/validate.js';
+import { requireRoles } from '../../middlewares/rbac.js';
 import { persistApiRealtimeEvent } from '../../lib/realtime.js';
 
 export const conversationsRouter = Router();
@@ -61,11 +62,26 @@ const sendMessageSchema = z.object({
     .optional(),
 });
 
+// Helper: Workspace Chat Visibility Policy ('ASSIGNED_ONLY' vs 'COMPANY_WIDE')
+async function getChatVisibilityMode(tenantId: string): Promise<'ASSIGNED_ONLY' | 'COMPANY_WIDE'> {
+  const workspace = await prisma.aicloserWorkspace.findUnique({
+    where: { id: tenantId },
+    select: { settings: true },
+  });
+  const settings = (workspace?.settings as Record<string, any>) || {};
+  return (settings.chatVisibility as 'ASSIGNED_ONLY' | 'COMPANY_WIDE') || 'ASSIGNED_ONLY';
+}
+
 // Helper: Verify closer access to conversation
 async function verifyCloserAccess(req: Request, conversation: { id: string; customerPhone?: string; assignedFreelancerId?: string | null }): Promise<boolean> {
   if (req.user?.role !== 'SALES_AGENT') return true;
 
   const tenantId = req.tenantId!;
+  const mode = await getChatVisibilityMode(tenantId);
+  if (mode === 'COMPANY_WIDE') {
+    return true;
+  }
+
   const profile = await prisma.salesAgentProfile.findFirst({
     where: { userId: req.user.userId, tenantId },
     select: { id: true },
@@ -106,10 +122,12 @@ conversationsRouter.get('/', validateQuery(listConversationsQuerySchema), async 
 
   // Strict SALES_AGENT permission scoping
   if (req.user?.role === 'SALES_AGENT') {
-    const profile = await prisma.salesAgentProfile.findFirst({
-      where: { userId: req.user.userId, tenantId },
-      select: { id: true },
-    });
+    const mode = await getChatVisibilityMode(tenantId);
+    if (mode !== 'COMPANY_WIDE') {
+      const profile = await prisma.salesAgentProfile.findFirst({
+        where: { userId: req.user.userId, tenantId },
+        select: { id: true },
+      });
 
     const assignedLeads = profile
       ? await prisma.salesLeadAssignment.findMany({
@@ -121,13 +139,14 @@ conversationsRouter.get('/', validateQuery(listConversationsQuerySchema), async 
     const phones = assignedLeads.map((l) => l.customerPhone).filter(Boolean) as string[];
     const convIds = assignedLeads.map((l) => l.conversationId).filter(Boolean) as string[];
 
-    andConditions.push({
-      OR: [
-        { assignedFreelancerId: profile?.id ?? '__NO_ACCESS__' },
-        ...(convIds.length > 0 ? [{ id: { in: convIds } }] : []),
-        ...(phones.length > 0 ? [{ customerPhone: { in: phones } }] : []),
-      ],
-    });
+      andConditions.push({
+        OR: [
+          { assignedFreelancerId: profile?.id ?? '__NO_ACCESS__' },
+          ...(convIds.length > 0 ? [{ id: { in: convIds } }] : []),
+          ...(phones.length > 0 ? [{ customerPhone: { in: phones } }] : []),
+        ],
+      });
+    }
   }
 
   if (status) andConditions.push({ status });
@@ -264,6 +283,93 @@ conversationsRouter.get('/', validateQuery(listConversationsQuerySchema), async 
       limit,
       totalPages: Math.ceil(total / limit),
     },
+    error: null,
+  });
+});
+
+// Chat Visibility Policy Management
+conversationsRouter.get('/chat-visibility', async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const mode = await getChatVisibilityMode(tenantId);
+
+  res.json({
+    success: true,
+    data: {
+      visibilityMode: mode,
+      description: mode === 'COMPANY_WIDE'
+        ? 'Company-wide: All sales agents can view all workspace conversations'
+        : 'Assigned-only: Sales agents are strictly scoped to their assigned leads',
+      roles: {
+        ADMIN: 'COMPANY_WIDE',
+        MANAGER: 'COMPANY_WIDE',
+        SALES_AGENT: mode,
+      },
+    },
+    error: null,
+  });
+});
+
+const updateVisibilitySchema = z.object({
+  visibilityMode: z.enum(['ASSIGNED_ONLY', 'COMPANY_WIDE']),
+  allowAgentIntervene: z.boolean().optional(),
+});
+
+const handleUpdateVisibility = async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const { visibilityMode, allowAgentIntervene } = req.body;
+
+  const workspace = await prisma.aicloserWorkspace.findUnique({
+    where: { id: tenantId },
+    select: { settings: true },
+  });
+
+  const settings = (workspace?.settings as Record<string, any>) || {};
+  settings.chatVisibility = visibilityMode;
+  if (allowAgentIntervene !== undefined) {
+    settings.chatAllowAgentIntervene = allowAgentIntervene;
+  }
+
+  await prisma.aicloserWorkspace.update({
+    where: { id: tenantId },
+    data: { settings, updatedAt: new Date() },
+  });
+
+  res.json({
+    success: true,
+    message: `Chat visibility policy updated to ${visibilityMode}`,
+    data: { visibilityMode, allowAgentIntervene },
+    error: null,
+  });
+};
+
+conversationsRouter.patch('/chat-visibility', requireRoles('ADMIN', 'SUPER_ADMIN'), validateBody(updateVisibilitySchema), handleUpdateVisibility);
+conversationsRouter.put('/chat-visibility', requireRoles('ADMIN', 'SUPER_ADMIN'), validateBody(updateVisibilitySchema), handleUpdateVisibility);
+
+// GET /:id - Single conversation detail with ownership verification
+conversationsRouter.get('/:id', async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const id = String(req.params.id);
+
+  if (id === 'chat-visibility') return;
+
+  const conversation = await prisma.appConversation.findFirst({
+    where: { id, tenantId },
+  });
+
+  if (!conversation) {
+    res.status(404).json({ success: false, error: 'NotFound', message: 'Conversation not found in workspace' });
+    return;
+  }
+
+  const hasAccess = await verifyCloserAccess(req, conversation);
+  if (!hasAccess) {
+    res.status(403).json({ success: false, error: 'Forbidden', message: 'You do not have access to view this conversation' });
+    return;
+  }
+
+  res.json({
+    success: true,
+    data: conversation,
     error: null,
   });
 });
