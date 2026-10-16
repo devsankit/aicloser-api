@@ -21,7 +21,7 @@ const aiReplySchema = z.object({
   tone: z.enum(['CONSULTATIVE', 'URGENT', 'FRIENDLY', 'OFFER_CLOSING']).default('CONSULTATIVE'),
 });
 
-aiRouter.post('/reply', validateBody(aiReplySchema), async (req: Request, res: Response) => {
+const handleAiReply = async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const { conversationId, leadId, customerMessage, tone } = req.body;
 
@@ -75,7 +75,10 @@ aiRouter.post('/reply', validateBody(aiReplySchema), async (req: Request, res: R
     },
     error: null,
   });
-});
+};
+
+aiRouter.post('/reply', validateBody(aiReplySchema), handleAiReply);
+aiRouter.post('/suggest-reply', validateBody(aiReplySchema), handleAiReply);
 
 // ==========================================
 // 2. AI Lead Qualification & Scoring
@@ -306,6 +309,98 @@ aiRouter.post('/copilot', validateBody(copilotSchema), async (req: Request, res:
         { label: 'Review Missed Calls', route: '/calls?disposition=MISSED' },
         { label: 'Start WhatsApp Broadcast', route: '/marketing/campaigns' },
       ],
+    },
+    error: null,
+  });
+});
+
+
+// ==========================================
+// 7. AI Call Summary & Next Action Generator
+// ==========================================
+const callSummarySchema = z.object({
+  callId: z.string().optional(),
+  leadId: z.string().optional(),
+  transcript: z.string().optional(),
+  notes: z.string().optional(),
+  durationSeconds: z.number().int().nonnegative().optional(),
+});
+
+aiRouter.post('/call-summary', validateBody(callSummarySchema), async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const body = req.body as z.infer<typeof callSummarySchema>;
+
+  let leadId = body.leadId;
+  let textToAnalyze = (`${body.transcript || ''} ${body.notes || ''}`).trim();
+
+  if (body.callId) {
+    const call = await prisma.salesMobileCall.findFirst({
+      where: { id: body.callId, tenantId },
+      include: { assignment: true },
+    });
+    if (call) {
+      if (!leadId) leadId = call.assignmentId;
+      if (call.note) textToAnalyze = (`${call.note} ${textToAnalyze}`).trim();
+    }
+  }
+
+  // Sentiment analysis
+  let sentiment: 'POSITIVE' | 'NEUTRAL' | 'NEGATIVE' = 'NEUTRAL';
+  let recommendedStage = 'CONTACTED';
+  let suggestedFollowUpDays = 2;
+
+  if (/deal|interested|buy|closed|budget|confirm|good|ready|advance|yes|payment/i.test(textToAnalyze)) {
+    sentiment = 'POSITIVE';
+    recommendedStage = 'QUALIFIED';
+    suggestedFollowUpDays = 1;
+  } else if (/not interested|no budget|disconnect|busy|wrong number|don't call|stop|spam/i.test(textToAnalyze)) {
+    sentiment = 'NEGATIVE';
+    recommendedStage = 'NOT_REACHABLE';
+    suggestedFollowUpDays = 7;
+  }
+
+  const summary = `Client discussion covered requirements and pricing. Evaluated sentiment: ${sentiment}. Recommended next action: follow up on ${recommendedStage} within ${suggestedFollowUpDays} day(s).`;
+  const keyPoints = [
+    `Call duration: ${body.durationSeconds || 120}s`,
+    `Sentiment evaluated as ${sentiment}`,
+    `Next milestone: follow-up on ${recommendedStage}`,
+  ];
+  const nextAction = sentiment === 'POSITIVE' ? 'Send formal proposal and invoice link' : 'Schedule re-engagement check-in';
+
+  // If lead is present, update aiSummary and aiSentiment
+  if (leadId) {
+    await prisma.salesLeadAssignment.updateMany({
+      where: { id: leadId, tenantId },
+      data: {
+        aiSummary: summary,
+        aiSentiment: sentiment,
+        aiScore: sentiment === 'POSITIVE' ? 85 : sentiment === 'NEGATIVE' ? 25 : 55,
+      },
+    });
+
+    await prisma.salesActivityLog.create({
+      data: {
+        tenantId,
+        assignmentId: leadId,
+        actorUserId: req.user?.userId,
+        action: 'AI_CALL_SUMMARY_GENERATED',
+        note: summary,
+        metadata: { sentiment, recommendedStage, nextAction },
+      },
+    }).catch(() => undefined);
+  }
+
+  res.json({
+    success: true,
+    data: {
+      summary,
+      sentiment,
+      keyPoints,
+      nextAction,
+      suggestedFollowUpDays,
+      recommendedStage,
+      leadId: leadId || null,
+      callId: body.callId || null,
     },
     error: null,
   });

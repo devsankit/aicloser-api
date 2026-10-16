@@ -148,7 +148,13 @@ recordingsRouter.post('/:id/complete', validateBody(z.object({ checksum: z.strin
 
 recordingsRouter.get('/:id/playback', async (req: Request, res: Response) => {
   const uploadId = String(req.params.id);
-  const upload = await prisma.callRecordingUpload.findFirst({ where: { id: uploadId, tenantId: req.tenantId!, status: 'UPLOADED' } });
+  let upload = await prisma.callRecordingUpload.findFirst({ where: { id: uploadId, tenantId: req.tenantId!, status: 'UPLOADED' } });
+  if (!upload) {
+    upload = await prisma.callRecordingUpload.findFirst({
+      where: { callId: uploadId, tenantId: req.tenantId!, status: 'UPLOADED' },
+      orderBy: { createdAt: 'desc' },
+    });
+  }
   if (!upload) {
     res.status(404).json({ success: false, error: 'NotFound', message: 'Uploaded recording not found in this workspace' });
     return;

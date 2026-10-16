@@ -443,6 +443,23 @@ leadsRouter.get('/:id/360', async (req: Request, res: Response) => {
     }),
   ]);
 
+  const recordingUploads = calls.length
+    ? await prisma.callRecordingUpload.findMany({
+        where: { tenantId, callId: { in: calls.map((call) => call.id) }, status: 'UPLOADED' },
+        orderBy: { createdAt: 'desc' },
+        select: { id: true, callId: true },
+      })
+    : [];
+  const recordingByCallId = new Map<string, string>();
+  for (const upload of recordingUploads) {
+    if (!recordingByCallId.has(upload.callId)) recordingByCallId.set(upload.callId, upload.id);
+  }
+  const enrichedCalls = calls.map((call) => ({
+    ...call,
+    recordingUploadId: recordingByCallId.get(call.id) ?? null,
+    hasRecording: Boolean(recordingByCallId.get(call.id)),
+  }));
+
   // 3. Direct conversation relation prioritized, fallback to phone
   let conversation = null;
   if (lead.conversationId) {
@@ -496,8 +513,8 @@ leadsRouter.get('/:id/360', async (req: Request, res: Response) => {
       timelineNotes: timeline,
       timeline,
       tasks,
-      callLogs: calls,
-      calls,
+      callLogs: enrichedCalls,
+      calls: enrichedCalls,
       activeConversation: conversation ? {
         id: conversation.id,
         status: conversation.status,

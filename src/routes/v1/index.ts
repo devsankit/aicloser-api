@@ -15,6 +15,7 @@ import { paymentsRouter } from './payments.js';
 import { reportsRouter } from './reports.js';
 import { teamRouter } from './team.js';
 import { stagesRouter } from './stages.js';
+import { tasksRouter } from './tasks.js';
 import { googleDriveRouter } from './google-drive.js';
 import { workspaceRouter } from './workspace.js';
 import { integrationsRouter } from './integrations.js';
@@ -41,6 +42,7 @@ v1Router.use('/payments', paymentsRouter);
 v1Router.use('/reports', reportsRouter);
 v1Router.use('/team', teamRouter);
 v1Router.use('/stages', stagesRouter);
+v1Router.use('/tasks', tasksRouter);
 
 // Workspace Plan & Entitlements
 v1Router.use('/workspace', workspaceRouter);

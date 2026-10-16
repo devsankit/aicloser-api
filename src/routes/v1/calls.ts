@@ -8,10 +8,68 @@ import { SalesMobileCallDirection, SalesMobileCallStatus } from '@prisma/client'
 import { SalesLeadStage, salesLeadStageSchema } from '../../types/leads.js';
 import { Prisma } from '@prisma/client';
 import { persistApiRealtimeEvent } from '../../lib/realtime.js';
+import { getRecordingPlayback } from '../../lib/recording-storage.js';
+import { hasPermission, PERM_RECORDINGS_PLAY_ALL } from '../../middlewares/rbac.js';
 
 export const callsRouter = Router();
 
 callsRouter.use(authenticate, enforceTenantIsolation);
+
+async function resolveCallRecording(callId: string, req: Request) {
+  const tenantId = req.tenantId!;
+  const call = await prisma.salesMobileCall.findFirst({
+    where: { id: callId, tenantId },
+    select: { id: true, tenantId: true, agentId: true, recordingStatus: true },
+  });
+
+  if (!call) {
+    return { ok: false as const, status: 404, error: 'NotFound', message: 'Call not found in this workspace' };
+  }
+  if (call.recordingStatus !== 'UPLOADED') {
+    return { ok: false as const, status: 404, error: 'RecordingNotReady', message: 'This call does not have an uploaded recording' };
+  }
+
+  if (req.user?.role === 'SALES_AGENT') {
+    const canPlayAll = await hasPermission(req.user.userId, tenantId, 'SALES_AGENT', PERM_RECORDINGS_PLAY_ALL);
+    if (!canPlayAll) {
+      const profile = await prisma.salesAgentProfile.findFirst({
+        where: { userId: req.user.userId, tenantId },
+        select: { id: true },
+      });
+      if (!profile || call.agentId !== profile.id) {
+        return { ok: false as const, status: 403, error: 'Forbidden', message: 'You can only listen to recordings for your own calls' };
+      }
+    }
+  }
+
+  const upload = await prisma.callRecordingUpload.findFirst({
+    where: { tenantId, callId: call.id, status: 'UPLOADED' },
+    orderBy: { createdAt: 'desc' },
+    select: { id: true, objectKey: true, mimeType: true },
+  });
+  if (!upload) {
+    return { ok: false as const, status: 404, error: 'RecordingNotFound', message: 'Uploaded recording metadata was not found' };
+  }
+
+  return { ok: true as const, call, upload };
+}
+
+async function sendCallRecording(req: Request, res: Response) {
+  const result = await resolveCallRecording(String(req.params.id), req);
+  if (!result.ok) {
+    res.status(result.status).json({ success: false, error: result.error, message: result.message });
+    return;
+  }
+
+  const playback = await getRecordingPlayback({ objectKey: result.upload.objectKey, contentType: result.upload.mimeType });
+  if (playback.mode === 's3') {
+    res.json({ success: true, data: { url: playback.url, expiresIn: 300, callId: result.call.id, recordingUploadId: result.upload.id } });
+    return;
+  }
+  res.setHeader('Content-Type', playback.contentType);
+  res.setHeader('Cache-Control', 'private, no-store');
+  res.send(playback.bytes);
+}
 
 const listCallsQuerySchema = z.object({
   cursor: z.string().optional(),
@@ -86,11 +144,29 @@ callsRouter.get('/', validateQuery(listCallsQuerySchema), async (req: Request, r
   });
   const hasMore = rows.length > limit;
   const calls = hasMore ? rows.slice(0, limit) : rows;
+  const recordingUploads = calls.length
+    ? await prisma.callRecordingUpload.findMany({
+        where: { tenantId, callId: { in: calls.map((call) => call.id) }, status: 'UPLOADED' },
+        orderBy: { createdAt: 'desc' },
+        select: { id: true, callId: true },
+      })
+    : [];
+  const recordingByCallId = new Map<string, string>();
+  for (const upload of recordingUploads) {
+    if (!recordingByCallId.has(upload.callId)) recordingByCallId.set(upload.callId, upload.id);
+  }
+  const enrichedCalls = calls.map((call) => ({
+    ...call,
+    recordingUploadId: recordingByCallId.get(call.id) ?? null,
+    hasRecording: Boolean(recordingByCallId.get(call.id)),
+  }));
 
   res.json({
     success: true,
     data: {
-      calls,
+      // The resolver is intentionally call-ID based so dashboard and chat clients
+      // do not need to know storage keys or make a second metadata lookup.
+      calls: enrichedCalls,
       pagination: {
         limit,
         cursor: cursor ?? null,
@@ -100,6 +176,11 @@ callsRouter.get('/', validateQuery(listCallsQuerySchema), async (req: Request, r
     },
   });
 });
+
+// Call-ID based playback bridge for dashboard/chat clients. The existing
+// /recordings/:id/playback contract remains available for mobile upload flows.
+callsRouter.get('/:id/recording', sendCallRecording);
+callsRouter.get('/:id/playback', sendCallRecording);
 
 const logCallSchema = z.object({
   assignmentId: z.string().min(1, 'Assignment ID required'),
