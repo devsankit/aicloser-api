@@ -233,7 +233,7 @@ async function runSuperAdminHardeningSuite() {
         displayName: 'Hardening Test Closer',
         role: 'SALES_AGENT',
         password: 'SecurePassword123!',
-        phone: '+919988776655',
+        phone: '+91' + Date.now().toString().slice(-8),
       }
     );
     assert.strictEqual(resCreate.statusCode, 201);
