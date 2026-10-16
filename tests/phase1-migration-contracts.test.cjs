@@ -1,14 +1,14 @@
+const jwt = require('jsonwebtoken');
 const assert = require('assert');
 const http = require('http');
-const jwt = require('jsonwebtoken');
 
-const API_BASE = 'http://localhost:3060';
-const JWT_SECRET = process.env.JWT_SECRET || 'aicloser_super_jwt_secret_production_2026_x99';
+const API_BASE = 'http://127.0.0.1:3060';
+const JWT_SECRET = process.env.JWT_SECRET || 'aicloser-super-secure-production-jwt-secret-2026-key';
 
 const tenantA = 'tenant-the-storage-test-1d01dda2';
 
-const userAdminA = { userId: 'usr-admin-phase1-a', email: 'admin.a@example.com', role: 'ADMIN', tenantId: tenantA };
-const userCloserA = { userId: 'usr-closer-phase1-a', email: 'closer.a@example.com', role: 'SALES_AGENT', tenantId: tenantA };
+const userAdminA = { userId: 'user-admin-eafadb6d', email: 'admin.a@example.com', role: 'ADMIN', tenantId: tenantA, displayName: 'Ankit rathore' };
+const userCloserA = { userId: 'user-sales-agent-83d13bc5', email: 'closer.a@example.com', role: 'SALES_AGENT', tenantId: tenantA, displayName: 'Closer Agent' };
 
 const tokenAdminA = jwt.sign(userAdminA, JWT_SECRET, { expiresIn: '2h' });
 const tokenCloserA = jwt.sign(userCloserA, JWT_SECRET, { expiresIn: '2h' });
@@ -160,36 +160,41 @@ async function runPhase1Suite() {
   });
 
   // 7 & 8. Contact suppression & unsuppression
-  const contactsLookup = await apiRequest({ path: '/api/v1/marketing/contacts?limit=1', method: 'GET', token: tokenAdminA });
-  const sampleContact = contactsLookup.data && contactsLookup.data.data && contactsLookup.data.data.contacts ? contactsLookup.data.data.contacts[0] : null;
-
-  if (sampleContact) {
-    await test('7. POST /api/v1/marketing/contacts/:id/suppress suppresses contact', async () => {
-      const res = await apiRequest(
-        { path: '/api/v1/marketing/contacts/' + sampleContact.id + '/suppress', method: 'POST', token: tokenAdminA }
-      );
-      assert.strictEqual(res.statusCode, 200);
-      assert.strictEqual(res.data.success, true);
-      assert.strictEqual(res.data.data.optInStatus, 'OPTED_OUT');
-      assert.ok(res.data.data.tags.includes('SUPPRESSED'));
-    });
-
-    await test('8. POST /api/v1/marketing/contacts/:id/unsuppress unsuppresses contact', async () => {
-      const res = await apiRequest(
-        { path: '/api/v1/marketing/contacts/' + sampleContact.id + '/unsuppress', method: 'POST', token: tokenAdminA }
-      );
-      assert.strictEqual(res.statusCode, 200);
-      assert.strictEqual(res.data.success, true);
-      assert.strictEqual(res.data.data.optInStatus, 'OPTED_IN');
-      assert.ok(!res.data.data.tags.includes('SUPPRESSED'));
-    });
-  } else {
-    console.log('  ! SKIP: 7 & 8 (No marketing contacts in tenantA)');
+  // Ensure a test contact exists
+  let contactRes = await apiRequest(
+    { path: '/api/v1/marketing/contacts', method: 'POST', token: tokenAdminA },
+    { fullName: 'Test Phase1 Lead', phone: '9988776655', email: 'test.phase1@example.com', tags: ['Phase1Test'] }
+  );
+  let sampleContactId = contactRes.data && contactRes.data.data ? contactRes.data.data.id : null;
+  if (!sampleContactId) {
+    const contactsLookup = await apiRequest({ path: '/api/v1/marketing/contacts?limit=1', method: 'GET', token: tokenAdminA });
+    sampleContactId = contactsLookup.data && contactsLookup.data.data && contactsLookup.data.data.contacts ? contactsLookup.data.data.contacts[0].id : null;
   }
+  assert.ok(sampleContactId, 'Must have a marketing contact for suppression test');
+
+  await test('7. POST /api/v1/marketing/contacts/:id/suppress suppresses contact', async () => {
+    const res = await apiRequest(
+      { path: '/api/v1/marketing/contacts/' + sampleContactId + '/suppress', method: 'POST', token: tokenAdminA }
+    );
+    assert.strictEqual(res.statusCode, 200);
+    assert.strictEqual(res.data.success, true);
+    assert.strictEqual(res.data.data.optInStatus, 'OPTED_OUT');
+    assert.ok(res.data.data.tags.includes('SUPPRESSED'));
+  });
+
+  await test('8. POST /api/v1/marketing/contacts/:id/unsuppress unsuppresses contact', async () => {
+    const res = await apiRequest(
+      { path: '/api/v1/marketing/contacts/' + sampleContactId + '/unsuppress', method: 'POST', token: tokenAdminA }
+    );
+    assert.strictEqual(res.statusCode, 200);
+    assert.strictEqual(res.data.success, true);
+    assert.strictEqual(res.data.data.optInStatus, 'OPTED_IN');
+    assert.ok(!res.data.data.tags.includes('SUPPRESSED'));
+  });
 
   // 9. Template direct preview
   const templatesLookup = await apiRequest({ path: '/api/v1/marketing/templates', method: 'GET', token: tokenAdminA });
-  const sampleTemplate = templatesLookup.data && templatesLookup.data.data ? templatesLookup.data.data[0] : null;
+  let sampleTemplate = templatesLookup.data && templatesLookup.data.data ? templatesLookup.data.data[0] : null;
 
   if (sampleTemplate) {
     await test('9. POST /api/v1/marketing/templates/:id/preview renders variables without campaign', async () => {
@@ -203,7 +208,14 @@ async function runPhase1Suite() {
       assert.strictEqual(res.data.data.templateId, sampleTemplate.id);
     });
   } else {
-    console.log('  ! SKIP: 9 (No WhatsApp templates in tenantA)');
+    await test('9. POST /api/v1/marketing/templates/:id/preview returns 404 for unknown template', async () => {
+      const res = await apiRequest(
+        { path: '/api/v1/marketing/templates/non_existent_tmpl/preview', method: 'POST', token: tokenAdminA },
+        { variables: { '1': 'Sankit Sharma' } }
+      );
+      assert.strictEqual(res.statusCode, 404);
+      assert.strictEqual(res.data.error, 'TemplateNotFound');
+    });
   }
 
   // 10. Call ID recording playback resolver fallback
@@ -211,7 +223,6 @@ async function runPhase1Suite() {
     const res = await apiRequest(
       { path: '/api/v1/calls/non_existent_call_id/playback', method: 'GET', token: tokenAdminA }
     );
-    // Non-existent call must return 404, not 500 crash
     assert.strictEqual(res.statusCode, 404);
   });
 
