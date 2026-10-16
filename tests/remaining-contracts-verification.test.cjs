@@ -155,14 +155,16 @@ async function runRemainingContractsSuite() {
   // Fetch or create a test lead for custom fields values test
   let sampleLeadId = null;
   const leadRes = await apiRequest({ path: '/api/v1/leads?limit=1', token: tokenAdminA });
-  if (leadRes.data?.data?.leads?.[0]) {
+  if (Array.isArray(leadRes.data?.data) && leadRes.data.data[0]?.id) {
+    sampleLeadId = leadRes.data.data[0].id;
+  } else if (leadRes.data?.data?.leads?.[0]?.id) {
     sampleLeadId = leadRes.data.data.leads[0].id;
   } else {
     const createLeadRes = await apiRequest(
       { path: '/api/v1/leads', method: 'POST', token: tokenAdminA },
       { customerName: 'Contract Test Lead', customerPhone: `+9199999${Math.floor(10000 + Math.random() * 90000)}` }
     );
-    sampleLeadId = createLeadRes.data?.data?.lead?.id || createLeadRes.data?.data?.id;
+    sampleLeadId = createLeadRes.data?.data?.id || createLeadRes.data?.data?.lead?.id;
   }
 
   await test('GET /api/v1/custom-fields/lead/:leadId - Read lead custom field values', async () => {
@@ -482,7 +484,7 @@ async function runRemainingContractsSuite() {
         contacts: [
           { fullName: 'Lead One', phone: `+9199111${Math.floor(10000 + Math.random() * 90000)}`, email: 'one@test.com' },
           { fullName: 'Lead Two', phone: `+9199222${Math.floor(10000 + Math.random() * 90000)}`, email: 'two@test.com' },
-          { fullName: 'Lead Invalid', phone: '123' }, // intentional invalid row to test error logging
+          { fullName: 'Lead Invalid', phone: '123' },
         ],
       }
     );

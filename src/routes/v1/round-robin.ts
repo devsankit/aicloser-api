@@ -85,31 +85,23 @@ roundRobinRouter.get('/', async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const settings = await getRoundRobinSettings(tenantId);
 
-  // Fetch closers and active lead counts
+  // Fetch closers and active lead counts using clean relation count
   const profiles = await prisma.salesAgentProfile.findMany({
     where: { tenantId },
     include: {
       user: { select: { id: true, displayName: true, email: true, phone: true } },
+      _count: {
+        select: {
+          leadAssignments: {
+            where: { stage: { notIn: ['CLOSED_WON', 'CLOSED_LOST', 'LOST'] as any } },
+          },
+        },
+      },
     },
-  });
-
-  const activeLeadCounts = await prisma.salesLeadAssignment.groupBy({
-    by: ['assignedAgentId'],
-    where: {
-      tenantId,
-      assignedAgentId: { not: null as any },
-      stage: { notIn: ['CLOSED_WON', 'CLOSED_LOST', 'LOST'] as any },
-    },
-    _count: { _all: true },
-  });
-
-  const countMap = new Map<string, number>();
-  activeLeadCounts.forEach((c) => {
-    if (c.assignedAgentId) countMap.set(c.assignedAgentId, c._count._all);
   });
 
   const closers = profiles.map((p) => {
-    const activeLeads = countMap.get(p.id) || 0;
+    const activeLeads = p._count?.leadAssignments || 0;
     const isAtQuota = activeLeads >= settings.maxActiveLeadsPerCloser;
     const isAvailable = p.status === 'ACTIVE' && (!settings.excludeInactiveClosers || p.status === 'ACTIVE') && !isAtQuota;
 
@@ -319,23 +311,18 @@ roundRobinRouter.get('/closers', async (req: Request, res: Response) => {
     where: { tenantId },
     include: {
       user: { select: { id: true, displayName: true, email: true } },
+      _count: {
+        select: {
+          leadAssignments: {
+            where: { stage: { notIn: ['CLOSED_WON', 'CLOSED_LOST', 'LOST'] as any } },
+          },
+        },
+      },
     },
   });
-
-  const activeCounts = await prisma.salesLeadAssignment.groupBy({
-    by: ['assignedAgentId'],
-    where: {
-      tenantId,
-      assignedAgentId: { not: null as any },
-      stage: { notIn: ['CLOSED_WON', 'CLOSED_LOST', 'LOST'] as any },
-    },
-    _count: { _all: true },
-  });
-
-  const countMap = new Map<string, number>();(activeCounts.map((c) => [c.assignedAgentId!, c._count]));
 
   const data = profiles.map((p) => {
-    const activeLeads = countMap.get(p.id) || 0;
+    const activeLeads = p._count?.leadAssignments || 0;
     const isAtQuota = activeLeads >= settings.maxActiveLeadsPerCloser;
     return {
       agentId: p.id,
@@ -382,11 +369,17 @@ roundRobinRouter.post('/assign', requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN')
     return;
   }
 
-  // Fetch active eligible closers
   const profiles = await prisma.salesAgentProfile.findMany({
     where: { tenantId, status: 'ACTIVE' },
     include: {
       user: { select: { id: true, displayName: true, email: true } },
+      _count: {
+        select: {
+          leadAssignments: {
+            where: { stage: { notIn: ['CLOSED_WON', 'CLOSED_LOST', 'LOST'] as any } },
+          },
+        },
+      },
     },
   });
 
@@ -395,22 +388,9 @@ roundRobinRouter.post('/assign', requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN')
     return;
   }
 
-  // Fetch active counts
-  const activeCounts = await prisma.salesLeadAssignment.groupBy({
-    by: ['assignedAgentId'],
-    where: {
-      tenantId,
-      assignedAgentId: { not: null as any },
-      stage: { notIn: ['CLOSED_WON', 'CLOSED_LOST', 'LOST'] as any },
-    },
-    _count: { _all: true },
-  });
-
-  const countMap = new Map<string, number>();(activeCounts.map((c) => [c.assignedAgentId!, c._count]));
-
   // Filter closers below quota
   let eligible = profiles.filter((p) => {
-    const active = countMap.get(p.id) || 0;
+    const active = p._count?.leadAssignments || 0;
     return active < settings.maxActiveLeadsPerCloser;
   });
 
@@ -435,8 +415,7 @@ roundRobinRouter.post('/assign', requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN')
   let selectedCloser = eligible[0];
 
   if (settings.mode === 'LOAD_BALANCED') {
-    // Pick closer with lowest current load
-    eligible.sort((a, b) => (countMap.get(a.id) || 0) - (countMap.get(b.id) || 0));
+    eligible.sort((a, b) => (a._count?.leadAssignments || 0) - (b._count?.leadAssignments || 0));
     selectedCloser = eligible[0];
   } else {
     // STRICT_ROUND_ROBIN
@@ -494,7 +473,7 @@ roundRobinRouter.post('/assign', requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN')
         agentId: selectedCloser.id,
         name: selectedCloser.user?.displayName || 'Agent',
         email: selectedCloser.user?.email || null,
-        currentLoad: (countMap.get(selectedCloser.id) || 0) + assignedResults.length,
+        currentLoad: (selectedCloser._count?.leadAssignments || 0) + assignedResults.length,
       },
     },
     error: null,
