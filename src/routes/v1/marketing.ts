@@ -521,3 +521,122 @@ marketingRouter.post('/channel/test-send', requireRoles('ADMIN', 'SUPER_ADMIN'),
     error: null,
   });
 });
+
+
+// ==========================================
+// 4. Template Direct Preview & Contact Suppression
+// ==========================================
+
+// POST /templates/:id/preview - Direct template preview with variable substitution
+marketingRouter.post('/templates/:id/preview', async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const id = String(req.params.id);
+  const { variables, samplePhone } = (req.body || {}) as { variables?: Record<string, string>; samplePhone?: string };
+
+  const template = await prisma.whatsAppTemplate.findFirst({
+    where: { id, tenantId },
+  });
+
+  if (!template) {
+    res.status(404).json({ success: false, error: 'NotFound', message: 'WhatsApp template not found in this workspace' });
+    return;
+  }
+
+  let renderedBody = template.bodyText || template.name;
+
+  const varMap: Record<string, string> = {
+    '1': 'John Doe',
+    '2': 'AI Closer',
+    '3': '9988776655',
+    ...(variables || {}),
+  };
+
+  for (const [k, v] of Object.entries(varMap)) {
+    renderedBody = renderedBody.split("{{" + k + "}}").join(v);
+  }
+
+  res.json({
+    success: true,
+    data: {
+      templateId: template.id,
+      name: template.name,
+      category: template.category,
+      language: template.language,
+      status: template.status,
+      renderedBody,
+      header: { type: template.headerType, content: template.headerContent, handle: template.headerHandle },
+      footer: template.footerText || null,
+      buttons: template.buttons || null,
+      samplePhone: samplePhone || '+919988776655',
+    },
+    error: null,
+  });
+});
+
+// POST /contacts/:id/suppress - Suppress contact from marketing campaigns
+marketingRouter.post('/contacts/:id/suppress', requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN'), async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const id = String(req.params.id);
+
+  const contact = await prisma.marketingContact.findFirst({
+    where: { id, tenantId },
+  });
+
+  if (!contact) {
+    res.status(404).json({ success: false, error: 'NotFound', message: 'Contact not found in this workspace' });
+    return;
+  }
+
+  const updatedTags = Array.from(new Set([...(contact.tags || []), 'SUPPRESSED']));
+
+  const updated = await prisma.marketingContact.update({
+    where: { id },
+    data: {
+      optInStatus: 'OPTED_OUT',
+      optOutAt: new Date(),
+      optOutSource: 'USER_SUPPRESSION',
+      tags: updatedTags,
+    },
+  });
+
+  res.json({
+    success: true,
+    message: 'Contact suppressed from marketing campaigns',
+    data: updated,
+    error: null,
+  });
+});
+
+// POST /contacts/:id/unsuppress - Unsuppress contact
+marketingRouter.post('/contacts/:id/unsuppress', requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN'), async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const id = String(req.params.id);
+
+  const contact = await prisma.marketingContact.findFirst({
+    where: { id, tenantId },
+  });
+
+  if (!contact) {
+    res.status(404).json({ success: false, error: 'NotFound', message: 'Contact not found in this workspace' });
+    return;
+  }
+
+  const updatedTags = (contact.tags || []).filter((t: string) => t !== 'SUPPRESSED');
+
+  const updated = await prisma.marketingContact.update({
+    where: { id },
+    data: {
+      optInStatus: 'OPTED_IN',
+      optInAt: new Date(),
+      optInSource: 'USER_UNSUPPRESSION',
+      tags: updatedTags,
+    },
+  });
+
+  res.json({
+    success: true,
+    message: 'Contact unsuppressed and eligible for marketing campaigns',
+    data: updated,
+    error: null,
+  });
+});
