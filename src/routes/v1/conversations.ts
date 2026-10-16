@@ -653,13 +653,18 @@ conversationsRouter.get('/:id/attachments/:filename', async (req: Request, res: 
   res.sendFile(filePath);
 });
 
-// 7. POST /:id/assign - Reassign conversation and linked lead
-conversationsRouter.post('/:id/assign', async (req: Request, res: Response) => {
+// 7. POST /:id/assign - Reassign conversation and linked lead (Role Guarded)
+conversationsRouter.post('/:id/assign', requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN'), async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const id = String(req.params.id);
-  const { assignedAgentId } = req.body as { assignedAgentId: string };
+  const rawAgentId = String(
+    req.body?.assignedAgentId ||
+    req.body?.freelancerId ||
+    (Array.isArray(req.body?.freelancerIds) ? req.body.freelancerIds[0] : '') ||
+    ''
+  ).trim();
 
-  if (!assignedAgentId) {
+  if (!rawAgentId) {
     res.status(400).json({ success: false, error: 'InvalidRequest', message: 'assignedAgentId is required' });
     return;
   }
@@ -673,10 +678,25 @@ conversationsRouter.post('/:id/assign', async (req: Request, res: Response) => {
     return;
   }
 
+  // Find agent profile or user in tenant
+  const agentProfile = await prisma.salesAgentProfile.findFirst({
+    where: {
+      tenantId,
+      OR: [{ id: rawAgentId }, { userId: rawAgentId }],
+    },
+    include: { user: { select: { displayName: true } } },
+  });
+
+  const assignedFreelancerId = agentProfile ? agentProfile.id : rawAgentId;
+  const assignedFreelancerName = agentProfile?.user?.displayName || null;
+
   // Update conversation
   await prisma.appConversation.update({
     where: { id },
-    data: { assignedFreelancerId: assignedAgentId },
+    data: {
+      assignedFreelancerId,
+      assignedFreelancerName,
+    },
   });
 
   // Also update linked lead
@@ -688,17 +708,54 @@ conversationsRouter.post('/:id/assign', async (req: Request, res: Response) => {
         ...(conversation.customerPhone ? [{ customerPhone: conversation.customerPhone }] : []),
       ],
     },
-    data: { assignedAgentId },
+    data: { assignedAgentId: assignedFreelancerId },
   });
 
   await persistApiRealtimeEvent({
     tenantId,
     eventType: 'lead.updated',
-    payload: { conversationId: id, assignedAgentId },
+    payload: { conversationId: id, assignedAgentId: assignedFreelancerId, assignedFreelancerName },
     actorUserId: req.user?.userId,
   }).catch(() => undefined);
 
-  res.json({ success: true, message: 'Conversation and lead reassigned successfully', error: null });
+  res.json({
+    success: true,
+    message: 'Conversation and lead reassigned successfully',
+    data: { conversationId: id, assignedAgentId: assignedFreelancerId, assignedFreelancerName },
+    error: null,
+  });
+});
+
+// 7b. DELETE /:id/assign - Unassign conversation and linked lead (Role Guarded)
+conversationsRouter.delete('/:id/assign', requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN'), async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const id = String(req.params.id);
+
+  const conversation = await prisma.appConversation.findFirst({
+    where: { id, tenantId },
+  });
+
+  if (!conversation) {
+    res.status(404).json({ success: false, error: 'NotFound', message: 'Conversation not found' });
+    return;
+  }
+
+  await prisma.appConversation.update({
+    where: { id },
+    data: { assignedFreelancerId: null, assignedFreelancerName: null },
+  });
+
+  // In AppConversation, assigned agent is unassigned
+  // salesLeadAssignment requires assignedAgentId so we keep the lead record scoped to tenant
+
+  await persistApiRealtimeEvent({
+    tenantId,
+    eventType: 'lead.updated',
+    payload: { conversationId: id, assignedAgentId: null },
+    actorUserId: req.user?.userId,
+  }).catch(() => undefined);
+
+  res.json({ success: true, message: 'Conversation unassigned successfully', error: null });
 });
 
 // 8. PATCH /:id/stage - Update lead stage from chat workspace
@@ -961,3 +1018,196 @@ conversationsRouter.post('/:id/drip', async (req: Request, res: Response) => {
   res.json({ success: true, message: `Drip sequence ${action} successfully`, error: null });
 });
 
+
+// 15. POST /:id/ai-auto-reply - Toggle AI auto-reply on/off for conversation thread
+conversationsRouter.post('/:id/ai-auto-reply', async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const id = String(req.params.id);
+  const disabled = Boolean(req.body?.disabled);
+
+  const conversation = await prisma.appConversation.findFirst({
+    where: { id, tenantId },
+  });
+
+  if (!conversation) {
+    res.status(404).json({ success: false, error: 'NotFound', message: 'Conversation not found' });
+    return;
+  }
+
+  const hasAccess = await verifyCloserAccess(req, conversation);
+  if (!hasAccess) {
+    res.status(403).json({ success: false, error: 'Forbidden', message: 'You do not have access to manage AI reply for this thread' });
+    return;
+  }
+
+  const existingPayload = (conversation.payload as Record<string, unknown>) || {};
+  const updatedPayload = {
+    ...existingPayload,
+    aiAutoReplyDisabled: disabled,
+    aiAutoReplyDisabledUpdatedAt: new Date().toISOString(),
+    aiAutoReplyUpdatedBy: req.user?.displayName || req.user?.role,
+  };
+
+  await prisma.appConversation.update({
+    where: { id },
+    data: { payload: updatedPayload },
+  });
+
+  await persistApiRealtimeEvent({
+    tenantId,
+    eventType: 'conversation.updated',
+    payload: { conversationId: id, aiAutoReplyDisabled: disabled },
+  }).catch(() => undefined);
+
+  res.json({
+    success: true,
+    data: {
+      id,
+      aiAutoReplyDisabled: disabled,
+      message: disabled ? 'AI Auto-Reply paused (Human mode)' : 'AI Auto-Reply resumed',
+    },
+    error: null,
+  });
+});
+
+// 16. POST /:id/payment-request - Create or update PhonePe/UPI payment request in conversation
+conversationsRouter.post('/:id/payment-request', async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const id = String(req.params.id);
+  const body = req.body || {};
+
+  const conversation = await prisma.appConversation.findFirst({
+    where: { id, tenantId },
+  });
+
+  if (!conversation) {
+    res.status(404).json({ success: false, error: 'NotFound', message: 'Conversation not found' });
+    return;
+  }
+
+  const hasAccess = await verifyCloserAccess(req, conversation);
+  if (!hasAccess) {
+    res.status(403).json({ success: false, error: 'Forbidden', message: 'You do not have access to create payment requests for this conversation' });
+    return;
+  }
+
+  const action = String(body.action || 'create').toLowerCase();
+  const existingPayload = (conversation.payload as Record<string, unknown>) || {};
+  const currentPayment = (existingPayload.latestPaymentRequest as Record<string, unknown>) || null;
+
+  if (action === 'mark-status') {
+    const nextStatus = String(body.status || 'Paid');
+    const paymentRequestId = String(body.paymentRequestId || currentPayment?.id || '');
+    const updatedPayment = {
+      ...(currentPayment || {}),
+      id: paymentRequestId,
+      status: nextStatus,
+      updatedAt: new Date().toISOString(),
+    };
+    await prisma.appConversation.update({
+      where: { id },
+      data: {
+        payload: {
+          ...existingPayload,
+          latestPaymentRequest: updatedPayment,
+        } as unknown as Prisma.InputJsonValue,
+      },
+    });
+    res.json({ success: true, data: { payment: updatedPayment }, error: null });
+    return;
+  }
+
+  if (action === 'submit-proof') {
+    const paymentRequestId = String(body.paymentRequestId || currentPayment?.id || '');
+    const updatedPayment = {
+      ...(currentPayment || {}),
+      id: paymentRequestId,
+      status: 'Viewed',
+      proofAttachments: body.attachments || [],
+      proofSubmittedAt: new Date().toISOString(),
+    };
+    await prisma.appConversation.update({
+      where: { id },
+      data: {
+        payload: {
+          ...existingPayload,
+          latestPaymentRequest: updatedPayment,
+        },
+      },
+    });
+    res.json({ success: true, data: { payment: updatedPayment }, error: null });
+    return;
+  }
+
+  // Create payment request
+  const amount = Number(body.amount) || 0;
+  if (amount <= 0) {
+    res.status(400).json({ success: false, error: 'InvalidAmount', message: 'Payment amount must be greater than 0' });
+    return;
+  }
+
+  const paymentRequestId = `payreq-${Date.now()}-${randomUUID().slice(0, 8)}`;
+  const title = String(body.title || body.projectTitle || 'Project Payment').trim();
+  const note = String(body.note || '').trim();
+
+  const upiId = String(body.payeeUpiId || 'payments@phonepe').trim();
+  const encodedTitle = encodeURIComponent(title);
+  const upiLink = `upi://pay?pa=${encodeURIComponent(upiId)}&pn=AICloser&am=${amount}&tn=${encodedTitle}&cu=INR`;
+
+  const newPayment = {
+    id: paymentRequestId,
+    amount,
+    title,
+    note,
+    status: 'Sent',
+    paymentLink: upiLink,
+    payeeRole: body.payeeRole || 'agency',
+    createdAt: new Date().toISOString(),
+  };
+
+  const rawMessages = Array.isArray(existingPayload.messages) ? (existingPayload.messages as Record<string, unknown>[]) : [];
+  const paymentMessage = {
+    id: `msg-${randomUUID()}`,
+    body: `Payment request: ₹${amount.toLocaleString('en-IN')} for ${title}${note ? ` (${note})` : ''}`,
+    senderRole: req.user?.role === 'SALES_AGENT' ? 'sales' : 'system',
+    senderLabel: req.user?.displayName || 'Sales Closer',
+    createdAt: new Date().toISOString(),
+    lane: 'customer',
+    attachments: [
+      {
+        id: `att-${randomUUID()}`,
+        kind: 'payment-request',
+        name: title,
+        sizeLabel: `₹${amount}`,
+        note: `Payment request for ₹${amount}`,
+        paymentRequestId,
+      },
+    ],
+  };
+
+  await prisma.appConversation.update({
+    where: { id },
+    data: {
+      payload: {
+        ...existingPayload,
+        latestPaymentRequest: newPayment,
+        messages: [...rawMessages, paymentMessage],
+      } as unknown as Prisma.InputJsonValue,
+    },
+  });
+
+  await persistApiRealtimeEvent({
+    tenantId,
+    eventType: 'payment.created',
+    payload: { conversationId: id, payment: newPayment },
+  }).catch(() => undefined);
+
+  res.status(201).json({
+    success: true,
+    data: {
+      payment: newPayment,
+      message: paymentMessage,
+    },
+    error: null,
+  });
+});

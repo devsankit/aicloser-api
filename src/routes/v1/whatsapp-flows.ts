@@ -167,7 +167,7 @@ whatsappFlowsRouter.get('/:id', async (req: Request, res: Response) => {
 });
 
 // 4. Create or Save Flow (POST /)
-whatsappFlowsRouter.post('/', requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN', 'SALES_AGENT'), async (req: Request, res: Response) => {
+whatsappFlowsRouter.post('/', requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN'), async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const body = req.body || {};
 
@@ -320,8 +320,8 @@ const handlePatchFlow = async (req: Request, res: Response) => {
   });
 };
 
-whatsappFlowsRouter.patch('/:id', requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN', 'SALES_AGENT'), handlePatchFlow);
-whatsappFlowsRouter.patch('/', requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN', 'SALES_AGENT'), handlePatchFlow);
+whatsappFlowsRouter.patch('/:id', requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN'), handlePatchFlow);
+whatsappFlowsRouter.patch('/', requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN'), handlePatchFlow);
 
 // 6. Delete Flow (DELETE /:id or DELETE / with id in body)
 const handleDeleteFlow = async (req: Request, res: Response) => {
@@ -356,11 +356,11 @@ const handleDeleteFlow = async (req: Request, res: Response) => {
   });
 };
 
-whatsappFlowsRouter.delete('/:id', requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN', 'SALES_AGENT'), handleDeleteFlow);
-whatsappFlowsRouter.delete('/', requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN', 'SALES_AGENT'), handleDeleteFlow);
+whatsappFlowsRouter.delete('/:id', requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN'), handleDeleteFlow);
+whatsappFlowsRouter.delete('/', requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN'), handleDeleteFlow);
 
 // 7. Toggle Flow Status (POST /:id/toggle)
-whatsappFlowsRouter.post('/:id/toggle', requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN', 'SALES_AGENT'), async (req: Request, res: Response) => {
+whatsappFlowsRouter.post('/:id/toggle', requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN'), async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const id = String(req.params.id);
 
@@ -413,7 +413,7 @@ whatsappFlowsRouter.get('/:id/runs', async (req: Request, res: Response) => {
 });
 
 // 9. Test Run Simulation (POST /:id/test-run)
-whatsappFlowsRouter.post('/:id/test-run', requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN', 'SALES_AGENT'), async (req: Request, res: Response) => {
+whatsappFlowsRouter.post('/:id/test-run', requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN'), async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const flowId = String(req.params.id);
 

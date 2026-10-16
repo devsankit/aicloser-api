@@ -2,6 +2,7 @@ import { Router, Request, Response } from 'express';
 import { prisma } from '../../lib/prisma.js';
 import { authenticate } from '../../middlewares/auth.js';
 import { enforceTenantIsolation } from '../../middlewares/tenant-isolation.js';
+import { requireRoles } from '../../middlewares/rbac.js';
 
 export const automationsRouter = Router();
 
@@ -48,7 +49,7 @@ automationsRouter.get('/logs', async (req: Request, res: Response) => {
 });
 
 // POST /automations (create rule)
-automationsRouter.post('/', async (req: Request, res: Response) => {
+automationsRouter.post('/', requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN'), async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const body = req.body;
 
@@ -143,11 +144,11 @@ const updateAutomationHandler = async (req: Request, res: Response) => {
   res.json({ ok: true, success: true, data: automations[idx], rule: automations[idx] });
 };
 
-automationsRouter.put('/:id', updateAutomationHandler);
-automationsRouter.patch('/:id', updateAutomationHandler);
+automationsRouter.put('/:id', requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN'), updateAutomationHandler);
+automationsRouter.patch('/:id', requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN'), updateAutomationHandler);
 
 // DELETE /automations/:id
-automationsRouter.delete('/:id', async (req: Request, res: Response) => {
+automationsRouter.delete('/:id', requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN'), async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const ws = await prisma.aicloserWorkspace.findUnique({
     where: { id: tenantId },
@@ -167,7 +168,7 @@ automationsRouter.delete('/:id', async (req: Request, res: Response) => {
 });
 
 // POST /automations/:id/test (dry run test execution)
-automationsRouter.post('/:id/test', async (req: Request, res: Response) => {
+automationsRouter.post('/:id/test', requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN'), async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const ws = await prisma.aicloserWorkspace.findUnique({
     where: { id: tenantId },

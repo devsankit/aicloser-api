@@ -41,6 +41,12 @@ paymentsRouter.get('/', validateQuery(listPaymentsQuerySchema), async (req: Requ
   const tenantId = req.tenantId!;
   const where: Record<string, unknown> = { tenantId };
 
+  // Sales agents can only see payment links they created. Tenant admins and
+  // managers keep the workspace-wide view needed for the dashboard totals.
+  if (req.user?.role === 'SALES_AGENT') {
+    where.createdByUserId = req.user.userId;
+  }
+
   if (status) where.status = status;
   if (search) {
     where.OR = [
@@ -50,7 +56,7 @@ paymentsRouter.get('/', validateQuery(listPaymentsQuerySchema), async (req: Requ
     ];
   }
 
-  const [total, payments] = await Promise.all([
+  const [total, payments, amountSummary, statusSummary] = await Promise.all([
     prisma.upiPaymentLink.count({ where }),
     prisma.upiPaymentLink.findMany({
       where,
@@ -58,11 +64,35 @@ paymentsRouter.get('/', validateQuery(listPaymentsQuerySchema), async (req: Requ
       take: limit,
       orderBy: { id: 'desc' },
     }),
+    prisma.upiPaymentLink.aggregate({
+      where,
+      _sum: { totalAmount: true },
+    }),
+    prisma.upiPaymentLink.groupBy({
+      by: ['status'],
+      where,
+      _count: { _all: true },
+      _sum: { totalAmount: true },
+    }),
   ]);
+
+  const statusTotals = Object.fromEntries(
+    statusSummary.map((item) => [
+      item.status,
+      { count: item._count._all, amount: Number(item._sum.totalAmount || 0) },
+    ]),
+  );
 
   res.json({
     success: true,
     data: payments,
+    summary: {
+      totalLinks: total,
+      totalAmount: Number(amountSummary._sum.totalAmount || 0),
+      paidAmount: statusTotals.PAID?.amount || 0,
+      pendingAmount: (statusTotals.PENDING?.amount || 0) + (statusTotals.CUSTOMER_CONFIRMED?.amount || 0),
+      statusTotals,
+    },
     pagination: {
       total,
       page,
