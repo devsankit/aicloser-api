@@ -395,6 +395,121 @@ aiRouter.post('/bot-train', requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN'), val
   });
 });
 
+
+// Document text / PDF / DOCX content ingestion
+const ingestDocumentSchema = z.object({
+  title: z.string().min(1, 'Title is required'),
+  content: z.string().min(1, 'Content is required'),
+  category: z.string().optional(),
+  tags: z.array(z.string()).optional(),
+  type: z.string().optional(),
+});
+
+aiRouter.post('/bot-train/document', requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN'), validateBody(ingestDocumentSchema), async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const { title, content, category, tags, type } = req.body;
+
+  const workspace = await prisma.aicloserWorkspace.findUnique({
+    where: { id: tenantId },
+    select: { settings: true },
+  });
+
+  const currentSettings = (workspace?.settings as Record<string, any>) || {};
+  const currentTraining = (currentSettings.aiBotTraining as Record<string, any>) || {
+    qaPairs: [],
+    documents: [],
+    knowledgeSnippets: [],
+  };
+
+  const existingDocs = Array.isArray(currentTraining.documents) ? currentTraining.documents : [];
+  const cleanContent = String(content).trim();
+  const wordCount = cleanContent.split(/\s+/).filter(Boolean).length;
+  const estimatedTokens = Math.ceil(cleanContent.length / 4);
+
+  const newDoc = {
+    id: 'doc_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7),
+    title: String(title).trim(),
+    content: cleanContent,
+    category: category || 'General',
+    tags: tags || [],
+    type: type || 'TEXT',
+    charCount: cleanContent.length,
+    wordCount,
+    estimatedTokens,
+    createdAt: new Date().toISOString(),
+  };
+
+  const updatedDocs = [...existingDocs, newDoc];
+  currentTraining.documents = updatedDocs;
+  currentTraining.lastTrainedAt = new Date().toISOString();
+  currentSettings.aiBotTraining = currentTraining;
+
+  await prisma.aicloserWorkspace.update({
+    where: { id: tenantId },
+    data: { settings: currentSettings },
+  });
+
+  res.status(201).json({
+    success: true,
+    message: 'Document ingested successfully',
+    data: newDoc,
+    error: null,
+  });
+});
+
+// Delete training item by ID (document or QA pair)
+aiRouter.delete('/bot-train/:id', requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN'), async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const id = String(req.params.id).trim();
+
+  const workspace = await prisma.aicloserWorkspace.findUnique({
+    where: { id: tenantId },
+    select: { settings: true },
+  });
+
+  const currentSettings = (workspace?.settings as Record<string, any>) || {};
+  const currentTraining = (currentSettings.aiBotTraining as Record<string, any>) || {
+    qaPairs: [],
+    documents: [],
+    knowledgeSnippets: [],
+  };
+
+  const existingDocs = Array.isArray(currentTraining.documents) ? [...currentTraining.documents] : [];
+  const existingQAs = Array.isArray(currentTraining.qaPairs) ? [...currentTraining.qaPairs] : [];
+
+  const docIdx = existingDocs.findIndex((d: any) => String(d.id) === id);
+  const qaIdx = existingQAs.findIndex((q: any) => String(q.id) === id);
+
+  if (docIdx === -1 && qaIdx === -1) {
+    res.status(404).json({ success: false, error: 'NotFound', message: 'Training item not found with ID ' + id });
+    return;
+  }
+
+  if (docIdx !== -1) {
+    existingDocs.splice(docIdx, 1);
+  }
+  if (qaIdx !== -1) {
+    existingQAs.splice(qaIdx, 1);
+  }
+
+  currentTraining.documents = existingDocs;
+  currentTraining.qaPairs = existingQAs;
+  currentTraining.lastTrainedAt = new Date().toISOString();
+  currentSettings.aiBotTraining = currentTraining;
+
+  await prisma.aicloserWorkspace.update({
+    where: { id: tenantId },
+    data: { settings: currentSettings },
+  });
+
+  res.json({
+    success: true,
+    message: 'Training item deleted successfully',
+    data: { id, remainingDocuments: existingDocs.length, remainingQAPairs: existingQAs.length },
+    error: null,
+  });
+});
+
 aiRouter.get('/bot-train', async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
 
@@ -410,9 +525,37 @@ aiRouter.get('/bot-train', async (req: Request, res: Response) => {
     knowledgeSnippets: [],
   };
 
+  const qaPairs = Array.isArray(training.qaPairs)
+    ? training.qaPairs.map((q: any, i: number) => ({
+        id: q.id || ('qa_' + (i + 1)),
+        question: q.question,
+        answer: q.answer,
+        category: q.category || 'General',
+        createdAt: q.createdAt || new Date().toISOString(),
+      }))
+    : [];
+
+  const documents = Array.isArray(training.documents)
+    ? training.documents.map((d: any, i: number) => ({
+        id: d.id || ('doc_' + (i + 1)),
+        title: d.title,
+        content: d.content,
+        category: d.category || 'General',
+        tags: d.tags || [],
+        type: d.type || 'TEXT',
+        charCount: d.charCount || d.content?.length || 0,
+        wordCount: d.wordCount || d.content?.split(/\s+/).filter(Boolean).length || 0,
+        createdAt: d.createdAt || new Date().toISOString(),
+      }))
+    : [];
+
   res.json({
     success: true,
-    data: training,
+    data: {
+      ...training,
+      qaPairs,
+      documents,
+    },
     error: null,
   });
 });

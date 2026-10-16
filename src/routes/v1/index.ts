@@ -1,4 +1,4 @@
-import { Router } from 'express';
+﻿import { Router } from 'express';
 import { authRouter } from './auth.js';
 import { leadsRouter } from './leads.js';
 import { contactsRouter } from './contacts.js';
@@ -26,6 +26,7 @@ import { automationsRouter } from './automations.js';
 import { payoutsRouter } from './payouts.js';
 import { referralsRouter } from './referrals.js';
 import { roundRobinRouter } from './round-robin.js';
+import { whatsappFlowsRouter } from './whatsapp-flows.js';
 
 export const v1Router = Router();
 
@@ -68,6 +69,10 @@ v1Router.use('/integrations/google-drive', googleDriveRouter);
 
 // Marketing, Campaigns & Templates
 v1Router.use('/marketing', marketingRouter);
+
+// WhatsApp Chatbot Flow Builder Engine (CRUD, Runs, Toggle, Simulator)
+v1Router.use('/whatsapp-flows', whatsappFlowsRouter);
+v1Router.use('/sales/whatsapp-flows', whatsappFlowsRouter);
 
 // Dedicated AI Engine (Consultative Reply, Lead Scoring, Transcribe, Objection Handling, Copilot, Bot)
 v1Router.use('/ai', aiRouter);

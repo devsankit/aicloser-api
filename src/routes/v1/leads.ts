@@ -23,6 +23,8 @@ const listLeadsQuerySchema = z.object({
   stage: salesLeadStageSchema.optional(),
   search: z.string().optional(),
   assignedAgentId: z.string().optional(),
+  sortBy: z.enum(['kanbanPosition', 'createdAt', 'updatedAt', 'followUpAt', 'budgetAmount']).optional(),
+  sortOrder: z.enum(['asc', 'desc']).optional(),
 });
 
 leadsRouter.get('/', validateQuery(listLeadsQuerySchema), async (req: Request, res: Response) => {
@@ -71,7 +73,7 @@ leadsRouter.get('/', validateQuery(listLeadsQuerySchema), async (req: Request, r
       where,
       skip: (page - 1) * limit,
       take: limit,
-      orderBy: { createdAt: 'desc' },
+      orderBy: (req.query as any).sortBy === 'createdAt' ? [{ createdAt: ((req.query as any).sortOrder || 'desc') as 'asc' | 'desc' }] : [{ kanbanPosition: 'asc' as const }, { createdAt: 'desc' as const }],
       include: {
         assignedAgent: {
           select: {
@@ -293,6 +295,102 @@ leadsRouter.get('/pipeline-aggregates', async (req: Request, res: Response) => {
 
   res.json({ success: true, data: results });
 });
+
+// GET /dashboard-summary - Permission-scoped aggregated totals for dashboard KPIs
+leadsRouter.get('/dashboard-summary', async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const where: any = { tenantId };
+
+  if (req.user?.role === 'SALES_AGENT') {
+    const profile = await prisma.salesAgentProfile.findFirst({
+      where: { userId: req.user.userId, tenantId },
+      select: { id: true },
+    });
+    where.assignedAgentId = profile?.id ?? '__NO_ACCESS__';
+  } else if (req.query.assignedAgentId) {
+    where.assignedAgentId = String(req.query.assignedAgentId);
+  }
+
+  const now = new Date();
+  const startOfDay = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const endOfDay = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59, 999);
+
+  const [
+    totalLeads,
+    hotLeads,
+    followUpsToday,
+    followUpsPending,
+    stageAggregates,
+  ] = await Promise.all([
+    prisma.salesLeadAssignment.count({ where }),
+    prisma.salesLeadAssignment.count({
+      where: {
+        ...where,
+        priority: { in: ['HIGH', 'URGENT'] },
+      },
+    }),
+    prisma.salesLeadAssignment.count({
+      where: {
+        ...where,
+        followUpAt: { gte: startOfDay, lte: endOfDay },
+      },
+    }),
+    prisma.salesLeadAssignment.count({
+      where: {
+        ...where,
+        followUpAt: { lt: now },
+        stage: { notIn: ['CLOSED_WON', 'CLOSED_LOST'] },
+      },
+    }),
+    prisma.salesLeadAssignment.groupBy({
+      by: ['stage'],
+      where,
+      _count: { id: true },
+      _sum: { budgetAmount: true },
+    }),
+  ]);
+
+  let wonCount = 0;
+  let wonAmount = 0;
+  let lostCount = 0;
+  let pipelineValue = 0;
+  const stageCounts: Record<string, number> = {};
+
+  for (const item of stageAggregates) {
+    const count = item._count?.id ?? 0;
+    const value = Number(item._sum?.budgetAmount ?? 0);
+    stageCounts[item.stage] = count;
+
+    if (item.stage === 'CLOSED_WON' || (item.stage as string) === 'PAID') {
+      wonCount += count;
+      wonAmount += value;
+    } else if (item.stage === 'CLOSED_LOST' || (item.stage as string) === 'LOST') {
+      lostCount += count;
+    } else {
+      pipelineValue += value;
+    }
+  }
+
+  const conversionRate = totalLeads > 0 ? Number(((wonCount / totalLeads) * 100).toFixed(1)) : 0;
+
+  res.json({
+    success: true,
+    data: {
+      totalLeads,
+      hotLeads,
+      followUpsToday,
+      followUpsPending,
+      wonCount,
+      wonAmount,
+      lostCount,
+      pipelineValue,
+      conversionRate,
+      stageCounts,
+    },
+    error: null,
+  });
+});
+
 
 // GET /pool - Unassigned leads in the Grab Pool
 leadsRouter.get('/pool', async (req: Request, res: Response) => {
