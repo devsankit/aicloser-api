@@ -5,7 +5,7 @@ import { authenticate } from '../../middlewares/auth.js';
 import { enforceTenantIsolation } from '../../middlewares/tenant-isolation.js';
 import { validateBody, validateQuery } from '../../middlewares/validate.js';
 import { SalesLeadStage, salesLeadStageSchema } from '../../types/leads.js';
-import { hasPermission, requirePermissions, PERM_LEADS_REASSIGN } from '../../middlewares/rbac.js';
+import { hasPermission, requirePermissions, PERM_LEADS_CLAIM, PERM_LEADS_REASSIGN } from '../../middlewares/rbac.js';
 import { persistApiRealtimeEvent } from '../../lib/realtime.js';
 
 export const leadsRouter = Router();
@@ -280,10 +280,23 @@ leadsRouter.get('/pipeline-aggregates', async (req: Request, res: Response) => {
 leadsRouter.get('/pool', async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
 
+  const profile = req.user?.role === 'SALES_AGENT'
+    ? await prisma.salesAgentProfile.findFirst({
+        where: { userId: req.user.userId, tenantId, status: 'ACTIVE' },
+        select: { id: true },
+      })
+    : null;
+
+  if (req.user?.role === 'SALES_AGENT' && !profile) {
+    res.json({ success: true, data: [], error: null });
+    return;
+  }
+
   const poolLeads = await prisma.salesLeadPoolItem.findMany({
     where: {
       tenantId,
       status: 'OPEN',
+      ...(profile ? { OR: [{ assignedAgentId: null }, { assignedAgentId: profile.id }] } : {}),
     },
     take: 50,
     orderBy: { createdAt: 'desc' },
@@ -739,64 +752,219 @@ leadsRouter.delete('/:id', async (req: Request, res: Response) => {
   await prisma.salesLeadAssignment.delete({ where: { id } });
   res.json({ success: true, message: 'Lead deleted from workspace' });
 });
-// POST /:id/claim - Closer claims a lead from the Grab Pool
-leadsRouter.post('/:id/claim', async (req: Request, res: Response) => {
+const claimPoolSchema = z.object({
+  assignedAgentId: z.string().min(1).optional(),
+});
+
+const inactiveLeadStages: SalesLeadStage[] = [
+  'CLOSED_WON',
+  'CLOSED_LOST',
+  'CLOSED',
+  'LOST',
+  'PAID',
+  'CONVERTED_FREE',
+  'RECYCLED',
+];
+
+class PoolClaimError extends Error {
+  constructor(
+    public status: number,
+    public code: string,
+    message: string,
+  ) {
+    super(message);
+  }
+}
+
+async function handlePoolClaim(req: Request, res: Response) {
   const tenantId = req.tenantId!;
-  const id = String(req.params.id);
+  const poolItemId = String(req.params.poolItemId || req.params.id || '').trim();
+  const parsed = claimPoolSchema.safeParse(req.body ?? {});
+
+  if (!poolItemId) {
+    res.status(400).json({ success: false, error: 'ValidationError', message: 'Pool item id is required' });
+    return;
+  }
+
+  if (!parsed.success) {
+    res.status(400).json({ success: false, error: 'ValidationError', message: parsed.error.issues[0]?.message || 'Invalid claim request' });
+    return;
+  }
+
+  const user = req.user!;
+  const canClaim = await hasPermission(user.userId, tenantId, user.role, PERM_LEADS_CLAIM);
+  if (!canClaim) {
+    res.status(403).json({ success: false, error: 'Forbidden', message: 'Lead claiming is not enabled for this user' });
+    return;
+  }
+
+  const requestedAgentId = parsed.data.assignedAgentId;
+  if (user.role === 'SALES_AGENT' && requestedAgentId) {
+    const ownProfile = await prisma.salesAgentProfile.findFirst({
+      where: { userId: user.userId, tenantId },
+      select: { id: true },
+    });
+    if (!ownProfile || (requestedAgentId !== ownProfile.id && requestedAgentId !== user.userId)) {
+      res.status(403).json({ success: false, error: 'Forbidden', message: 'Sales agents can only claim leads for themselves' });
+      return;
+    }
+  }
 
   const profile = await prisma.salesAgentProfile.findFirst({
-    where: { userId: req.user?.userId, tenantId },
-  });
-
-  if (!profile) {
-    res.status(403).json({ success: false, error: 'Forbidden', message: 'Only active sales closers can claim leads' });
-    return;
-  }
-
-  const lead = await prisma.salesLeadAssignment.findFirst({
-    where: { id, tenantId },
-  });
-
-  if (!lead) {
-    res.status(404).json({ success: false, error: 'NotFound', message: 'Lead not found' });
-    return;
-  }
-
-  if (lead.assignedAgentId && lead.assignedAgentId !== profile.id) {
-    res.status(409).json({ success: false, error: 'Conflict', message: 'This lead has already been claimed by another closer' });
-    return;
-  }
-
-  const updated = await prisma.salesLeadAssignment.update({
-    where: { id: lead.id },
-    data: {
-      assignedAgentId: profile.id,
-    },
-  });
-
-  await prisma.salesActivityLog.create({
-    data: {
+    where: {
       tenantId,
-      assignmentId: lead.id,
-      actorUserId: req.user?.userId,
-      action: 'LEAD_CLAIMED',
-      note: `Lead claimed from pool by ${req.user?.displayName || 'closer'}`,
+      ...(user.role === 'SALES_AGENT'
+        ? { userId: user.userId }
+        : requestedAgentId
+          ? { OR: [{ id: requestedAgentId }, { userId: requestedAgentId }] }
+          : { userId: user.userId }),
     },
   });
 
-  await persistApiRealtimeEvent({
-    tenantId,
-    eventType: 'lead.claimed',
-    payload: {
-      id: updated.id,
-      assignedAgentId: profile.id,
-      agentCode: profile.agentCode,
-    },
-    actorUserId: req.user?.userId,
-  }).catch(() => undefined);
+  if (!profile || profile.status !== 'ACTIVE' || !profile.canClaimLeads) {
+    res.status(403).json({ success: false, error: 'Forbidden', message: 'Only active sales closers with lead-claim access can claim leads' });
+    return;
+  }
 
-  res.json({ success: true, data: updated, message: 'Lead claimed successfully', error: null });
-});
+  const activeLeadCount = await prisma.salesLeadAssignment.count({
+    where: {
+      tenantId,
+      assignedAgentId: profile.id,
+      stage: { notIn: inactiveLeadStages },
+    },
+  });
+  const maxActiveLeads = profile.maxActiveLeads && profile.maxActiveLeads > 0 ? profile.maxActiveLeads : 10;
+  if (activeLeadCount >= maxActiveLeads) {
+    res.status(409).json({
+      success: false,
+      error: 'LeadQuotaReached',
+      message: `This closer already has ${activeLeadCount} of ${maxActiveLeads} allowed active leads`,
+      data: { activeLeadCount, maxActiveLeads },
+    });
+    return;
+  }
+
+  try {
+    const result = await prisma.$transaction(async (tx) => {
+      const poolItem = await tx.salesLeadPoolItem.findFirst({
+        where: { id: poolItemId, tenantId },
+        include: { convertedAssignment: true },
+      });
+
+      if (!poolItem) throw new PoolClaimError(404, 'NotFound', 'Lead pool item was not found in this workspace');
+
+      if (poolItem.status !== 'OPEN') {
+        if (poolItem.claimedByAgentId === profile.id && poolItem.convertedAssignment) {
+          return { poolItem, lead: poolItem.convertedAssignment, deduplicated: false, idempotent: true };
+        }
+        throw new PoolClaimError(409, 'AlreadyClaimed', 'This lead has already been claimed');
+      }
+
+      if (poolItem.assignedAgentId && poolItem.assignedAgentId !== profile.id) {
+        throw new PoolClaimError(409, 'ReservedForAnotherCloser', 'This lead is reserved for another closer');
+      }
+
+      const rawPhone = poolItem.customerPhone?.trim() || '';
+      const phoneDigits = rawPhone.replace(/\D/g, '');
+      const last10 = phoneDigits.length >= 10 ? phoneDigits.slice(-10) : phoneDigits;
+      const duplicateFilters: Array<Record<string, unknown>> = [];
+      if (rawPhone) duplicateFilters.push({ customerPhone: rawPhone });
+      if (last10.length >= 7) duplicateFilters.push({ customerPhone: { contains: last10 } });
+      if (poolItem.customerEmail) duplicateFilters.push({ customerEmail: poolItem.customerEmail });
+
+      const existingLead = duplicateFilters.length
+        ? await tx.salesLeadAssignment.findFirst({
+            where: { tenantId, OR: duplicateFilters },
+            orderBy: { createdAt: 'asc' },
+          })
+        : null;
+
+      if (existingLead && existingLead.assignedAgentId !== profile.id) {
+        throw new PoolClaimError(409, 'LeadAlreadyAssigned', 'This customer already belongs to another closer in this workspace');
+      }
+
+      const reserved = await tx.salesLeadPoolItem.updateMany({
+        where: { id: poolItem.id, tenantId, status: 'OPEN' },
+        data: { status: 'CLAIMED', claimedByAgentId: profile.id, claimedAt: new Date() },
+      });
+      if (reserved.count !== 1) throw new PoolClaimError(409, 'AlreadyClaimed', 'This lead has already been claimed');
+
+      const lead = existingLead ?? await tx.salesLeadAssignment.create({
+        data: {
+          tenantId,
+          assignedAgentId: profile.id,
+          createdById: user.userId,
+          customerName: poolItem.customerName,
+          customerPhone: poolItem.customerPhone,
+          customerEmail: poolItem.customerEmail,
+          source: poolItem.source,
+          serviceInterest: poolItem.serviceInterest,
+          segment: poolItem.segment,
+          priority: poolItem.priority,
+          budgetAmount: poolItem.budgetAmount,
+          stage: 'NEW',
+          notes: poolItem.notes,
+          conversationId: poolItem.conversationId,
+        },
+      });
+
+      await tx.salesLeadPoolItem.update({
+        where: { id: poolItem.id },
+        data: {
+          status: 'CLAIMED',
+          claimedByAgentId: profile.id,
+          convertedAssignmentId: lead.id,
+          claimedAt: new Date(),
+        },
+      });
+
+      await tx.salesActivityLog.create({
+        data: {
+          tenantId,
+          assignmentId: lead.id,
+          actorUserId: user.userId,
+          action: existingLead ? 'LEAD_POOL_DEDUPLICATED' : 'LEAD_CLAIMED',
+          note: existingLead
+            ? 'Queue item linked to the existing tenant lead instead of creating a duplicate.'
+            : 'Lead claimed from the shared pool.',
+        },
+      });
+
+      const updatedPoolItem = await tx.salesLeadPoolItem.findUniqueOrThrow({ where: { id: poolItem.id } });
+      return { poolItem: updatedPoolItem, lead, deduplicated: Boolean(existingLead), idempotent: false };
+    });
+
+    await persistApiRealtimeEvent({
+      tenantId,
+      eventType: 'lead.claimed',
+      payload: {
+        id: result.lead.id,
+        poolItemId,
+        assignedAgentId: profile.id,
+        agentCode: profile.agentCode,
+        deduplicated: result.deduplicated,
+      },
+      actorUserId: user.userId,
+    }).catch(() => undefined);
+
+    res.json({ success: true, data: result, message: result.idempotent ? 'Lead was already claimed by this closer' : 'Lead claimed successfully', error: null });
+  } catch (error: unknown) {
+    if (error instanceof PoolClaimError) {
+      res.status(error.status).json({ success: false, error: error.code, message: error.message });
+      return;
+    }
+    if (typeof error === 'object' && error && 'code' in error && error.code === 'P2002') {
+      res.status(409).json({ success: false, error: 'DuplicateLead', message: 'This customer already exists in the workspace' });
+      return;
+    }
+    throw error;
+  }
+}
+
+// Canonical pool-item claim route. The shorter path remains a compatibility alias,
+// and both routes deliberately reuse the same handler/business transaction.
+leadsRouter.post('/pool/:poolItemId/claim', handlePoolClaim);
+leadsRouter.post('/:poolItemId/claim', handlePoolClaim);
 
 // GET /:id/notes - Get internal notes for a lead
 leadsRouter.get('/:id/notes', async (req: Request, res: Response) => {

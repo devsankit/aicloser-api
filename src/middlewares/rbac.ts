@@ -5,6 +5,7 @@ import { prisma } from '../lib/prisma.js';
 export const PERM_TEAM_VIEW = 'team:view';
 export const PERM_TEAM_MANAGE = 'team:manage';
 export const PERM_LEADS_VIEW_ALL = 'leads:view_all';
+export const PERM_LEADS_CLAIM = 'leads:claim';
 export const PERM_LEADS_REASSIGN = 'leads:reassign';
 export const PERM_LEADS_EXPORT = 'leads:export';
 export const PERM_CALLS_VIEW_ALL = 'calls:view_all';
@@ -52,7 +53,7 @@ export async function hasPermission(
         const perms = profile.permissions as Record<string, boolean>;
         if (perms[permission] === true) return true;
       }
-      if (permission === 'leads:claim' && profile.canClaimLeads) {
+      if (permission === PERM_LEADS_CLAIM && profile.canClaimLeads) {
         return true;
       }
     }
