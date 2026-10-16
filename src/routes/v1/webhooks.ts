@@ -1,3 +1,5 @@
+import { assignLeadToNextCloser } from '../../lib/lead-assignment-engine.js';
+import { generateAiCloserReply } from '../../lib/ai-provider-engine.js';
 import { Router, Request, Response } from 'express';
 import { verifyWebhookSignature } from '../../middlewares/webhook-signature.js';
 import { logger } from '../../lib/logger.js';
@@ -146,10 +148,20 @@ webhooksRouter.post(['/meta', '/whatsapp'], verifyWebhookSignature, async (req: 
             },
           });
         } else {
-          // Assign to first active agent or fallback
-          const agent = await prisma.salesAgentProfile.findFirst({
-            where: { user: { tenantId } },
+          // Strictly fetch non-admin active sales agent profile as fallback holder
+          let agent = await prisma.salesAgentProfile.findFirst({
+            where: {
+              tenantId,
+              status: 'ACTIVE',
+              user: { role: 'SALES_AGENT', packageStatus: 'ACTIVE' },
+            },
           });
+
+          if (!agent) {
+            agent = await prisma.salesAgentProfile.findFirst({
+              where: { tenantId },
+            });
+          }
 
           if (agent) {
             lead = await prisma.salesLeadAssignment.create({
@@ -159,11 +171,22 @@ webhooksRouter.post(['/meta', '/whatsapp'], verifyWebhookSignature, async (req: 
                 customerName: profileName,
                 customerPhone: normalizedPhone,
                 conversationId: conversation.id,
-                source: 'whatsapp_official',
+                source: 'WHATSAPP',
                 stage: 'NEW',
                 notes: `Inbound message from WhatsApp: "${messageText.slice(0, 100)}"`,
               },
             });
+
+            // Execute strict round-robin & source rule distribution
+            try {
+              await assignLeadToNextCloser({
+                tenantId,
+                leadId: lead.id,
+                source: 'WHATSAPP',
+              });
+            } catch (rrErr) {
+              logger.warn('Inbound WhatsApp lead assignment engine failed, keeping fallback', { error: String(rrErr) });
+            }
           }
         }
 
@@ -179,6 +202,117 @@ webhooksRouter.post(['/meta', '/whatsapp'], verifyWebhookSignature, async (req: 
             customerName: profileName,
           },
         }).catch(() => undefined);
+
+        // ==========================================
+        // Runtime AI Auto-Reply Execution
+        // ==========================================
+        try {
+          const workspace = await prisma.aicloserWorkspace.findUnique({
+            where: { id: tenantId },
+            select: { settings: true },
+          });
+
+          const wsSettings = (workspace?.settings as Record<string, any>) || {};
+          const botConfig = wsSettings.aiBotConfig || {};
+
+          if (botConfig.enabled) {
+            const aiResult = await generateAiCloserReply({
+              tenantId,
+              customerPhone: normalizedPhone,
+              customerName: profileName,
+              messageText,
+            });
+
+            if (aiResult?.reply) {
+              // Dispatch to Meta Graph API if access token exists
+              const channelRecord = await prisma.whatsAppChannel.findFirst({
+                where: { phoneNumberId: channelId },
+                select: { encryptedAccessToken: true, phoneNumberId: true },
+              });
+
+              const token = channelRecord?.encryptedAccessToken || process.env.META_ACCESS_TOKEN;
+              if (token && channelRecord) {
+                await fetch(`https://graph.facebook.com/v22.0/${channelRecord.phoneNumberId}/messages`, {
+                  method: 'POST',
+                  headers: {
+                    'Content-Type': 'application/json',
+                    Authorization: `Bearer ${token}`,
+                  },
+                  body: JSON.stringify({
+                    messaging_product: 'whatsapp',
+                    recipient_type: 'individual',
+                    to: normalizedPhone.replace(/\D/g, ''),
+                    type: 'text',
+                    text: { preview_url: false, body: aiResult.reply },
+                  }),
+                }).catch((err) => {
+                  logger.warn('Meta Graph API outbound dispatch failed', { error: String(err) });
+                });
+              }
+
+              // Record outbound message in conversation payload
+              const outboundMessage = {
+                id: `ai-msg-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+                role: 'assistant',
+                senderRole: 'ai',
+                senderLabel: 'AI Closer Bot',
+                body: aiResult.reply,
+                lane: 'agent',
+                createdAt: new Date().toISOString(),
+                status: 'SENT',
+                metadata: {
+                  provider: aiResult.provider,
+                  model: aiResult.model,
+                  latencyMs: aiResult.latencyMs,
+                },
+              };
+
+              const convFresh = await prisma.appConversation.findUnique({ where: { id: conversation.id } });
+              if (convFresh) {
+                const p = (convFresh.payload as Record<string, unknown>) || {};
+                const msgs = Array.isArray(p.messages) ? (p.messages as Record<string, unknown>[]) : [];
+                msgs.push(outboundMessage);
+                p.messages = msgs.slice(-100);
+
+                await prisma.appConversation.update({
+                  where: { id: conversation.id },
+                  data: {
+                    payload: p as any,
+                    updatedAt: new Date(),
+                  },
+                });
+
+                // Broadcast outbound AI reply via realtime SSE
+                await persistApiRealtimeEvent({
+                  tenantId,
+                  eventType: 'chat.message',
+                  payload: {
+                    conversationId: conversation.id,
+                    leadId: lead?.id,
+                    message: outboundMessage,
+                    customerPhone: normalizedPhone,
+                    customerName: profileName,
+                  },
+                }).catch(() => undefined);
+
+                // Log activity on lead
+                if (lead) {
+                  await prisma.salesActivityLog.create({
+                    data: {
+                      tenantId,
+                      assignmentId: lead.id,
+                      action: 'AI_AUTOREPLY_DISPATCHED',
+                      note: `AI Bot sent reply: "${aiResult.reply.slice(0, 80)}..."`,
+                      metadata: { provider: aiResult.provider, latencyMs: aiResult.latencyMs },
+                    },
+                  }).catch(() => undefined);
+                }
+              }
+            }
+          }
+        } catch (aiErr) {
+          logger.warn('AI auto-reply execution failed in webhook', { error: String(aiErr) });
+        }
       }
     }
 

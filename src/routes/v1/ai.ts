@@ -1,3 +1,4 @@
+import { generateAiCloserReply, testAiProvider, DEFAULT_AI_PROVIDERS, AiProviderConfig } from '../../lib/ai-provider-engine.js';
 import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import { prisma } from '../../lib/prisma.js';
@@ -748,6 +749,159 @@ aiRouter.post('/call-summary', validateBody(callSummarySchema), async (req: Requ
       leadId: leadId || null,
       callId: body.callId || null,
     },
+    error: null,
+  });
+});
+
+
+// ==========================================
+// 8. Multi-Provider AI Fallback Engine Management
+// ==========================================
+
+// GET /providers - List AI providers, active chain, status & models
+aiRouter.get('/providers', async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+
+  const workspace = await prisma.aicloserWorkspace.findUnique({
+    where: { id: tenantId },
+    select: { settings: true },
+  });
+
+  const settings = (workspace?.settings as Record<string, any>) || {};
+  const customProviders = Array.isArray(settings.aiProviders) ? settings.aiProviders : DEFAULT_AI_PROVIDERS;
+
+  const sanitized = customProviders.map((p: AiProviderConfig) => ({
+    id: p.id,
+    name: p.name,
+    enabled: p.enabled !== false,
+    model: p.model,
+    priority: p.priority,
+    timeoutMs: p.timeoutMs,
+    isConfigured: p.id === 'fallback' || Boolean(p.apiKey || process.env[`${p.id.toUpperCase()}_API_KEY`] || (p.id === 'gemini' && process.env.GOOGLE_API_KEY)),
+  }));
+
+  res.json({
+    success: true,
+    data: {
+      providers: sanitized,
+      fallbackChain: sanitized.filter((p: any) => p.enabled).sort((a: any, b: any) => a.priority - b.priority).map((p: any) => p.id),
+      environmentDefaults: {
+        groqAvailable: Boolean(process.env.GROQ_API_KEY),
+        geminiAvailable: Boolean(process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY),
+        openaiAvailable: Boolean(process.env.OPENAI_API_KEY),
+      },
+    },
+    error: null,
+  });
+});
+
+// PATCH /providers - Update provider priority, enabled status, and custom keys
+const updateProvidersSchema = z.object({
+  providers: z.array(
+    z.object({
+      id: z.enum(['groq', 'gemini', 'openai', 'fallback']),
+      enabled: z.boolean().optional(),
+      model: z.string().optional(),
+      apiKey: z.string().optional(),
+      priority: z.number().int().min(1).max(10).optional(),
+      timeoutMs: z.number().int().min(500).max(15000).optional(),
+    })
+  ),
+});
+
+aiRouter.patch('/providers', requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN'), validateBody(updateProvidersSchema), async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const { providers: newUpdates } = req.body;
+
+  const workspace = await prisma.aicloserWorkspace.findUnique({
+    where: { id: tenantId },
+    select: { settings: true },
+  });
+
+  const settings = (workspace?.settings as Record<string, any>) || {};
+  const currentProviders: AiProviderConfig[] = Array.isArray(settings.aiProviders) ? settings.aiProviders : [...DEFAULT_AI_PROVIDERS];
+
+  for (const update of newUpdates) {
+    const idx = currentProviders.findIndex((p) => p.id === update.id);
+    if (idx >= 0) {
+      currentProviders[idx] = {
+        ...currentProviders[idx],
+        ...update,
+        // preserve existing key if not supplied or empty
+        apiKey: update.apiKey !== undefined ? (update.apiKey.trim() || null) : currentProviders[idx].apiKey,
+      };
+    } else {
+      const def = DEFAULT_AI_PROVIDERS.find((p) => p.id === update.id);
+      if (def) {
+        currentProviders.push({ ...def, ...update });
+      }
+    }
+  }
+
+  // Sort by priority
+  currentProviders.sort((a, b) => (a.priority || 99) - (b.priority || 99));
+
+  await prisma.aicloserWorkspace.update({
+    where: { id: tenantId },
+    data: {
+      settings: {
+        ...settings,
+        aiProviders: currentProviders,
+      } as any,
+      updatedAt: new Date(),
+    },
+  });
+
+  res.json({
+    success: true,
+    message: 'AI Provider fallback configuration updated successfully',
+    data: {
+      providers: currentProviders.map((p) => ({
+        id: p.id,
+        name: p.name,
+        enabled: p.enabled !== false,
+        model: p.model,
+        priority: p.priority,
+        timeoutMs: p.timeoutMs,
+        isConfigured: p.id === 'fallback' || Boolean(p.apiKey || process.env[`${p.id.toUpperCase()}_API_KEY`]),
+      })),
+    },
+    error: null,
+  });
+});
+
+// POST /test-provider - Test connectivity to a specific provider
+const testProviderSchema = z.object({
+  providerId: z.enum(['groq', 'gemini', 'openai', 'fallback']),
+  apiKey: z.string().optional(),
+  model: z.string().optional(),
+  prompt: z.string().optional(),
+});
+
+aiRouter.post('/test-provider', requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN'), validateBody(testProviderSchema), async (req: Request, res: Response) => {
+  const { providerId, apiKey, model, prompt } = req.body;
+
+  const result = await testAiProvider({
+    providerId,
+    apiKey,
+    model,
+    prompt,
+  });
+
+  if (!result.success) {
+    res.status(502).json({
+      success: false,
+      error: 'ProviderError',
+      message: `Test to AI provider "${providerId}" failed: ${result.error}`,
+      data: result,
+    });
+    return;
+  }
+
+  res.json({
+    success: true,
+    message: `AI provider "${providerId}" responded in ${result.latencyMs}ms`,
+    data: result,
     error: null,
   });
 });

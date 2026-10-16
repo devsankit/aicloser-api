@@ -115,16 +115,24 @@ export async function authenticate(req: Request, res: Response, next: NextFuncti
           role: true,
           tenantId: true,
           AicloserWorkspace: { select: { status: true } },
+          salesAgentProfile: { select: { status: true } },
         },
       });
 
       if (dbUser) {
-        if (dbUser.packageStatus === 'PAUSED' || dbUser.packageStatus === 'EXPIRED') {
+        const isSuspended =
+          dbUser.packageStatus === 'PAUSED' ||
+          dbUser.packageStatus === 'EXPIRED' ||
+          (dbUser.packageStatus as string) === 'SUSPENDED' ||
+          (dbUser.packageStatus as string) === 'INACTIVE' ||
+          dbUser.salesAgentProfile?.status === 'SUSPENDED';
+
+        if (isSuspended) {
           res.status(403).json({
             success: false,
             data: null,
             error: 'AccountSuspended',
-            message: 'Your user account is suspended or expired. Contact your administrator.',
+            message: 'Your user account or sales profile is suspended or inactive. Contact your administrator.',
           });
           return;
         }

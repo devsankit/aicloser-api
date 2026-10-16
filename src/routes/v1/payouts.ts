@@ -148,7 +148,7 @@ payoutsRouter.post('/', async (req: Request, res: Response) => {
 });
 
 // PATCH /payouts/:id/approve
-payoutsRouter.patch('/:id/approve', requireRoles('ADMIN', 'SUPER_ADMIN'), async (req: Request, res: Response) => {
+payoutsRouter.patch('/:id/approve', requireRoles('ADMIN', 'SUPER_ADMIN', 'MANAGER'), async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const payoutId = String(req.params.id);
   const payout = await prisma.salesPayout.findFirst({
@@ -173,7 +173,7 @@ payoutsRouter.patch('/:id/approve', requireRoles('ADMIN', 'SUPER_ADMIN'), async 
 });
 
 // PATCH /payouts/:id/reject
-payoutsRouter.patch('/:id/reject', requireRoles('ADMIN', 'SUPER_ADMIN'), async (req: Request, res: Response) => {
+payoutsRouter.patch('/:id/reject', requireRoles('ADMIN', 'SUPER_ADMIN', 'MANAGER'), async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const payoutId = String(req.params.id);
   const { reason } = req.body;

@@ -307,8 +307,15 @@ roundRobinRouter.get('/closers', async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const settings = await getRoundRobinSettings(tenantId);
 
+  // Strictly fetch non-admin active sales agents only
   const profiles = await prisma.salesAgentProfile.findMany({
-    where: { tenantId },
+    where: {
+      tenantId,
+      user: {
+        role: 'SALES_AGENT', // STRICT ADMIN & MANAGER EXCLUSION
+        packageStatus: 'ACTIVE',
+      },
+    },
     include: {
       user: { select: { id: true, displayName: true, email: true } },
       _count: {
@@ -369,8 +376,16 @@ roundRobinRouter.post('/assign', requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN')
     return;
   }
 
+  // Strictly fetch non-admin active sales agents only
   const profiles = await prisma.salesAgentProfile.findMany({
-    where: { tenantId, status: 'ACTIVE' },
+    where: {
+      tenantId,
+      status: 'ACTIVE',
+      user: {
+        role: 'SALES_AGENT', // STRICT ADMIN & MANAGER EXCLUSION
+        packageStatus: 'ACTIVE',
+      },
+    },
     include: {
       user: { select: { id: true, displayName: true, email: true } },
       _count: {
@@ -476,6 +491,131 @@ roundRobinRouter.post('/assign', requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN')
         currentLoad: (selectedCloser._count?.leadAssignments || 0) + assignedResults.length,
       },
     },
+    error: null,
+  });
+});
+
+
+// ==========================================
+// 10. Source-Wise Distribution Rules
+// ==========================================
+
+export interface SourceDistributionRule {
+  source: string; // e.g. WHATSAPP, GOOGLE_SHEETS, CSV, EXCEL, INDIAMART, JUSTDIAL, EMAIL
+  action: 'ROUND_ROBIN' | 'POOL' | 'MANUAL';
+  allowedCloserIds?: string[];
+  maxDailyLeads?: number;
+  enabled: boolean;
+}
+
+// GET /source-rules - List configured distribution rules per lead source
+roundRobinRouter.get('/source-rules', async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const workspace = await prisma.aicloserWorkspace.findUnique({
+    where: { id: tenantId },
+    select: { settings: true },
+  });
+
+  const settings = (workspace?.settings as Record<string, any>) || {};
+  const sourceRules: SourceDistributionRule[] = settings.sourceDistributionRules || [];
+
+  res.json({
+    success: true,
+    data: {
+      rules: sourceRules,
+      availableSources: ['WHATSAPP', 'GOOGLE_SHEETS', 'CSV', 'EXCEL', 'INDIAMART', 'JUSTDIAL', 'FACEBOOK_ADS', 'EMAIL', 'MANUAL'],
+    },
+    error: null,
+  });
+});
+
+// POST /source-rules - Upsert a source distribution rule
+const sourceRuleSchema = z.object({
+  source: z.string().min(1, 'Source name is required'),
+  action: z.enum(['ROUND_ROBIN', 'POOL', 'MANUAL']),
+  allowedCloserIds: z.array(z.string()).optional(),
+  maxDailyLeads: z.number().int().min(1).optional(),
+  enabled: z.boolean().default(true),
+});
+
+roundRobinRouter.post('/source-rules', requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN'), validateBody(sourceRuleSchema), async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const { source, action, allowedCloserIds, maxDailyLeads, enabled } = req.body;
+  const upperSource = source.toUpperCase().trim();
+
+  const workspace = await prisma.aicloserWorkspace.findUnique({
+    where: { id: tenantId },
+    select: { settings: true },
+  });
+
+  const settings = (workspace?.settings as Record<string, any>) || {};
+  const currentRules: SourceDistributionRule[] = settings.sourceDistributionRules || [];
+
+  const existingIdx = currentRules.findIndex((r) => r.source.toUpperCase() === upperSource);
+  const ruleObj: SourceDistributionRule = {
+    source: upperSource,
+    action,
+    allowedCloserIds: allowedCloserIds || [],
+    maxDailyLeads,
+    enabled: enabled !== false,
+  };
+
+  if (existingIdx >= 0) {
+    currentRules[existingIdx] = ruleObj;
+  } else {
+    currentRules.push(ruleObj);
+  }
+
+  await prisma.aicloserWorkspace.update({
+    where: { id: tenantId },
+    data: {
+      settings: {
+        ...settings,
+        sourceDistributionRules: currentRules,
+      } as any,
+      updatedAt: new Date(),
+    },
+  });
+
+  res.json({
+    success: true,
+    message: `Distribution rule for source "${upperSource}" saved successfully`,
+    data: { rule: ruleObj, totalRules: currentRules.length },
+    error: null,
+  });
+});
+
+// DELETE /source-rules/:source - Remove a source distribution rule
+roundRobinRouter.delete('/source-rules/:source', requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN'), async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const { source } = req.params;
+  const upperSource = String(Array.isArray(source) ? source[0] : source).toUpperCase().trim();
+
+  const workspace = await prisma.aicloserWorkspace.findUnique({
+    where: { id: tenantId },
+    select: { settings: true },
+  });
+
+  const settings = (workspace?.settings as Record<string, any>) || {};
+  const currentRules: SourceDistributionRule[] = settings.sourceDistributionRules || [];
+
+  const filtered = currentRules.filter((r) => r.source.toUpperCase() !== upperSource);
+
+  await prisma.aicloserWorkspace.update({
+    where: { id: tenantId },
+    data: {
+      settings: {
+        ...settings,
+        sourceDistributionRules: filtered,
+      } as any,
+      updatedAt: new Date(),
+    },
+  });
+
+  res.json({
+    success: true,
+    message: `Distribution rule for source "${upperSource}" removed`,
+    data: { deletedSource: upperSource, remainingRules: filtered.length },
     error: null,
   });
 });
