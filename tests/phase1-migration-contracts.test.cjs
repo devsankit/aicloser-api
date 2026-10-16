@@ -6,7 +6,6 @@ const API_BASE = 'http://localhost:3060';
 const JWT_SECRET = process.env.JWT_SECRET || 'aicloser_super_jwt_secret_production_2026_x99';
 
 const tenantA = 'tenant-the-storage-test-1d01dda2';
-const tenantB = 'tenant-other-b2b-test-9900aabb';
 
 const userAdminA = { userId: 'usr-admin-phase1-a', email: 'admin.a@example.com', role: 'ADMIN', tenantId: tenantA };
 const userCloserA = { userId: 'usr-closer-phase1-a', email: 'closer.a@example.com', role: 'SALES_AGENT', tenantId: tenantA };
@@ -14,7 +13,7 @@ const userCloserA = { userId: 'usr-closer-phase1-a', email: 'closer.a@example.co
 const tokenAdminA = jwt.sign(userAdminA, JWT_SECRET, { expiresIn: '2h' });
 const tokenCloserA = jwt.sign(userCloserA, JWT_SECRET, { expiresIn: '2h' });
 
-function apiRequest(options, postData = null) {
+function apiRequest(options, postData) {
   return new Promise((resolve, reject) => {
     const url = new URL(options.path, API_BASE);
     const req = http.request(
@@ -23,7 +22,7 @@ function apiRequest(options, postData = null) {
         method: options.method || 'GET',
         headers: {
           'Content-Type': 'application/json',
-          ...(options.token ? { Authorization: Bearer  } : {}),
+          ...(options.token ? { Authorization: 'Bearer ' + options.token } : {}),
           ...(options.headers || {}),
         },
       },
@@ -49,7 +48,7 @@ function apiRequest(options, postData = null) {
 
 async function runPhase1Suite() {
   console.log('========================================================================');
-  console.log('?? PHASE 1 MIGRATION GAPS ACCEPTANCE & INTEGRATION CONTRACT SUITE');
+  console.log('PHASE 1 MIGRATION GAPS ACCEPTANCE & INTEGRATION CONTRACT SUITE');
   console.log('========================================================================\n');
 
   let passed = 0;
@@ -58,18 +57,18 @@ async function runPhase1Suite() {
   async function test(name, fn) {
     try {
       await fn();
-      console.log(  ? PASS: );
+      console.log('  PASS: ' + name);
       passed++;
     } catch (err) {
-      console.error(  ? FAIL: );
-      console.error(     Error: \n);
+      console.error('  FAIL: ' + name);
+      console.error('     Error: ' + (err ? err.message : '') + '\n');
       failed++;
     }
   }
 
   // Lookup sample lead in tenantA
   const leadsRes = await apiRequest({ path: '/api/v1/leads?limit=5', method: 'GET', token: tokenAdminA });
-  const sampleLead = leadsRes.data?.data?.[0];
+  const sampleLead = leadsRes.data && leadsRes.data.data ? leadsRes.data.data[0] : null;
   assert.ok(sampleLead, 'Must have at least one lead in tenantA');
   const sampleLeadId = sampleLead.id;
 
@@ -84,7 +83,7 @@ async function runPhase1Suite() {
 
   // 2. POST /api/v1/tasks creates task
   let createdTaskId = null;
-  const taskTitle = Follow up on contract terms - ;
+  const taskTitle = 'Follow up on contract terms - ' + Date.now();
   await test('2. POST /api/v1/tasks creates task on lead', async () => {
     const dueAt = new Date(Date.now() + 86400000).toISOString();
     const res = await apiRequest(
@@ -94,7 +93,7 @@ async function runPhase1Suite() {
         title: taskTitle,
         description: 'Verify security deposit clause',
         priority: 'HIGH',
-        dueAt,
+        dueAt: dueAt,
       }
     );
     assert.strictEqual(res.statusCode, 201);
@@ -108,7 +107,7 @@ async function runPhase1Suite() {
   await test('3. PATCH /api/v1/tasks/:id toggles task status to DONE and sets completedAt', async () => {
     assert.ok(createdTaskId);
     const res = await apiRequest(
-      { path: /api/v1/tasks/, method: 'PATCH', token: tokenAdminA },
+      { path: '/api/v1/tasks/' + createdTaskId, method: 'PATCH', token: tokenAdminA },
       { status: 'DONE' }
     );
     assert.strictEqual(res.statusCode, 200);
@@ -121,7 +120,7 @@ async function runPhase1Suite() {
   await test('4. DELETE /api/v1/tasks/:id deletes task', async () => {
     assert.ok(createdTaskId);
     const res = await apiRequest(
-      { path: /api/v1/tasks/, method: 'DELETE', token: tokenAdminA },
+      { path: '/api/v1/tasks/' + createdTaskId, method: 'DELETE', token: tokenAdminA }
     );
     assert.strictEqual(res.statusCode, 200);
     assert.strictEqual(res.data.success, true);
@@ -160,15 +159,14 @@ async function runPhase1Suite() {
     assert.ok(Array.isArray(res.data.data.keyPoints));
   });
 
-  // 7. Contact suppression & unsuppression
-  // Lookup a contact in tenantA
+  // 7 & 8. Contact suppression & unsuppression
   const contactsLookup = await apiRequest({ path: '/api/v1/marketing/contacts?limit=1', method: 'GET', token: tokenAdminA });
-  const sampleContact = contactsLookup.data?.data?.contacts?.[0];
+  const sampleContact = contactsLookup.data && contactsLookup.data.data && contactsLookup.data.data.contacts ? contactsLookup.data.data.contacts[0] : null;
 
   if (sampleContact) {
     await test('7. POST /api/v1/marketing/contacts/:id/suppress suppresses contact', async () => {
       const res = await apiRequest(
-        { path: /api/v1/marketing/contacts//suppress, method: 'POST', token: tokenAdminA }
+        { path: '/api/v1/marketing/contacts/' + sampleContact.id + '/suppress', method: 'POST', token: tokenAdminA }
       );
       assert.strictEqual(res.statusCode, 200);
       assert.strictEqual(res.data.success, true);
@@ -178,7 +176,7 @@ async function runPhase1Suite() {
 
     await test('8. POST /api/v1/marketing/contacts/:id/unsuppress unsuppresses contact', async () => {
       const res = await apiRequest(
-        { path: /api/v1/marketing/contacts//unsuppress, method: 'POST', token: tokenAdminA }
+        { path: '/api/v1/marketing/contacts/' + sampleContact.id + '/unsuppress', method: 'POST', token: tokenAdminA }
       );
       assert.strictEqual(res.statusCode, 200);
       assert.strictEqual(res.data.success, true);
@@ -191,12 +189,12 @@ async function runPhase1Suite() {
 
   // 9. Template direct preview
   const templatesLookup = await apiRequest({ path: '/api/v1/marketing/templates', method: 'GET', token: tokenAdminA });
-  const sampleTemplate = templatesLookup.data?.data?.[0];
+  const sampleTemplate = templatesLookup.data && templatesLookup.data.data ? templatesLookup.data.data[0] : null;
 
   if (sampleTemplate) {
     await test('9. POST /api/v1/marketing/templates/:id/preview renders variables without campaign', async () => {
       const res = await apiRequest(
-        { path: /api/v1/marketing/templates//preview, method: 'POST', token: tokenAdminA },
+        { path: '/api/v1/marketing/templates/' + sampleTemplate.id + '/preview', method: 'POST', token: tokenAdminA },
         { variables: { '1': 'Sankit Sharma' } }
       );
       assert.strictEqual(res.statusCode, 200);
@@ -218,7 +216,7 @@ async function runPhase1Suite() {
   });
 
   console.log('\n========================================================================');
-  console.log(?? PHASE 1 SUMMARY:  PASSED,  FAILED);
+  console.log('PHASE 1 SUMMARY: ' + passed + ' PASSED, ' + failed + ' FAILED');
   console.log('========================================================================\n');
 
   if (failed > 0) process.exit(1);
