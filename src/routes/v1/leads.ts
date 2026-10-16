@@ -560,13 +560,19 @@ leadsRouter.get('/:id', async (req: Request, res: Response) => {
 });
 
 const updateLeadSchema = z.object({
+  customerName: z.string().trim().min(1).max(200).optional(),
+  customerPhone: z.string().trim().min(5).max(40).nullable().optional(),
+  customerEmail: z.string().trim().email().max(320).nullable().optional(),
+  serviceInterest: z.string().trim().max(200).nullable().optional(),
+  segment: z.string().trim().max(120).nullable().optional(),
   stage: salesLeadStageSchema.optional(),
   kanbanPosition: z.number().optional(),
   priority: z.string().optional(),
   notes: z.string().optional(),
-  followUpAt: z.string().datetime().optional(),
+  followUpAt: z.string().datetime().nullable().optional(),
   budgetAmount: z.number().optional(),
   assignedAgentId: z.string().optional(),
+  tags: z.array(z.string().trim().min(1).max(80)).max(50).optional(),
   customFields: z.record(z.unknown()).optional(),
   lostReason: z.string().optional().nullable(),
   lostReasonNotes: z.string().optional().nullable(),
@@ -586,6 +592,34 @@ leadsRouter.patch('/:id', validateBody(updateLeadSchema), async (req: Request, r
   if (!existing) {
     res.status(404).json({ success: false, error: 'NotFound', message: 'Lead not found in this workspace' });
     return;
+  }
+
+  // Phone numbers are tenant-unique. Return a conflict instead of allowing a
+  // database constraint error to surface as an opaque 500 response.
+  if (typeof body.customerPhone === 'string' && body.customerPhone.trim() && body.customerPhone.trim() !== existing.customerPhone) {
+    const rawPhone = body.customerPhone.trim();
+    const cleanDigits = rawPhone.replace(/\D/g, '');
+    const last10 = cleanDigits.length >= 10 ? cleanDigits.slice(-10) : cleanDigits;
+    const duplicate = await prisma.salesLeadAssignment.findFirst({
+      where: {
+        tenantId,
+        NOT: { id },
+        OR: [
+          { customerPhone: rawPhone },
+          ...(last10.length >= 7 ? [{ customerPhone: { contains: last10 } }] : []),
+        ],
+      },
+      select: { id: true, customerName: true },
+    });
+    if (duplicate) {
+      res.status(409).json({
+        success: false,
+        error: 'DuplicateLeadPhone',
+        message: `This phone number already belongs to ${duplicate.customerName || 'another lead'} in this workspace`,
+        data: { existingLeadId: duplicate.id },
+      });
+      return;
+    }
   }
 
   // Strict closer scoping: Closers can only update leads assigned to them and cannot reassign
@@ -629,9 +663,23 @@ leadsRouter.patch('/:id', validateBody(updateLeadSchema), async (req: Request, r
   const updated = await prisma.salesLeadAssignment.update({
     where: { id },
     data: {
-      ...body,
+      ...(body.customerName !== undefined ? { customerName: body.customerName } : {}),
+      ...(body.customerPhone !== undefined ? { customerPhone: body.customerPhone || null } : {}),
+      ...(body.customerEmail !== undefined ? { customerEmail: body.customerEmail || null } : {}),
+      ...(body.serviceInterest !== undefined ? { serviceInterest: body.serviceInterest || null } : {}),
+      ...(body.segment !== undefined ? { segment: body.segment || null } : {}),
+      ...(body.stage !== undefined ? { stage: body.stage } : {}),
+      ...(body.kanbanPosition !== undefined ? { kanbanPosition: body.kanbanPosition } : {}),
+      ...(body.priority !== undefined ? { priority: body.priority } : {}),
+      ...(body.notes !== undefined ? { notes: body.notes } : {}),
+      ...(body.budgetAmount !== undefined ? { budgetAmount: body.budgetAmount } : {}),
+      ...(body.tags !== undefined ? { tags: body.tags } : {}),
+      ...(body.customFields !== undefined ? { customFields: body.customFields } : {}),
+      ...(body.lostReason !== undefined ? { lostReason: body.lostReason } : {}),
+      ...(body.lostReasonNotes !== undefined ? { lostReasonNotes: body.lostReasonNotes } : {}),
+      ...(body.isDndActive !== undefined ? { isDndActive: body.isDndActive } : {}),
       ...(targetAgentId ? { assignedAgentId: targetAgentId } : {}),
-      followUpAt: body.followUpAt ? new Date(body.followUpAt) : undefined,
+      ...(body.followUpAt !== undefined ? { followUpAt: body.followUpAt ? new Date(body.followUpAt) : null } : {}),
     },
   });
 
