@@ -479,6 +479,15 @@ superAdminRouter.post('/tenants/:tenantId/users', validateBody(createUserSchema)
     return;
   }
 
+  // Check if phone already taken
+  if (body.phone) {
+    const existingPhone = await prisma.appAuthUser.findFirst({ where: { phone: body.phone } });
+    if (existingPhone) {
+      res.status(409).json({ success: false, error: 'PhoneConflict', message: 'User with this phone number already exists' });
+      return;
+    }
+  }
+
   // Secure scrypt password hashing
   const salt = randomBytes(16).toString('hex');
   const rawPassword = body.password || randomBytes(8).toString('hex');
