@@ -61,7 +61,17 @@ async function sendCallRecording(req: Request, res: Response) {
     return;
   }
 
-  const playback = await getRecordingPlayback({ objectKey: result.upload.objectKey, contentType: result.upload.mimeType });
+  let playback;
+  try {
+    playback = await getRecordingPlayback({ objectKey: result.upload.objectKey, contentType: result.upload.mimeType });
+  } catch (error) {
+    const code = error && typeof error === 'object' && 'code' in error ? String((error as { code?: unknown }).code) : '';
+    if (code === 'ENOENT') {
+      res.status(404).json({ success: false, error: 'RecordingFileNotFound', message: 'Recording metadata exists but the audio file is unavailable' });
+      return;
+    }
+    throw error;
+  }
   if (playback.mode === 's3') {
     res.json({ success: true, data: { url: playback.url, expiresIn: 300, callId: result.call.id, recordingUploadId: result.upload.id } });
     return;
