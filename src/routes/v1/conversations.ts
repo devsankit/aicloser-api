@@ -10,7 +10,7 @@ import { Prisma } from '@prisma/client';
 import { authenticate } from '../../middlewares/auth.js';
 import { enforceTenantIsolation } from '../../middlewares/tenant-isolation.js';
 import { validateBody, validateQuery } from '../../middlewares/validate.js';
-import { requireRoles } from '../../middlewares/rbac.js';
+import { requireRoles, hasPermission, PERM_LEADS_REASSIGN } from '../../middlewares/rbac.js';
 import { persistApiRealtimeEvent } from '../../lib/realtime.js';
 
 export const conversationsRouter = Router();
@@ -653,9 +653,10 @@ conversationsRouter.get('/:id/attachments/:filename', async (req: Request, res: 
   res.sendFile(filePath);
 });
 
-// 7. POST /:id/assign - Reassign conversation and linked lead (Role Guarded)
-conversationsRouter.post('/:id/assign', requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN'), async (req: Request, res: Response) => {
+// 7. POST /:id/assign - Reassign conversation and linked lead (Role Guarded & Tenant Isolated)
+conversationsRouter.post('/:id/assign', async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
+  const user = req.user!;
   const id = String(req.params.id);
   const rawAgentId = String(
     req.body?.assignedAgentId ||
@@ -664,13 +665,26 @@ conversationsRouter.post('/:id/assign', requireRoles('ADMIN', 'MANAGER', 'SUPER_
     ''
   ).trim();
 
+  // 1. Check user permission (leads:reassign or admin/manager role)
+  const canReassign = await hasPermission(user.userId, tenantId, user.role, PERM_LEADS_REASSIGN);
+  if (!canReassign) {
+    res.status(403).json({
+      success: false,
+      code: 'PERMISSION_DENIED',
+      error: 'PermissionDenied',
+      message: 'You lack permission to reassign leads/conversations (leads:reassign required)',
+    });
+    return;
+  }
+
   if (!rawAgentId) {
     res.status(400).json({ success: false, error: 'InvalidRequest', message: 'assignedAgentId is required' });
     return;
   }
 
-  const conversation = await prisma.appConversation.findFirst({
-    where: { id, tenantId },
+  // 2. Check conversation and tenant isolation
+  const conversation = await prisma.appConversation.findUnique({
+    where: { id },
   });
 
   if (!conversation) {
@@ -678,17 +692,85 @@ conversationsRouter.post('/:id/assign', requireRoles('ADMIN', 'MANAGER', 'SUPER_
     return;
   }
 
-  // Find agent profile or user in tenant
+  if (conversation.tenantId !== tenantId) {
+    res.status(403).json({
+      success: false,
+      code: 'TENANT_ISOLATION_VIOLATION',
+      error: 'TenantIsolationViolation',
+      message: 'Cross-tenant assignment is strictly prohibited: conversation belongs to another workspace',
+    });
+    return;
+  }
+
+  // 3. Resolve target agent profile
   const agentProfile = await prisma.salesAgentProfile.findFirst({
     where: {
-      tenantId,
       OR: [{ id: rawAgentId }, { userId: rawAgentId }],
     },
-    include: { user: { select: { displayName: true } } },
+    include: { user: { select: { id: true, displayName: true, role: true, email: true } } },
   });
 
-  const assignedFreelancerId = agentProfile ? agentProfile.id : rawAgentId;
-  const assignedFreelancerName = agentProfile?.user?.displayName || null;
+  if (!agentProfile) {
+    res.status(404).json({
+      success: false,
+      code: 'AGENT_NOT_IN_WORKSPACE',
+      error: 'AgentNotInWorkspace',
+      message: 'Target team member not found in workspace',
+    });
+    return;
+  }
+
+  if (agentProfile.tenantId !== tenantId) {
+    res.status(403).json({
+      success: false,
+      code: 'TENANT_ISOLATION_VIOLATION',
+      error: 'TenantIsolationViolation',
+      message: 'Target team member belongs to a different workspace',
+    });
+    return;
+  }
+
+  // 4. Verify agent status is ACTIVE (reject INACTIVE / SUSPENDED / ON_LEAVE)
+  if (agentProfile.status !== 'ACTIVE') {
+    res.status(400).json({
+      success: false,
+      code: 'AGENT_NOT_ACTIVE',
+      error: 'AgentNotActive',
+      message: `Target team member is not active (current status: ${agentProfile.status}). Only ACTIVE members can be assigned.`,
+    });
+    return;
+  }
+
+  // 5. Allowed role: Administrators cannot be assigned leads
+  if (agentProfile.user.role === 'ADMIN' || agentProfile.user.role === 'SUPER_ADMIN') {
+    res.status(400).json({
+      success: false,
+      code: 'AGENT_NOT_ACTIVE',
+      error: 'InvalidTargetRole',
+      message: 'Administrators and Super Admins cannot be assigned leads. Target must be a sales agent or closer.',
+    });
+    return;
+  }
+
+  // 6. Duplicate assignment handled idempotently
+  if (conversation.assignedFreelancerId === agentProfile.id) {
+    res.status(200).json({
+      success: true,
+      code: 'DUPLICATE_ASSIGNMENT',
+      message: 'Conversation is already assigned to this agent (idempotent)',
+      data: {
+        conversationId: id,
+        assignedAgentId: agentProfile.id,
+        assignedFreelancerName: agentProfile.user.displayName,
+        idempotent: true,
+      },
+      error: null,
+    });
+    return;
+  }
+
+  const assignedFreelancerId = agentProfile.id;
+  const assignedFreelancerName = agentProfile.user?.displayName || null;
 
   // Update conversation
   await prisma.appConversation.update({
@@ -715,7 +797,7 @@ conversationsRouter.post('/:id/assign', requireRoles('ADMIN', 'MANAGER', 'SUPER_
     tenantId,
     eventType: 'lead.updated',
     payload: { conversationId: id, assignedAgentId: assignedFreelancerId, assignedFreelancerName },
-    actorUserId: req.user?.userId,
+    actorUserId: user.userId,
   }).catch(() => undefined);
 
   res.json({

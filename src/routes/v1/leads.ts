@@ -1417,8 +1417,8 @@ leadsRouter.post('/:id/reassign', requirePermissions(PERM_LEADS_REASSIGN), valid
   const id = String(req.params.id);
   const { assignedAgentId, reason } = req.body as z.infer<typeof reassignLeadSchema>;
 
-  const lead = await prisma.salesLeadAssignment.findFirst({
-    where: { id, tenantId },
+  const lead = await prisma.salesLeadAssignment.findUnique({
+    where: { id },
   });
 
   if (!lead) {
@@ -1426,20 +1426,81 @@ leadsRouter.post('/:id/reassign', requirePermissions(PERM_LEADS_REASSIGN), valid
     return;
   }
 
+  if (lead.tenantId !== tenantId) {
+    res.status(403).json({
+      success: false,
+      code: 'TENANT_ISOLATION_VIOLATION',
+      error: 'TenantIsolationViolation',
+      message: 'Cross-tenant reassignment is strictly prohibited: lead belongs to another workspace',
+    });
+    return;
+  }
+
   // Resolve target agent profile
   const targetAgent = await prisma.salesAgentProfile.findFirst({
     where: {
-      tenantId,
       OR: [
         { id: assignedAgentId },
         { userId: assignedAgentId },
       ],
     },
-    include: { user: { select: { displayName: true } } },
+    include: { user: { select: { id: true, displayName: true, role: true } } },
   });
 
   if (!targetAgent) {
-    res.status(400).json({ success: false, error: 'InvalidAgent', message: 'Target agent not found in this workspace' });
+    res.status(404).json({
+      success: false,
+      code: 'AGENT_NOT_IN_WORKSPACE',
+      error: 'AgentNotInWorkspace',
+      message: 'Target agent not found in workspace',
+    });
+    return;
+  }
+
+  if (targetAgent.tenantId !== tenantId) {
+    res.status(403).json({
+      success: false,
+      code: 'TENANT_ISOLATION_VIOLATION',
+      error: 'TenantIsolationViolation',
+      message: 'Target agent belongs to a different workspace',
+    });
+    return;
+  }
+
+  if (targetAgent.status !== 'ACTIVE') {
+    res.status(400).json({
+      success: false,
+      code: 'AGENT_NOT_ACTIVE',
+      error: 'AgentNotActive',
+      message: `Target agent is not active (status: ${targetAgent.status}). Only ACTIVE agents can be assigned.`,
+    });
+    return;
+  }
+
+  if (targetAgent.user.role === 'ADMIN' || targetAgent.user.role === 'SUPER_ADMIN') {
+    res.status(400).json({
+      success: false,
+      code: 'AGENT_NOT_ACTIVE',
+      error: 'InvalidTargetRole',
+      message: 'Administrators and Super Admins cannot be assigned leads. Target must be a sales agent or closer.',
+    });
+    return;
+  }
+
+  // Idempotent duplicate check
+  if (lead.assignedAgentId === targetAgent.id) {
+    res.status(200).json({
+      success: true,
+      code: 'DUPLICATE_ASSIGNMENT',
+      message: `Lead is already assigned to ${targetAgent.user.displayName || targetAgent.agentCode} (idempotent)`,
+      data: {
+        id: lead.id,
+        assignedAgentId: targetAgent.id,
+        agentCode: targetAgent.agentCode,
+        idempotent: true,
+      },
+      error: null,
+    });
     return;
   }
 

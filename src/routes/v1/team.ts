@@ -106,39 +106,62 @@ teamRouter.get('/me', async (req: Request, res: Response) => {
 teamRouter.get('/', requirePermissions(PERM_TEAM_VIEW), async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const user = req.user!;
+  const statusQuery = typeof req.query.status === 'string' ? req.query.status.trim().toUpperCase() : undefined;
+  const assignableQuery = String(req.query.assignable ?? '').trim().toLowerCase() === 'true';
 
-  const profiles = await prisma.salesAgentProfile.findMany({
-    where: { tenantId },
-    include: {
-      user: {
-        select: {
-          id: true,
-          displayName: true,
-          email: true,
-          phone: true,
-          role: true,
+  const whereClause: any = { tenantId };
+  if (statusQuery) {
+    whereClause.status = statusQuery as SalesAgentStatus;
+  } else if (assignableQuery) {
+    whereClause.status = 'ACTIVE';
+  }
+
+  const [workspace, profiles] = await Promise.all([
+    prisma.aicloserWorkspace.findUnique({
+      where: { id: tenantId },
+      select: { id: true, name: true },
+    }),
+    prisma.salesAgentProfile.findMany({
+      where: whereClause,
+      include: {
+        user: {
+          select: {
+            id: true,
+            displayName: true,
+            email: true,
+            phone: true,
+            role: true,
+          },
+        },
+        parentAgent: {
+          select: {
+            id: true,
+            agentCode: true,
+            user: { select: { displayName: true, email: true } },
+          },
+        },
+        _count: {
+          select: {
+            leadAssignments: true,
+            mobileCalls: true,
+          },
         },
       },
-      parentAgent: {
-        select: {
-          id: true,
-          agentCode: true,
-          user: { select: { displayName: true, email: true } },
-        },
-      },
-      _count: {
-        select: {
-          leadAssignments: true,
-          mobileCalls: true,
-        },
-      },
-    },
-    orderBy: { createdAt: 'desc' },
-  });
+      orderBy: { createdAt: 'desc' },
+    }),
+  ]);
 
   const canSeeCommissions = user.role === 'SUPER_ADMIN' || user.role === 'ADMIN';
 
-  const team = profiles.map((p) => ({
+  let filteredProfiles = profiles;
+  if (assignableQuery) {
+    // Exclude Admin and Super Admin from lead assignment lists; must be ACTIVE
+    filteredProfiles = profiles.filter(
+      (p) => p.status === 'ACTIVE' && p.user.role !== 'ADMIN' && p.user.role !== 'SUPER_ADMIN'
+    );
+  }
+
+  const team = filteredProfiles.map((p) => ({
     id: p.id,
     userId: p.user.id,
     displayName: p.user.displayName,
@@ -166,7 +189,12 @@ teamRouter.get('/', requirePermissions(PERM_TEAM_VIEW), async (req: Request, res
 
   res.json({
     success: true,
-    data: team,
+    data: {
+      workspaceId: workspace?.id || tenantId,
+      workspaceName: workspace?.name || 'Workspace',
+      members: team,
+    },
+    members: team,
   });
 });
 

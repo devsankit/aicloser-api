@@ -78,6 +78,7 @@ export function requireRoles(...allowedRoles: UserRole[]) {
     if (!allowedRoles.includes(user.role)) {
       res.status(403).json({
         success: false,
+        code: 'PERMISSION_DENIED',
         error: 'Forbidden',
         message: 'Insufficient permissions: role ' + user.role + ' is not authorized for this resource',
       });
@@ -112,6 +113,7 @@ export function requirePermissions(...requiredPermissions: string[]) {
       if (!allowed) {
         res.status(403).json({
           success: false,
+          code: 'PERMISSION_DENIED',
           error: 'Forbidden',
           message: `You lack the required granular permission: ${perm}`,
         });

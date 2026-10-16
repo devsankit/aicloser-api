@@ -114,6 +114,7 @@ export async function enforceTenantIsolation(req: Request, res: Response, next: 
 
     res.status(403).json({
       success: false,
+      code: 'TENANT_ISOLATION_VIOLATION',
       error: 'TenantIsolationViolation',
       message: 'Access denied: Client cannot query or mutate data outside their assigned workspace',
     });

@@ -40,7 +40,18 @@ async function getWorkspaceStages(tenantId: string): Promise<PipelineStageConfig
 
   const settings = (workspace?.settings as Record<string, any>) || {};
   if (Array.isArray(settings.pipelineStages) && settings.pipelineStages.length > 0) {
-    return settings.pipelineStages;
+    const valid = settings.pipelineStages.filter((s: any) => s && (s.key || s.id) && s.label);
+    if (valid.length > 0) {
+      return valid.map((s: any, idx: number) => ({
+        id: s.id || s.key,
+        key: s.key || s.id,
+        label: s.label,
+        color: s.color || '#3B82F6',
+        probability: typeof s.probability === 'number' ? s.probability : 0.5,
+        position: typeof s.position === 'number' ? s.position : idx + 1,
+        isCustom: Boolean(s.isCustom),
+      }));
+    }
   }
   return DEFAULT_PIPELINE_STAGES;
 }
@@ -86,6 +97,7 @@ stagesRouter.get('/', async (req: Request, res: Response) => {
   res.json({
     success: true,
     data: enrichedStages,
+    stages: enrichedStages,
     error: null,
   });
 });
@@ -284,7 +296,7 @@ stagesRouter.patch('/:id', requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN'), vali
   const targetIndex = currentStages.findIndex((s) => s.id === id || s.key === id);
 
   if (targetIndex === -1) {
-    res.status(404).json({ success: false, error: 'NotFound', message: `Stage "${id}" not found in workspace` });
+    res.status(404).json({ success: false, code: 'STAGE_NOT_FOUND', error: 'NotFound', message: `Stage "${id}" not found in workspace` });
     return;
   }
 
@@ -328,7 +340,7 @@ stagesRouter.delete('/:id', requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN'), asy
   const target = currentStages.find((s) => s.id === id || s.key === id);
 
   if (!target) {
-    res.status(404).json({ success: false, error: 'NotFound', message: `Stage "${id}" not found` });
+    res.status(404).json({ success: false, code: 'STAGE_NOT_FOUND', error: 'NotFound', message: `Stage "${id}" not found` });
     return;
   }
 
