@@ -11,7 +11,7 @@ import { validateBody, validateQuery } from '../../middlewares/validate.js';
 import { SalesLeadStage, salesLeadStageSchema } from '../../types/leads.js';
 import { hasPermission, requirePermissions, PERM_LEADS_CLAIM, PERM_LEADS_REASSIGN } from '../../middlewares/rbac.js';
 import { persistApiRealtimeEvent } from '../../lib/realtime.js';
-import { syncMarketingContactForLead } from '../../lib/lead-contact-sync.js';
+import { syncMarketingContactForLead, normalizeLeadPhone, deleteContactsAndLinkedLeadsTransactional } from '../../lib/lead-contact-sync.js';
 import { getWorkspaceScope } from '../../lib/workspace-scope.js';
 
 export const leadsRouter = Router();
@@ -714,11 +714,13 @@ leadsRouter.get('/:id/360', async (req: Request, res: Response) => {
       email: lead.assignedAgent.user?.email,
       phone: lead.assignedAgent.user?.phone,
     } : null,
+    notes: timeline.filter((entry) => entry.type === 'NOTE'),
     timelineNotes: timeline.filter((entry) => entry.type === 'NOTE'),
     timeline,
     activityLogs,
     history,
     tasks,
+    callbacks: tasks,
     callLogs: enrichedCalls,
     calls: enrichedCalls,
     activeConversation: conversation ? {
@@ -1008,6 +1010,9 @@ leadsRouter.patch('/:id', validateBody(updateLeadSchema), async (req: Request, r
     actorUserId: req.user?.userId,
   }).catch(() => undefined);
 
+  // Sync mirrored marketing contact with updated lead fields (name, email, assignee)
+  await syncMarketingContactForLead(updated).catch(() => undefined);
+
   res.json({ success: true, data: updated, error: null });
 });
 
@@ -1030,8 +1035,21 @@ leadsRouter.delete('/:id', async (req: Request, res: Response) => {
     return;
   }
 
-  await prisma.salesLeadAssignment.delete({ where: { id } });
-  res.json({ success: true, message: 'Lead deleted from workspace' });
+  const result = await deleteContactsAndLinkedLeadsTransactional(tenantId, {
+    leadIds: [existing.id],
+  });
+
+  res.json({
+    success: true,
+    message: 'Lead and linked contact deleted successfully',
+    deletedLeadId: existing.id,
+    deletedContactId: result.deletedContactId,
+    data: {
+      deletedLeadId: existing.id,
+      deletedContactId: result.deletedContactId,
+    },
+    error: null,
+  });
 });
 const claimPoolSchema = z.object({
   assignedAgentId: z.string().min(1).optional(),
@@ -1231,6 +1249,9 @@ async function handlePoolClaim(req: Request, res: Response) {
       actorUserId: user.userId,
     }).catch(() => undefined);
 
+    // Sync mirrored marketing contact with newly assigned lead
+    await syncMarketingContactForLead(result.lead).catch(() => undefined);
+
     res.json({ success: true, data: result, message: result.idempotent ? 'Lead was already claimed by this closer' : 'Lead claimed successfully', error: null });
   } catch (error: unknown) {
     if (error instanceof PoolClaimError) {
@@ -1270,9 +1291,11 @@ leadsRouter.get('/:id/notes', async (req: Request, res: Response) => {
   res.json({
     success: true,
     data: {
-      summaryNotes: check.lead.notes || '',
+      notes: entries,
       timelineNotes: entries,
+      summaryNotes: check.lead.notes || '',
     },
+    error: null,
   });
 });
 
@@ -1466,11 +1489,17 @@ leadsRouter.post('/:id/tasks', async (req: Request, res: Response) => {
   res.status(201).json({ success: true, data: task });
 });
 
-// PATCH /:id/tasks/:taskId - Update task status
+// PATCH /:id/tasks/:taskId - Update task status, reschedule, or edit details
 leadsRouter.patch('/:id/tasks/:taskId', async (req: Request, res: Response) => {
   const id = String(req.params.id);
   const taskId = String(req.params.taskId);
-  const { status } = req.body as { status: string };
+  const { status, title, description, dueAt, priority } = req.body as {
+    status?: string;
+    title?: string;
+    description?: string;
+    dueAt?: string;
+    priority?: string;
+  };
 
   const check = await verifyLeadAccess(id, req);
   if (!check.ok) {
@@ -1489,8 +1518,14 @@ leadsRouter.patch('/:id/tasks/:taskId', async (req: Request, res: Response) => {
   const task = await prisma.gxLeadTask.update({
     where: { id: taskId },
     data: {
-      status: (status || 'OPEN').toUpperCase(),
-      completedAt: status === 'DONE' ? new Date() : null,
+      ...(status !== undefined ? {
+        status: status.toUpperCase(),
+        completedAt: status.toUpperCase() === 'DONE' ? new Date() : null,
+      } : {}),
+      ...(title !== undefined ? { title: title.trim() } : {}),
+      ...(description !== undefined ? { description: description.trim() } : {}),
+      ...(dueAt !== undefined ? { dueAt: new Date(dueAt) } : {}),
+      ...(priority !== undefined ? { priority: priority.toUpperCase() } : {}),
     },
   });
 
@@ -1720,6 +1755,22 @@ leadsRouter.post('/:id/reassign', requirePermissions(PERM_LEADS_REASSIGN), valid
     },
   }).catch(() => undefined);
 
+  // Symmetrically sync linked MarketingContact with new assignee
+  const normPhone = normalizeLeadPhone(lead.customerPhone);
+  await prisma.marketingContact.updateMany({
+    where: {
+      tenantId,
+      OR: [
+        { leadId: lead.id },
+        ...(normPhone ? [{ e164Phone: normPhone }] : []),
+      ],
+    },
+    data: {
+      assignedAgentId: targetAgent.id,
+      updatedAt: new Date(),
+    },
+  }).catch(() => undefined);
+
   await persistApiRealtimeEvent({
     tenantId,
     actorUserId: req.user?.userId,
@@ -1732,6 +1783,156 @@ leadsRouter.post('/:id/reassign', requirePermissions(PERM_LEADS_REASSIGN), valid
     success: true,
     data: updated,
     message: `Lead successfully reassigned to ${targetAgent.user.displayName || targetAgent.agentCode}`,
+  });
+});
+
+// POST /bulk-reassign - Dedicated bulk lead reassignment endpoint
+const bulkReassignSchema = z.object({
+  leadIds: z.array(z.string().min(1)).min(1, 'Provide at least one lead ID to reassign'),
+  assignedAgentId: z.string().min(1).optional(),
+  agentId: z.string().min(1).optional(),
+  reason: z.string().optional(),
+}).refine((d) => Boolean(d.assignedAgentId || d.agentId), {
+  message: 'Target assignedAgentId or agentId is required',
+  path: ['assignedAgentId'],
+});
+
+leadsRouter.post('/bulk-reassign', requirePermissions(PERM_LEADS_REASSIGN), validateBody(bulkReassignSchema), async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const body = req.body as z.infer<typeof bulkReassignSchema>;
+  const rawTargetAgentId = (body.assignedAgentId || body.agentId)!.trim();
+
+  // Resolve target agent profile in this workspace
+  const targetAgent = await prisma.salesAgentProfile.findFirst({
+    where: {
+      tenantId,
+      OR: [
+        { id: rawTargetAgentId },
+        { userId: rawTargetAgentId },
+      ],
+    },
+    include: { user: { select: { id: true, displayName: true, role: true } } },
+  });
+
+  if (!targetAgent) {
+    res.status(404).json({
+      success: false,
+      code: 'AGENT_NOT_IN_WORKSPACE',
+      error: 'AgentNotInWorkspace',
+      message: 'Target agent not found in workspace',
+    });
+    return;
+  }
+
+  if (targetAgent.status !== 'ACTIVE') {
+    res.status(400).json({
+      success: false,
+      code: 'AGENT_NOT_ACTIVE',
+      error: 'AgentNotActive',
+      message: `Target agent is not active (status: ${targetAgent.status}). Only ACTIVE agents can be assigned.`,
+    });
+    return;
+  }
+
+  if (targetAgent.user.role === 'ADMIN' || targetAgent.user.role === 'SUPER_ADMIN') {
+    res.status(400).json({
+      success: false,
+      code: 'INVALID_TARGET_ROLE',
+      error: 'InvalidTargetRole',
+      message: 'Administrators and Super Admins cannot be assigned leads. Target must be a sales closer.',
+    });
+    return;
+  }
+
+  // Find all matching leads strictly within this tenant
+  const validLeads = await prisma.salesLeadAssignment.findMany({
+    where: {
+      tenantId,
+      id: { in: body.leadIds },
+    },
+    select: { id: true, customerPhone: true, customerName: true, assignedAgentId: true },
+  });
+
+  if (validLeads.length === 0) {
+    res.status(404).json({
+      success: false,
+      error: 'NotFound',
+      message: 'No matching leads found in workspace to reassign',
+    });
+    return;
+  }
+
+  const validLeadIds = validLeads.map((l) => l.id);
+  const phones = validLeads
+    .map((l) => normalizeLeadPhone(l.customerPhone))
+    .filter((p): p is string => Boolean(p));
+
+  // Perform bulk reassignment in a transaction
+  await prisma.$transaction(async (tx) => {
+    // 1. Reassign SalesLeadAssignment records
+    await tx.salesLeadAssignment.updateMany({
+      where: {
+        tenantId,
+        id: { in: validLeadIds },
+      },
+      data: {
+        assignedAgentId: targetAgent.id,
+        updatedAt: new Date(),
+      },
+    });
+
+    // 2. Reassign mirrored MarketingContact records
+    const contactOrConditions: Array<Record<string, unknown>> = [{ leadId: { in: validLeadIds } }];
+    if (phones.length > 0) {
+      contactOrConditions.push({ e164Phone: { in: phones } });
+    }
+    await tx.marketingContact.updateMany({
+      where: {
+        tenantId,
+        OR: contactOrConditions,
+      },
+      data: {
+        assignedAgentId: targetAgent.id,
+        updatedAt: new Date(),
+      },
+    });
+
+    // 3. Activity logs for all reassigned leads
+    for (const lead of validLeads) {
+      await tx.salesActivityLog.create({
+        data: {
+          tenantId,
+          assignmentId: lead.id,
+          actorUserId: req.user?.userId,
+          action: 'LEAD_REASSIGNED',
+          note: `Lead reassigned to ${targetAgent.user.displayName || targetAgent.agentCode}${body.reason ? ': ' + body.reason : ''}`,
+          metadata: { previousAgentId: lead.assignedAgentId, newAgentId: targetAgent.id, reason: body.reason, isBulk: true },
+        },
+      });
+    }
+  });
+
+  // Emit realtime events
+  for (const lead of validLeads) {
+    await persistApiRealtimeEvent({
+      tenantId,
+      actorUserId: req.user?.userId,
+      audienceRoles: ['SUPER_ADMIN', 'ADMIN', 'MANAGER', 'SALES_AGENT'],
+      eventType: 'lead.reassigned',
+      payload: { id: lead.id, assignedAgentId: targetAgent.id, agentCode: targetAgent.agentCode },
+    }).catch(() => undefined);
+  }
+
+  res.json({
+    success: true,
+    message: `Successfully reassigned ${validLeadIds.length} lead(s) to ${targetAgent.user.displayName || targetAgent.agentCode}`,
+    data: {
+      reassignedLeadIds: validLeadIds,
+      assignedAgentId: targetAgent.id,
+      agentCode: targetAgent.agentCode,
+      count: validLeadIds.length,
+    },
+    error: null,
   });
 });
 

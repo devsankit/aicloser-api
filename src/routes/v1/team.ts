@@ -459,18 +459,54 @@ teamRouter.patch('/:id/status', requirePermissions(PERM_TEAM_MANAGE), validateBo
   });
 });
 
-// PATCH /:id/permissions - Direct permissions map update
+// GET /:id/permissions - Get team member permissions (accepts profile ID or user ID)
+teamRouter.get('/:id/permissions', requirePermissions(PERM_TEAM_VIEW), async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const id = String(req.params.id);
+
+  const profile = await prisma.salesAgentProfile.findFirst({
+    where: {
+      tenantId,
+      OR: [{ id }, { userId: id }],
+    },
+    include: {
+      user: { select: { id: true, displayName: true, email: true, role: true } },
+    },
+  });
+
+  if (!profile) {
+    res.status(404).json({ success: false, error: 'NotFound', message: 'Team member profile not found' });
+    return;
+  }
+
+  res.json({
+    success: true,
+    data: {
+      id: profile.id,
+      userId: profile.userId,
+      role: profile.user?.role,
+      displayName: profile.user?.displayName,
+      permissions: (profile.permissions as Record<string, boolean>) || {},
+    },
+    error: null,
+  });
+});
+
+// Update permissions schema
 const updatePermissionsSchema = z.object({
   permissions: z.record(z.boolean()),
 });
 
-teamRouter.patch('/:id/permissions', requirePermissions(PERM_TEAM_MANAGE), validateBody(updatePermissionsSchema), async (req: Request, res: Response) => {
+const handleUpdatePermissions = async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const id = String(req.params.id);
   const { permissions } = req.body;
 
   const profile = await prisma.salesAgentProfile.findFirst({
-    where: { id, tenantId },
+    where: {
+      tenantId,
+      OR: [{ id }, { userId: id }],
+    },
   });
 
   if (!profile) {
@@ -486,7 +522,11 @@ teamRouter.patch('/:id/permissions', requirePermissions(PERM_TEAM_MANAGE), valid
   res.json({
     success: true,
     message: 'Team member permissions updated successfully',
-    data: { id: updated.id, permissions: updated.permissions },
+    data: { id: updated.id, userId: updated.userId, permissions: updated.permissions },
     error: null,
   });
-});
+};
+
+// PUT /:id/permissions & PATCH /:id/permissions - Direct permissions map update (accepts profile ID or user ID)
+teamRouter.patch('/:id/permissions', requirePermissions(PERM_TEAM_MANAGE), validateBody(updatePermissionsSchema), handleUpdatePermissions);
+teamRouter.put('/:id/permissions', requirePermissions(PERM_TEAM_MANAGE), validateBody(updatePermissionsSchema), handleUpdatePermissions);

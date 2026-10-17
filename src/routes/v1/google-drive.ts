@@ -236,7 +236,7 @@ export async function backupRecordingToGoogleDrive(input: {
 }
 
 // 1. GET /auth-url - Generate Google OAuth consent URL with drive.file scope
-googleDriveRouter.get('/auth-url', async (req: Request, res: Response) => {
+const handleAuthUrl = async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const clientId = process.env.GOOGLE_CLIENT_ID?.trim() || DEFAULT_GOOGLE_CLIENT_ID;
   const redirectUri = googleDriveRedirectUri(req);
@@ -277,7 +277,12 @@ googleDriveRouter.get('/auth-url', async (req: Request, res: Response) => {
     },
     error: null,
   });
-});
+};
+
+googleDriveRouter.get('/auth-url', handleAuthUrl);
+googleDriveRouter.get('/auth/url', handleAuthUrl);
+googleDriveRouter.get('/oauth/start', handleAuthUrl);
+googleDriveRouter.get('/oauth-url', handleAuthUrl);
 
 const callbackSchema = z.object({
   code: z.string().min(1, 'Authorization code is required'),
@@ -513,7 +518,7 @@ googleDriveRouter.post('/disconnect', async (req: Request, res: Response) => {
 });
 
 // 5. POST /sync-test - Test uploading a small verification file to client's Drive
-googleDriveRouter.post('/sync-test', async (req: Request, res: Response) => {
+const handleTestSync = async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const config = getTenantDriveConfig(tenantId);
 
@@ -561,4 +566,7 @@ googleDriveRouter.post('/sync-test', async (req: Request, res: Response) => {
     saveTenantDriveConfig(tenantId, config);
     res.status(502).json({ success: false, data: null, error: 'GoogleDriveWriteFailed', message: config.lastSyncError });
   }
-});
+};
+
+googleDriveRouter.post('/sync-test', handleTestSync);
+googleDriveRouter.post('/test-sync', handleTestSync);

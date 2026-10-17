@@ -8,7 +8,7 @@ import { enforceTenantIsolation } from '../../middlewares/tenant-isolation.js';
 import { requireRoles, requirePermissions, PERM_CONTACTS_VIEW } from '../../middlewares/rbac.js';
 import { validateBody, validateQuery } from '../../middlewares/validate.js';
 import { logger } from '../../lib/logger.js';
-import { normalizeLeadPhone, syncMarketingContactForLead } from '../../lib/lead-contact-sync.js';
+import { normalizeLeadPhone, syncMarketingContactForLead, deleteContactsAndLinkedLeadsTransactional } from '../../lib/lead-contact-sync.js';
 import { upsertCompanyLead } from '../../lib/lead-upsert-pipeline.js';
 import { getWorkspaceScope } from '../../lib/workspace-scope.js';
 
@@ -772,7 +772,57 @@ const handleUpdateContact = async (req: Request, res: Response) => {
 contactsRouter.put('/:id', requirePermissions(PERM_CONTACTS_VIEW), validateBody(updateContactSchema), handleUpdateContact);
 contactsRouter.patch('/:id', requirePermissions(PERM_CONTACTS_VIEW), validateBody(updateContactSchema), handleUpdateContact);
 
-// 12. DELETE /:id - Delete a contact (Admin / Manager only)
+// Schema for bulk contact deletion
+const bulkDeleteContactsSchema = z.object({
+  contactIds: z.array(z.string().min(1)).min(1, 'At least one contact ID is required for bulk deletion'),
+});
+
+// POST /bulk-delete - Transactionally delete multiple contacts and their linked Kanban leads
+contactsRouter.post('/bulk-delete', requirePermissions(PERM_CONTACTS_VIEW), requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN'), validateBody(bulkDeleteContactsSchema), async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const { contactIds } = req.body as { contactIds: string[] };
+
+  // Scope verification: enforce role/tenant visibility conditions
+  const visibilityConditions = await getContactVisibilityConditions(req, tenantId);
+  const permittedContacts = await prisma.marketingContact.findMany({
+    where: {
+      AND: [
+        ...visibilityConditions,
+        { id: { in: contactIds } },
+      ],
+    },
+    select: { id: true, leadId: true },
+  });
+
+  const permittedContactIds = permittedContacts.map((c) => c.id);
+  if (permittedContactIds.length === 0) {
+    res.status(404).json({
+      success: false,
+      error: 'NotFound',
+      message: 'No matching contacts found in your workspace scope to delete',
+    });
+    return;
+  }
+
+  const result = await deleteContactsAndLinkedLeadsTransactional(tenantId, {
+    contactIds: permittedContactIds,
+    leadIds: permittedContacts.map((c) => c.leadId).filter(Boolean) as string[],
+  });
+
+  res.json({
+    success: true,
+    message: `Successfully deleted ${result.deletedContactIds.length} contact(s) and ${result.deletedLeadIds.length} linked Kanban lead(s)`,
+    deletedContactIds: result.deletedContactIds,
+    deletedLeadIds: result.deletedLeadIds,
+    deletedContactId: result.deletedContactId,
+    deletedLeadId: result.deletedLeadId,
+    count: result.deletedContactIds.length,
+    data: result,
+    error: null,
+  });
+});
+
+// 12. DELETE /:id - Transactionally delete a contact and its linked Kanban lead (Admin / Manager only)
 contactsRouter.delete('/:id', requirePermissions(PERM_CONTACTS_VIEW), requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN'), async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const id = String(req.params.id);
@@ -786,14 +836,21 @@ contactsRouter.delete('/:id', requirePermissions(PERM_CONTACTS_VIEW), requireRol
     return;
   }
 
-  await prisma.marketingContact.delete({
-    where: { id: existing.id },
+  const result = await deleteContactsAndLinkedLeadsTransactional(tenantId, {
+    contactIds: [existing.id],
+    leadIds: existing.leadId ? [existing.leadId] : [],
   });
 
   res.json({
     success: true,
-    message: `Contact "${existing.fullName}" deleted successfully`,
-    data: { deletedId: existing.id },
+    message: `Contact "${existing.fullName}" and linked Kanban lead deleted successfully`,
+    deletedContactId: existing.id,
+    deletedLeadId: result.deletedLeadId,
+    data: {
+      deletedContactId: existing.id,
+      deletedLeadId: result.deletedLeadId,
+      deletedId: existing.id,
+    },
     error: null,
   });
 });
