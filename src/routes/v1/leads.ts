@@ -697,13 +697,6 @@ leadsRouter.get('/:id/360', async (req: Request, res: Response) => {
       body: `${payment.status}${payment.totalAmount != null ? ` · ${payment.currency} ${payment.totalAmount}` : ''}`,
       createdAt: payment.createdAt.toISOString(),
     })),
-    ...rawMessages.map((message: any, index: number) => ({
-      id: `message:${message.id || index}`,
-      kind: 'MESSAGE',
-      title: message.senderRole === 'customer' ? 'Customer message' : 'Team message',
-      body: String(message.body || '').trim() || 'Message activity recorded.',
-      createdAt: String(message.createdAt || conversation?.updatedAt || new Date().toISOString()),
-    })),
   ].sort((left, right) => String(right.createdAt).localeCompare(String(left.createdAt)));
 
   const raw360Data = {

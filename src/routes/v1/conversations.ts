@@ -97,6 +97,21 @@ const sendMessageSchema = z.object({
     .optional(),
 });
 
+function normalizePhone(value: string | null | undefined) {
+  const digits = String(value || '').replace(/\D/g, '');
+  return digits.length >= 10 ? digits.slice(-10) : digits;
+}
+
+function phoneMatchConditions(values: Array<string | null | undefined>) {
+  return Array.from(new Set(values.filter(Boolean).flatMap((value) => {
+    const raw = String(value);
+    const normalized = normalizePhone(raw);
+    return normalized.length >= 10 && normalized !== raw
+      ? [{ customerPhone: raw }, { customerPhone: { endsWith: normalized } }]
+      : [{ customerPhone: raw }];
+  })));
+}
+
 // Helper: Workspace Chat Visibility Policy ('ASSIGNED_ONLY' vs 'COMPANY_WIDE')
 async function getChatVisibilityMode(tenantId: string): Promise<'ASSIGNED_ONLY' | 'COMPANY_WIDE'> {
   const workspace = await prisma.aicloserWorkspace.findUnique({
@@ -104,7 +119,18 @@ async function getChatVisibilityMode(tenantId: string): Promise<'ASSIGNED_ONLY' 
     select: { settings: true },
   });
   const settings = (workspace?.settings as Record<string, any>) || {};
-  return (settings.chatVisibility as 'ASSIGNED_ONLY' | 'COMPANY_WIDE') || 'ASSIGNED_ONLY';
+  if (settings.chatVisibility === 'ASSIGNED_ONLY' || settings.chatVisibility === 'COMPANY_WIDE') {
+    return settings.chatVisibility;
+  }
+
+  // Keep the old workspace setting as a read fallback while all callers move
+  // to the central chat-visibility API. This prevents an existing tenant from
+  // silently reverting to ASSIGNED_ONLY after the API migration.
+  const legacySettings = await prisma.salesSettings.findUnique({
+    where: { tenantId },
+    select: { showOnlyAssignedChats: true },
+  });
+  return legacySettings?.showOnlyAssignedChats === false ? 'COMPANY_WIDE' : 'ASSIGNED_ONLY';
 }
 
 // Helper: Check detailed user access and permission (VIEW vs REPLY, Assigned vs Shared)
@@ -140,7 +166,7 @@ async function checkConversationAccess(
       assignedAgentId: { in: scope.profileIds },
       OR: [
         { conversationId: conversation.id },
-        ...(conversation.customerPhone ? [{ customerPhone: conversation.customerPhone }] : []),
+        ...phoneMatchConditions([conversation.customerPhone]),
       ],
     },
     select: { id: true },
@@ -216,7 +242,7 @@ conversationsRouter.get('/', validateQuery(listConversationsQuerySchema), async 
         OR: [
           { assignedFreelancerId: profile?.id ?? '__NO_ACCESS__' },
           ...(convIds.length > 0 ? [{ id: { in: convIds } }] : []),
-          ...(phones.length > 0 ? [{ customerPhone: { in: phones } }] : []),
+          ...phoneMatchConditions(phones),
           { payload: { path: ['sharedUserIds'], array_contains: req.user.userId } },
           ...(profile ? [{ payload: { path: ['sharedUserIds'], array_contains: profile.id } }] : []),
         ],
@@ -236,7 +262,7 @@ conversationsRouter.get('/', validateQuery(listConversationsQuerySchema), async 
       OR: [
         ...(scope.profileIds.length ? [{ assignedFreelancerId: { in: scope.profileIds } }] : []),
         ...(convIds.length ? [{ id: { in: convIds } }] : []),
-        ...(phones.length ? [{ customerPhone: { in: phones } }] : []),
+        ...phoneMatchConditions(phones),
         { payload: { path: ['sharedUserIds'], array_contains: req.user.userId } },
         ...(scope.userIds.length > 0 ? scope.userIds.map((uid) => ({ payload: { path: ['sharedUserIds'], array_contains: uid } })) : []),
       ],
@@ -289,7 +315,7 @@ conversationsRouter.get('/', validateQuery(listConversationsQuerySchema), async 
       tenantId,
       OR: [
         { conversationId: { in: convIds } },
-        { customerPhone: { in: phones } },
+        ...phoneMatchConditions(phones),
       ],
     },
     include: {
@@ -307,7 +333,7 @@ conversationsRouter.get('/', validateQuery(listConversationsQuerySchema), async 
   const leadByPhone = new Map<string, (typeof matchingLeads)[0]>();
   for (const lead of matchingLeads) {
     if (lead.conversationId) leadByConvId.set(lead.conversationId, lead);
-    if (lead.customerPhone) leadByPhone.set(lead.customerPhone, lead);
+    if (lead.customerPhone) leadByPhone.set(normalizePhone(lead.customerPhone), lead);
   }
 
   const wsSettingsForConv = await prisma.aicloserWorkspace.findUnique({
@@ -332,7 +358,7 @@ conversationsRouter.get('/', validateQuery(listConversationsQuerySchema), async 
     }
 
     const lastMsg = rawMessages.length > 0 ? rawMessages[rawMessages.length - 1] : null;
-    const lead = leadByConvId.get(c.id) || (c.customerPhone ? leadByPhone.get(c.customerPhone) : undefined);
+    const lead = leadByConvId.get(c.id) || (c.customerPhone ? leadByPhone.get(normalizePhone(c.customerPhone)) : undefined);
     const sourceChannel = c.serviceSlug ? c.serviceSlug.toUpperCase() : 'WHATSAPP';
 
     return {
@@ -446,10 +472,22 @@ const handleUpdateVisibility = async (req: Request, res: Response) => {
     settings.chatAllowAgentIntervene = allowAgentIntervene;
   }
 
-  await prisma.aicloserWorkspace.update({
-    where: { id: tenantId },
-    data: { settings, updatedAt: new Date() },
-  });
+  const showOnlyAssignedChats = visibilityMode === 'ASSIGNED_ONLY';
+  await prisma.$transaction([
+    prisma.aicloserWorkspace.update({
+      where: { id: tenantId },
+      data: { settings, updatedAt: new Date() },
+    }),
+    prisma.salesSettings.upsert({
+      where: { tenantId },
+      update: { showOnlyAssignedChats },
+      create: {
+        id: `sales-settings-${tenantId}`,
+        tenantId,
+        showOnlyAssignedChats,
+      },
+    }),
+  ]);
 
   res.json({
     success: true,
@@ -925,7 +963,7 @@ const handleAssignConversation = async (req: Request, res: Response) => {
       tenantId,
       OR: [
         { conversationId: id },
-        ...(conversation.customerPhone ? [{ customerPhone: conversation.customerPhone }] : []),
+        ...phoneMatchConditions([conversation.customerPhone]),
       ],
     },
     select: { id: true, assignedAgentId: true },
@@ -936,7 +974,7 @@ const handleAssignConversation = async (req: Request, res: Response) => {
       tenantId,
       OR: [
         { conversationId: id },
-        ...(conversation.customerPhone ? [{ customerPhone: conversation.customerPhone }] : []),
+        ...phoneMatchConditions([conversation.customerPhone]),
       ],
     },
     data: { assignedAgentId: assignedFreelancerId },
@@ -1009,7 +1047,7 @@ const handleUnassignConversation = async (req: Request, res: Response) => {
       tenantId,
       OR: [
         { conversationId: id },
-        ...(conversation.customerPhone ? [{ customerPhone: conversation.customerPhone }] : []),
+        ...phoneMatchConditions([conversation.customerPhone]),
       ],
     },
     select: { id: true, assignedAgentId: true },
@@ -1270,7 +1308,7 @@ conversationsRouter.post('/:id/shares', validateBody(createShareSchema), async (
       tenantId,
       OR: [
         { conversationId: conversation.id },
-        ...(conversation.customerPhone ? [{ customerPhone: conversation.customerPhone }] : []),
+        ...phoneMatchConditions([conversation.customerPhone]),
       ],
     },
     select: { id: true },
@@ -1404,7 +1442,7 @@ conversationsRouter.delete('/:id/shares/:userId', async (req: Request, res: Resp
       tenantId,
       OR: [
         { conversationId: conversation.id },
-        ...(conversation.customerPhone ? [{ customerPhone: conversation.customerPhone }] : []),
+        ...phoneMatchConditions([conversation.customerPhone]),
       ],
     },
     select: { id: true },
@@ -1613,7 +1651,7 @@ conversationsRouter.patch('/:id/stage', async (req: Request, res: Response) => {
       tenantId,
       OR: [
         { conversationId: id },
-        ...(conversation.customerPhone ? [{ customerPhone: conversation.customerPhone }] : []),
+        ...phoneMatchConditions([conversation.customerPhone]),
         ...(phoneSuffix ? [{ customerPhone: { endsWith: phoneSuffix } }] : []),
       ],
     },
@@ -1715,7 +1753,7 @@ conversationsRouter.post('/:id/notes', async (req: Request, res: Response) => {
       tenantId,
       OR: [
         { conversationId: id },
-        ...(conversation.customerPhone ? [{ customerPhone: conversation.customerPhone }] : []),
+        ...phoneMatchConditions([conversation.customerPhone]),
       ],
     },
     select: { id: true },
@@ -1769,7 +1807,7 @@ conversationsRouter.post('/:id/callback', async (req: Request, res: Response) =>
       tenantId,
       OR: [
         { conversationId: id },
-        ...(conversation.customerPhone ? [{ customerPhone: conversation.customerPhone }] : []),
+        ...phoneMatchConditions([conversation.customerPhone]),
       ],
     },
   });
@@ -1836,6 +1874,16 @@ conversationsRouter.post('/:id/typing', async (req: Request, res: Response) => {
   const id = String(req.params.id);
   const { isTyping } = req.body as { isTyping: boolean };
 
+  const conversation = await prisma.appConversation.findFirst({ where: { id, tenantId } });
+  if (!conversation) {
+    res.status(404).json({ success: false, error: 'NotFound', message: 'Conversation not found' });
+    return;
+  }
+  if (!(await verifyCloserAccess(req, conversation))) {
+    res.status(403).json({ success: false, error: 'Forbidden', message: 'You do not have access to this conversation' });
+    return;
+  }
+
   await persistApiRealtimeEvent({
     tenantId,
     eventType: 'chat.typing',
@@ -1857,13 +1905,23 @@ conversationsRouter.patch('/:id/transport', async (req: Request, res: Response) 
   const id = String(req.params.id);
   const { channel } = req.body as { channel: string };
 
+  const conversation = await prisma.appConversation.findFirst({ where: { id, tenantId } });
+  if (!conversation) {
+    res.status(404).json({ success: false, error: 'NotFound', message: 'Conversation not found' });
+    return;
+  }
+  if (!(await verifyCloserAccess(req, conversation))) {
+    res.status(403).json({ success: false, error: 'Forbidden', message: 'You do not have access to this conversation' });
+    return;
+  }
+
   if (!channel) {
     res.status(400).json({ success: false, error: 'InvalidRequest', message: 'channel is required' });
     return;
   }
 
   const updated = await prisma.appConversation.update({
-    where: { id },
+    where: { id: conversation.id },
     data: { serviceSlug: channel.toLowerCase() },
   });
 
@@ -1881,6 +1939,11 @@ conversationsRouter.post('/:id/ai-reply', async (req: Request, res: Response) =>
 
   if (!conversation) {
     res.status(404).json({ success: false, error: 'NotFound', message: 'Conversation not found' });
+    return;
+  }
+
+  if (!(await verifyCloserAccess(req, conversation))) {
+    res.status(403).json({ success: false, error: 'Forbidden', message: 'You do not have access to this conversation' });
     return;
   }
 
@@ -1925,6 +1988,11 @@ conversationsRouter.post('/:id/drip', async (req: Request, res: Response) => {
 
   if (!conversation) {
     res.status(404).json({ success: false, error: 'NotFound', message: 'Conversation not found' });
+    return;
+  }
+
+  if (!(await verifyCloserAccess(req, conversation))) {
+    res.status(403).json({ success: false, error: 'Forbidden', message: 'You do not have access to this conversation' });
     return;
   }
 
