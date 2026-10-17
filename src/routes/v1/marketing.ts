@@ -1,4 +1,5 @@
 import { Router, Request, Response } from 'express';
+import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { prisma } from '../../lib/prisma.js';
 import { authenticate } from '../../middlewares/auth.js';
@@ -10,6 +11,55 @@ import { logger } from '../../lib/logger.js';
 export const marketingRouter = Router();
 
 marketingRouter.use(authenticate, enforceTenantIsolation);
+
+function templateComponents(template: { variableCount: number }, variableValues?: Record<string, unknown>) {
+  const values = variableValues || {};
+  const parameters = Array.from({ length: template.variableCount }, (_, index) => ({
+    type: 'text',
+    text: String(values[String(index + 1)] || `Test ${index + 1}`),
+  }));
+  return parameters.length > 0 ? [{ type: 'body', parameters }] : [];
+}
+
+async function sendApprovedTemplateMessage(input: {
+  channel: { phoneNumberId: string; encryptedAccessToken: string | null; graphApiVersion?: string | null };
+  template: { name: string; language: string; variableCount: number };
+  recipientPhone: string;
+  variableValues?: Record<string, unknown>;
+}) {
+  const response = await fetch(
+    `https://graph.facebook.com/${input.channel.graphApiVersion || 'v22.0'}/${input.channel.phoneNumberId}/messages`,
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${input.channel.encryptedAccessToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        messaging_product: 'whatsapp',
+        recipient_type: 'individual',
+        to: input.recipientPhone.replace(/[^0-9]/g, ''),
+        type: 'template',
+        template: {
+          name: input.template.name,
+          language: { code: input.template.language },
+          components: templateComponents(input.template, input.variableValues),
+        },
+      }),
+      signal: AbortSignal.timeout(15000),
+    },
+  );
+  const payload = (await response.json().catch(() => ({}))) as Record<string, any>;
+  if (!response.ok) {
+    return {
+      ok: false as const,
+      status: response.status,
+      message: payload?.error?.error_user_msg || payload?.error?.message || 'Meta Cloud API rejected the WhatsApp template message.',
+      payload,
+    };
+  }
+  return { ok: true as const, messageId: payload.messages?.[0]?.id || null, payload };
+}
 
 // ==========================================
 // 1. WhatsApp Templates
@@ -349,7 +399,10 @@ marketingRouter.get('/campaigns', async (req: Request, res: Response) => {
 
 marketingRouter.post('/campaigns', requireRoles('ADMIN', 'SUPER_ADMIN'), async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
-  const { name, templateId, channelId, scheduledAt, variableMappings, recipientGroupIds } = req.body;
+  const { name, templateId, channelId, scheduledAt, variableMappings } = req.body;
+  const requestedGroupIds = Array.isArray(req.body?.groupIds)
+    ? req.body.groupIds
+    : (Array.isArray(req.body?.recipientGroupIds) ? req.body.recipientGroupIds : []);
 
   const channel = await prisma.whatsAppChannel.findFirst({
     where: { tenantId, ...(channelId ? { id: channelId } : {}) },
@@ -358,6 +411,35 @@ marketingRouter.post('/campaigns', requireRoles('ADMIN', 'SUPER_ADMIN'), async (
 
   if (!channel) {
     res.status(400).json({ success: false, error: 'NoChannel', message: 'No active WhatsApp channel found' });
+    return;
+  }
+
+  const template = await prisma.whatsAppTemplate.findFirst({
+    where: { id: String(templateId || ''), tenantId, channelId: channel.id },
+  });
+  if (!template) {
+    res.status(404).json({ success: false, error: 'TemplateNotFound', message: 'Selected WhatsApp template is not available on this channel.' });
+    return;
+  }
+  if (template.status !== 'APPROVED') {
+    res.status(400).json({ success: false, error: 'TemplateNotApproved', message: 'Only Meta-approved templates can be used for bulk marketing.' });
+    return;
+  }
+
+  const groupIds = requestedGroupIds.map((id: unknown) => String(id)).filter(Boolean);
+  const audienceWhere = {
+    tenantId,
+    optInStatus: 'OPTED_IN' as const,
+    isBlocked: false,
+    ...(groupIds.length > 0 ? { groupMemberships: { some: { groupId: { in: groupIds } } } } : {}),
+  };
+  const audience = await prisma.marketingContact.findMany({
+    where: audienceWhere,
+    select: { id: true, e164Phone: true },
+    orderBy: { createdAt: 'asc' },
+  });
+  if (audience.length === 0) {
+    res.status(400).json({ success: false, error: 'EmptyAudience', message: 'No opted-in, eligible contacts found for this audience.' });
     return;
   }
 
@@ -371,7 +453,17 @@ marketingRouter.post('/campaigns', requireRoles('ADMIN', 'SUPER_ADMIN'), async (
       variableMappings: variableMappings || {},
       createdById: req.user?.userId,
       status: 'DRAFT',
+      totalRecipients: audience.length,
     },
+  });
+
+  await prisma.whatsAppCampaignRecipient.createMany({
+    data: audience.map((contact) => ({
+      campaignId: campaign.id,
+      contactId: contact.id,
+      e164Phone: contact.e164Phone,
+      idempotencyKey: createHash('sha256').update(`${campaign.id}:${contact.id}`).digest('hex'),
+    })),
   });
 
   res.status(201).json({ success: true, data: campaign, error: null });
@@ -454,6 +546,15 @@ marketingRouter.post('/campaigns/:id/dispatch', requireRoles('ADMIN', 'SUPER_ADM
 
   const campaign = await prisma.whatsAppCampaign.findFirst({
     where: { id: String(id), tenantId },
+    include: {
+      template: true,
+      channel: true,
+      recipients: {
+        where: { status: 'QUEUED' },
+        include: { contact: true },
+        orderBy: { createdAt: 'asc' },
+      },
+    },
   });
 
   if (!campaign) {
@@ -461,7 +562,23 @@ marketingRouter.post('/campaigns/:id/dispatch', requireRoles('ADMIN', 'SUPER_ADM
     return;
   }
 
-  const updated = await prisma.whatsAppCampaign.update({
+  if (!campaign.channel.encryptedAccessToken || !campaign.channel.phoneNumberId) {
+    res.status(400).json({ success: false, error: 'WhatsAppNotConfigured', message: 'No active Meta WhatsApp channel token is available for this campaign.' });
+    return;
+  }
+  if (campaign.template.status !== 'APPROVED') {
+    res.status(400).json({ success: false, error: 'TemplateNotApproved', message: 'Only Meta-approved templates can be dispatched.' });
+    return;
+  }
+
+  const scheduledAt = campaign.scheduledAt?.getTime() || 0;
+  if (scheduledAt > Date.now()) {
+    const scheduled = await prisma.whatsAppCampaign.update({ where: { id: campaign.id }, data: { status: 'SCHEDULED' } });
+    res.json({ success: true, message: 'Campaign scheduled for its configured time.', data: scheduled, error: null });
+    return;
+  }
+
+  await prisma.whatsAppCampaign.update({
     where: { id: campaign.id },
     data: {
       status: 'RUNNING',
@@ -469,7 +586,78 @@ marketingRouter.post('/campaigns/:id/dispatch', requireRoles('ADMIN', 'SUPER_ADM
     },
   });
 
-  res.json({ success: true, message: 'Campaign dispatched to delivery queue', data: updated, error: null });
+  const mappings = (campaign.variableMappings && typeof campaign.variableMappings === 'object'
+    ? campaign.variableMappings
+    : {}) as Record<string, unknown>;
+  let sentCount = 0;
+  let failedCount = 0;
+
+  for (const recipient of campaign.recipients) {
+    const variableValues: Record<string, unknown> = {};
+    for (const [key, rawMapping] of Object.entries(mappings)) {
+      const mapping = rawMapping as { source?: string; fieldOrValue?: string };
+      if (mapping.source === 'static') {
+        variableValues[key] = mapping.fieldOrValue || '';
+      } else {
+        const field = mapping.fieldOrValue || 'fullName';
+        const contact = recipient.contact as Record<string, unknown>;
+        variableValues[key] = contact[field] || (field === 'phone' ? recipient.e164Phone : contact.fullName) || '';
+      }
+    }
+
+    try {
+      const sendResult = await sendApprovedTemplateMessage({
+        channel: campaign.channel,
+        template: campaign.template,
+        recipientPhone: recipient.e164Phone,
+        variableValues,
+      });
+
+      if (sendResult.ok) {
+        sentCount++;
+        await prisma.$transaction([
+          prisma.whatsAppCampaignRecipient.update({
+            where: { id: recipient.id },
+            data: { status: 'SENT', sentAt: new Date(), resolvedVariables: variableValues as any },
+          }),
+          prisma.whatsAppCampaignMessage.create({
+            data: {
+              campaignId: campaign.id,
+              recipientId: recipient.id,
+              wamid: sendResult.messageId || `pending-${campaign.id}-${recipient.id}`,
+              status: 'SENT',
+              sentAt: new Date(),
+              rawPayload: sendResult.payload,
+            },
+          }),
+        ]);
+      } else {
+        failedCount++;
+        await prisma.whatsAppCampaignRecipient.update({
+          where: { id: recipient.id },
+          data: { status: 'FAILED', failedAt: new Date(), errorMessage: sendResult.message },
+        });
+      }
+    } catch (error: unknown) {
+      failedCount++;
+      await prisma.whatsAppCampaignRecipient.update({
+        where: { id: recipient.id },
+        data: { status: 'FAILED', failedAt: new Date(), errorMessage: error instanceof Error ? error.message : 'Unknown Meta API error' },
+      });
+    }
+  }
+
+  const updated = await prisma.whatsAppCampaign.update({
+    where: { id: campaign.id },
+    data: {
+      status: failedCount > 0 && sentCount === 0 ? 'FAILED' : 'COMPLETED',
+      completedAt: new Date(),
+      sentCount,
+      failedCount,
+    },
+  });
+
+  res.json({ success: failedCount === 0, message: `Campaign dispatched: ${sentCount} sent, ${failedCount} failed.`, data: updated, error: failedCount ? 'Some recipients were rejected by Meta.' : null });
 });
 
 marketingRouter.post('/campaigns/:id/pause', requireRoles('ADMIN', 'SUPER_ADMIN'), async (req: Request, res: Response) => {
@@ -513,13 +701,94 @@ marketingRouter.post('/campaigns/:id/retry-failed', requireRoles('ADMIN', 'SUPER
 });
 
 marketingRouter.post('/channel/test-send', requireRoles('ADMIN', 'SUPER_ADMIN'), async (req: Request, res: Response) => {
-  const { recipientPhone, message } = req.body;
-  res.json({
-    success: true,
-    message: `Test message dispatched to ${recipientPhone}`,
-    data: { sentAt: new Date().toISOString(), status: 'SENT' },
-    error: null,
+  const tenantId = req.tenantId!;
+  const { testPhone, recipientPhone, templateId, channelId, variableValues } = req.body || {};
+  const targetPhone = String(testPhone || recipientPhone || '').trim();
+
+  if (!targetPhone || !templateId) {
+    res.status(400).json({
+      success: false,
+      error: 'testPhone and templateId are required',
+      message: 'Choose an approved template and enter one recipient phone number.',
+    });
+    return;
+  }
+
+  const channel = await prisma.whatsAppChannel.findFirst({
+    where: {
+      tenantId,
+      status: 'ACTIVE',
+      ...(channelId ? { id: String(channelId) } : {}),
+    },
+    orderBy: { isDefault: 'desc' },
   });
+
+  if (!channel?.encryptedAccessToken || !channel.phoneNumberId) {
+    res.status(400).json({
+      success: false,
+      error: 'WhatsAppNotConfigured',
+      message: 'No active WhatsApp Business channel with a Meta access token is configured for this workspace.',
+    });
+    return;
+  }
+
+  const template = await prisma.whatsAppTemplate.findFirst({
+    where: { id: String(templateId), tenantId, ...(channelId ? { channelId: channel.id } : {}) },
+  });
+
+  if (!template) {
+    res.status(404).json({ success: false, error: 'TemplateNotFound', message: 'The selected WhatsApp template was not found in this workspace.' });
+    return;
+  }
+
+  if (template.status !== 'APPROVED') {
+    res.status(400).json({
+      success: false,
+      error: 'TemplateNotApproved',
+      message: `Template is ${template.status}. Only Meta-approved templates can be sent outside the customer-service window.`,
+    });
+    return;
+  }
+
+  const providedVariables = (variableValues && typeof variableValues === 'object' ? variableValues : {}) as Record<string, unknown>;
+
+  try {
+    const sendResult = await sendApprovedTemplateMessage({
+      channel,
+      template,
+      recipientPhone: targetPhone,
+      variableValues: providedVariables,
+    });
+    if (!sendResult.ok) {
+      res.status(sendResult.status).json({
+        success: false,
+        error: 'MetaApiError',
+        message: sendResult.message,
+        data: sendResult.payload,
+      });
+      return;
+    }
+
+    res.json({
+      success: true,
+      message: `Test template dispatched to ${targetPhone}`,
+      data: {
+        messageId: sendResult.messageId,
+        recipientPhone: targetPhone,
+        status: 'SENT',
+        channelId: channel.id,
+        templateId: template.id,
+        sentAt: new Date().toISOString(),
+      },
+      error: null,
+    });
+  } catch (error: unknown) {
+    res.status(502).json({
+      success: false,
+      error: 'MetaGatewayError',
+      message: error instanceof Error ? error.message : 'Failed to connect to Meta WhatsApp Graph API.',
+    });
+  }
 });
 
 

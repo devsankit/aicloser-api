@@ -1,4 +1,5 @@
 import { Router, Request, Response } from 'express';
+import { Readable } from 'node:stream';
 import { z } from 'zod';
 import { prisma } from '../../lib/prisma.js';
 import { authenticate } from '../../middlewares/auth.js';
@@ -397,16 +398,91 @@ integrationsRouter.post('/whatsapp/messages', validateBody(sendWhatsAppMessageSc
 // GET /whatsapp/media/:mediaId - Proxy media download
 integrationsRouter.get('/whatsapp/media/:mediaId', async (req: Request, res: Response) => {
   const { mediaId } = req.params;
-  res.json({
-    success: true,
-    data: {
-      mediaId,
-      url: `https://lookaside.fbsbx.com/whatsapp_business/attachments/?mid=${mediaId}`,
-      mimeType: 'image/jpeg',
-      expiresIn: 3600,
+  const tenantId = req.tenantId!;
+  const requestedFileName = typeof req.query.fileName === 'string' ? req.query.fileName.trim() : '';
+  const requestedMimeType = typeof req.query.mimeType === 'string' ? req.query.mimeType.trim() : '';
+  const fileName = (requestedFileName || 'whatsapp-media').replace(/["\r\n]/g, '');
+  const range = req.headers.range;
+
+  const channel = await prisma.whatsAppChannel.findFirst({
+    where: {
+      tenantId,
+      encryptedAccessToken: { not: null },
     },
-    error: null,
+    select: {
+      encryptedAccessToken: true,
+    },
+    orderBy: [{ isDefault: 'desc' }, { updatedAt: 'desc' }],
   });
+
+  const accessToken = channel?.encryptedAccessToken?.trim();
+  if (!accessToken) {
+    res.status(503).json({
+      success: false,
+      error: 'WhatsAppNotConfigured',
+      message: 'No active WhatsApp channel is configured for this workspace.',
+    });
+    return;
+  }
+
+  try {
+    const graphApiVersion = process.env.META_GRAPH_API_VERSION || 'v22.0';
+    const metadataResponse = await fetch(
+      `https://graph.facebook.com/${graphApiVersion}/${encodeURIComponent(String(mediaId))}`,
+      {
+        headers: { Authorization: `Bearer ${accessToken}` },
+      },
+    );
+    if (!metadataResponse.ok) {
+      const details = await metadataResponse.text().catch(() => '');
+      res.status(metadataResponse.status || 502).json({
+        success: false,
+        error: 'MetaMediaMetadataError',
+        message: details || 'Unable to resolve the WhatsApp media file.',
+      });
+      return;
+    }
+
+    const metadata = (await metadataResponse.json()) as { url?: string; mime_type?: string };
+    const downloadUrl = String(metadata.url || '').trim();
+    if (!downloadUrl) {
+      res.status(502).json({ success: false, error: 'MetaMediaUrlMissing', message: 'Meta did not return a media URL.' });
+      return;
+    }
+
+    const mediaResponse = await fetch(downloadUrl, {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        ...(range ? { Range: range } : {}),
+      },
+    });
+    if (!mediaResponse.ok || !mediaResponse.body) {
+      const details = await mediaResponse.text().catch(() => '');
+      res.status(mediaResponse.status || 502).json({
+        success: false,
+        error: 'MetaMediaDownloadError',
+        message: details || 'Unable to download the WhatsApp media file.',
+      });
+      return;
+    }
+
+    const contentType = mediaResponse.headers.get('content-type') || metadata.mime_type || requestedMimeType || 'application/octet-stream';
+    res.status(mediaResponse.status === 206 ? 206 : 200);
+    res.setHeader('Cache-Control', 'private, max-age=60');
+    res.setHeader('Content-Disposition', `inline; filename="${fileName}"`);
+    res.setHeader('Content-Type', contentType);
+    for (const header of ['content-length', 'content-range', 'accept-ranges', 'etag', 'last-modified']) {
+      const value = mediaResponse.headers.get(header);
+      if (value) res.setHeader(header, value);
+    }
+    Readable.fromWeb(mediaResponse.body as any).pipe(res);
+  } catch (error: unknown) {
+    res.status(502).json({
+      success: false,
+      error: 'MetaMediaGatewayError',
+      message: error instanceof Error ? error.message : 'Failed to connect to Meta media gateway.',
+    });
+  }
 });
 
 // ==========================================

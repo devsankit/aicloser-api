@@ -782,6 +782,16 @@ conversationsRouter.post('/:id/assign', async (req: Request, res: Response) => {
   });
 
   // Also update linked lead
+  const linkedLead = await prisma.salesLeadAssignment.findFirst({
+    where: {
+      tenantId,
+      OR: [
+        { conversationId: id },
+        ...(conversation.customerPhone ? [{ customerPhone: conversation.customerPhone }] : []),
+      ],
+    },
+    select: { id: true, assignedAgentId: true },
+  });
   await prisma.salesLeadAssignment.updateMany({
     where: {
       tenantId,
@@ -792,6 +802,19 @@ conversationsRouter.post('/:id/assign', async (req: Request, res: Response) => {
     },
     data: { assignedAgentId: assignedFreelancerId },
   });
+
+  if (linkedLead) {
+    await prisma.salesActivityLog.create({
+      data: {
+        tenantId,
+        assignmentId: linkedLead.id,
+        actorUserId: user.userId,
+        action: 'LEAD_REASSIGNED',
+        note: `Lead assigned to ${assignedFreelancerName || 'team member'}`,
+        metadata: { previousAgentId: linkedLead.assignedAgentId, newAgentId: assignedFreelancerId, conversationId: id },
+      },
+    }).catch(() => undefined);
+  }
 
   await persistApiRealtimeEvent({
     tenantId,
@@ -827,6 +850,11 @@ conversationsRouter.delete('/:id/assign', requireRoles('ADMIN', 'MANAGER', 'SUPE
     data: { assignedFreelancerId: null, assignedFreelancerName: null },
   });
 
+  const linkedLead = await prisma.salesLeadAssignment.findFirst({
+    where: { tenantId, conversationId: id },
+    select: { id: true, assignedAgentId: true },
+  });
+
   // In AppConversation, assigned agent is unassigned
   // salesLeadAssignment requires assignedAgentId so we keep the lead record scoped to tenant
 
@@ -836,6 +864,19 @@ conversationsRouter.delete('/:id/assign', requireRoles('ADMIN', 'MANAGER', 'SUPE
     payload: { conversationId: id, assignedAgentId: null },
     actorUserId: req.user?.userId,
   }).catch(() => undefined);
+
+  if (linkedLead) {
+    await prisma.salesActivityLog.create({
+      data: {
+        tenantId,
+        assignmentId: linkedLead.id,
+        actorUserId: req.user?.userId,
+        action: 'LEAD_UNASSIGNED',
+        note: 'Lead removed from the assigned team member',
+        metadata: { previousAgentId: linkedLead.assignedAgentId, conversationId: id },
+      },
+    }).catch(() => undefined);
+  }
 
   res.json({ success: true, message: 'Conversation unassigned successfully', error: null });
 });
@@ -860,6 +901,17 @@ conversationsRouter.patch('/:id/stage', async (req: Request, res: Response) => {
     return;
   }
 
+  const linkedLeads = await prisma.salesLeadAssignment.findMany({
+    where: {
+      tenantId,
+      OR: [
+        { conversationId: id },
+        ...(conversation.customerPhone ? [{ customerPhone: conversation.customerPhone }] : []),
+      ],
+    },
+    select: { id: true, stage: true },
+  });
+
   const updateResult = await prisma.salesLeadAssignment.updateMany({
     where: {
       tenantId,
@@ -873,6 +925,17 @@ conversationsRouter.patch('/:id/stage', async (req: Request, res: Response) => {
       stageChangedAt: new Date(),
     },
   });
+
+  await Promise.all(linkedLeads.map((linkedLead) => prisma.salesActivityLog.create({
+    data: {
+      tenantId,
+      assignmentId: linkedLead.id,
+      actorUserId: req.user?.userId,
+      action: 'LEAD_STAGE_CHANGED',
+      note: `Lead stage changed from ${linkedLead.stage} to ${stage}`,
+      metadata: { previousStage: linkedLead.stage, newStage: stage, conversationId: id },
+    },
+  }).catch(() => undefined)));
 
   await persistApiRealtimeEvent({
     tenantId,
@@ -984,7 +1047,35 @@ conversationsRouter.post('/:id/callback', async (req: Request, res: Response) =>
     },
   });
 
-  res.status(201).json({ success: true, data: { leadId: lead.id, followUpAt: parsedDate, task }, error: null });
+  const scheduledAt = parsedDate.toISOString();
+  const reminderAt = new Date(parsedDate.getTime() - 5 * 60_000).toISOString();
+  await prisma.salesActivityLog.create({
+    data: {
+      tenantId,
+      assignmentId: lead.id,
+      actorUserId: req.user?.userId,
+      action: 'CALLBACK_SCHEDULED',
+      note: note?.trim() || `Callback scheduled for ${scheduledAt}`,
+      metadata: { followUpAt: scheduledAt, reminderAt, conversationId: id },
+    },
+  }).catch(() => undefined);
+  res.status(201).json({
+    success: true,
+    data: {
+      leadId: lead.id,
+      conversationId: id,
+      followUpAt: scheduledAt,
+      task,
+      mobileReminder: {
+        type: 'CALLBACK_REMINDER',
+        triggerAt: reminderAt,
+        title: 'Callback in 5 minutes',
+        message: `${conversation.customerName || conversation.customerPhone || 'Lead'} callback is scheduled for ${scheduledAt}.`,
+        deepLinkUrl: `aicloser://conversations/${encodeURIComponent(id)}`,
+      },
+    },
+    error: null,
+  });
 });
 
 // 11. POST /:id/typing - Broadcast typing state

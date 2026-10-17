@@ -96,3 +96,24 @@ export async function getRecordingPlayback(input: { objectKey: string; contentTy
 
   return { mode: 'local' as const, bytes: await readFile(localPath(input.objectKey)), contentType: input.contentType ?? 'application/octet-stream' };
 }
+
+/**
+ * Read a recording into memory for a downstream integration such as Google Drive.
+ * This intentionally keeps the storage driver hidden from callers: local files
+ * are read directly and S3 recordings are fetched through a short-lived signed URL.
+ */
+export async function readRecordingBytes(input: { objectKey: string; contentType?: string | null }) {
+  const playback = await getRecordingPlayback(input);
+  if (playback.mode === 'local') {
+    return { bytes: playback.bytes, contentType: playback.contentType };
+  }
+
+  const response = await fetch(playback.url);
+  if (!response.ok) {
+    throw new Error(`Recording download failed with status ${response.status}`);
+  }
+  return {
+    bytes: Buffer.from(await response.arrayBuffer()),
+    contentType: input.contentType ?? response.headers.get('content-type') ?? 'application/octet-stream',
+  };
+}

@@ -6,6 +6,7 @@ import { enforceTenantIsolation } from '../../middlewares/tenant-isolation.js';
 import { hasPermission, PERM_RECORDINGS_PLAY_ALL } from '../../middlewares/rbac.js';
 import { validateBody } from '../../middlewares/validate.js';
 import { createRecordingUploadUrl, getRecordingPlayback, recordingExists, recordingStorageMode, writeRecording } from '../../lib/recording-storage.js';
+import { backupRecordingToGoogleDrive } from './google-drive.js';
 
 export const recordingsRouter = express.Router();
 recordingsRouter.use(authenticate, enforceTenantIsolation);
@@ -27,7 +28,10 @@ recordingsRouter.post('/init', validateBody(initSchema), async (req: Request, re
   const tenantId = req.tenantId!;
   const input = req.body as z.infer<typeof initSchema>;
   const call = await prisma.salesMobileCall.findFirst({
-    where: { id: input.callId, tenantId },
+    where: {
+      tenantId,
+      OR: [{ id: input.callId }, { clientCallId: input.callId }],
+    },
     select: { id: true, tenantId: true, agentId: true },
   });
 
@@ -143,7 +147,14 @@ recordingsRouter.post('/:id/complete', validateBody(z.object({ checksum: z.strin
     });
     return saved;
   });
-  res.json({ success: true, data: completed });
+  const driveBackup = await backupRecordingToGoogleDrive({
+    tenantId,
+    objectKey: upload.objectKey,
+    callId: upload.callId,
+    mimeType: upload.mimeType,
+    fileName: `call-${upload.callId}.${(upload.mimeType || 'audio/mp4').split('/')[1]?.split(';')[0] || 'bin'}`,
+  });
+  res.json({ success: true, data: { ...completed, driveBackup } });
 });
 
 recordingsRouter.get('/:id/playback', async (req: Request, res: Response) => {

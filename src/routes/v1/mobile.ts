@@ -356,6 +356,151 @@ mobileRouter.post('/bootstrap', validateBody(bootstrapSchema), async (req: Reque
   });
 });
 
+// GET /mobile/callbacks - Agent-scoped callback schedule for mobile reminders
+mobileRouter.get('/callbacks', async (req: Request, res: Response) => {
+  const agent = await agentForRequest(req).catch(() => null);
+  if (!agent) {
+    res.status(403).json({ success: false, error: 'Forbidden', message: 'Active sales agent profile required' });
+    return;
+  }
+
+  const requestedLimit = Number(req.query.limit ?? 100);
+  const limit = Number.isFinite(requestedLimit) ? Math.min(Math.max(Math.trunc(requestedLimit), 1), 200) : 100;
+  const from = typeof req.query.from === 'string' && req.query.from ? new Date(req.query.from) : new Date(0);
+  const to = typeof req.query.to === 'string' && req.query.to ? new Date(req.query.to) : new Date('2999-12-31T23:59:59.999Z');
+  if (Number.isNaN(from.getTime()) || Number.isNaN(to.getTime())) {
+    res.status(400).json({ success: false, error: 'InvalidRequest', message: 'from and to must be valid ISO date strings' });
+    return;
+  }
+
+  const assignments = await prisma.salesLeadAssignment.findMany({
+    where: {
+      tenantId: req.tenantId!,
+      assignedAgentId: agent.id,
+      followUpAt: { gte: from, lte: to },
+    },
+    orderBy: { followUpAt: 'asc' },
+    take: limit,
+    select: {
+      id: true,
+      conversationId: true,
+      customerName: true,
+      customerPhone: true,
+      stage: true,
+      notes: true,
+      followUpAt: true,
+      updatedAt: true,
+    },
+  });
+
+  res.json({
+    success: true,
+    data: {
+      callbacks: assignments.map((assignment) => ({
+        id: assignment.id,
+        conversationId: assignment.conversationId,
+        customerName: assignment.customerName,
+        customerPhone: assignment.customerPhone,
+        stage: assignment.stage,
+        note: assignment.notes ?? '',
+        scheduledAt: assignment.followUpAt?.toISOString() ?? null,
+        reminderAt: assignment.followUpAt
+          ? new Date(assignment.followUpAt.getTime() - 5 * 60_000).toISOString()
+          : null,
+        state: assignment.followUpAt && assignment.followUpAt.getTime() <= Date.now() ? 'due' : 'scheduled',
+        deepLinkUrl: assignment.conversationId
+          ? `aicloser://conversations/${encodeURIComponent(assignment.conversationId)}`
+          : 'aicloser://dashboard',
+        updatedAt: assignment.updatedAt.toISOString(),
+      })),
+    },
+    error: null,
+  });
+});
+
+
+// GET /mobile/push-config - Firebase WebPush/VAPID public configuration
+mobileRouter.get('/push-config', async (req: Request, res: Response) => {
+  res.json({
+    success: true,
+    data: {
+      vapidKey: process.env.FIREBASE_VAPID_KEY || process.env.NEXT_PUBLIC_FIREBASE_VAPID_KEY || '',
+      config: {
+        apiKey: process.env.FIREBASE_API_KEY || process.env.NEXT_PUBLIC_FIREBASE_API_KEY || '',
+        authDomain: process.env.FIREBASE_AUTH_DOMAIN || '',
+        projectId: process.env.FIREBASE_PROJECT_ID || '',
+        storageBucket: process.env.FIREBASE_STORAGE_BUCKET || '',
+        messagingSenderId: process.env.FIREBASE_MESSAGING_SENDER_ID || '',
+        appId: process.env.FIREBASE_APP_ID || process.env.NEXT_PUBLIC_FIREBASE_APP_ID || '',
+      },
+    },
+    error: null,
+  });
+});
+
+// GET /mobile/notifications - Unread/inbox notifications for the mobile app
+mobileRouter.get('/notifications', async (req: Request, res: Response) => {
+  const userId = req.user!.userId;
+  const unreadOnly = String(req.query.unreadOnly ?? '').toLowerCase() === 'true';
+  const requestedLimit = Number(req.query.limit ?? 50);
+  const limit = Number.isFinite(requestedLimit) ? Math.min(Math.max(Math.trunc(requestedLimit), 1), 100) : 50;
+  const where = {
+    userId,
+    ...(req.tenantId ? { tenantId: req.tenantId } : {}),
+    ...(unreadOnly ? { status: 'UNREAD' } : {}),
+  };
+  const [notifications, unread] = await Promise.all([
+    prisma.appNotification.findMany({
+      where,
+      orderBy: { createdAt: 'desc' },
+      take: limit,
+    }),
+    prisma.appNotification.count({ where: { userId, ...(req.tenantId ? { tenantId: req.tenantId } : {}), status: 'UNREAD' } }),
+  ]);
+
+  res.json({
+    success: true,
+    data: {
+      unread,
+      notifications: notifications.map((notification) => ({
+        id: notification.id,
+        type: notification.type,
+        title: notification.title,
+        message: notification.message,
+        status: notification.status,
+        entityType: notification.entityType,
+        entityId: notification.entityId,
+        metadata: notification.metadata,
+        createdAt: notification.createdAt.toISOString(),
+        readAt: notification.readAt?.toISOString() ?? null,
+      })),
+    },
+    error: null,
+  });
+});
+
+// POST /mobile/notifications/:id/read - Mark one mobile notification read
+mobileRouter.post('/notifications/:id/read', async (req: Request, res: Response) => {
+  const id = String(req.params.id);
+  const notification = await prisma.appNotification.findFirst({
+    where: { id, userId: req.user!.userId, ...(req.tenantId ? { tenantId: req.tenantId } : {}) },
+  });
+  if (!notification) {
+    res.status(404).json({ success: false, error: 'NotFound', message: 'Notification not found' });
+    return;
+  }
+
+  const updated = await prisma.appNotification.update({
+    where: { id: notification.id },
+    data: { status: 'READ', readAt: new Date() },
+  });
+  res.json({
+    success: true,
+    data: { id: updated.id, status: updated.status, readAt: updated.readAt?.toISOString() ?? null },
+    error: null,
+  });
+});
+
 const pushTokenSchema = z.object({
   token: z.string().min(10).max(500),
   platform: z.enum(['android', 'ios']).default('android'),

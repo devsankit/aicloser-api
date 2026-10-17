@@ -4,6 +4,7 @@ import { z } from 'zod';
 import { randomUUID } from 'crypto';
 import { prisma } from '../../lib/prisma.js';
 import { authenticate } from '../../middlewares/auth.js';
+import { requireRoles } from '../../middlewares/rbac.js';
 import { enforceTenantIsolation } from '../../middlewares/tenant-isolation.js';
 import { validateBody, validateQuery } from '../../middlewares/validate.js';
 import { UpiPaymentDurationUnit, UpiPaymentLinkStatus } from '@prisma/client';
@@ -27,7 +28,70 @@ const createPaymentSchema = z.object({
   amount: z.number().positive('Amount must be positive'),
   productName: z.string().optional().default('CRM License / Consultation'),
   customerNote: z.string().optional(),
-  upiId: z.string().optional().default('aicloser@upi'),
+  upiId: z.string().optional(),
+});
+
+const paymentSettingsSchema = z.object({
+  enabled: z.boolean().optional(),
+  upiId: z.string().max(120).nullable().optional(),
+  payeeName: z.string().max(120).nullable().optional(),
+  instructions: z.string().max(1000).nullable().optional(),
+  qrBrandName: z.string().max(100).nullable().optional(),
+  qrAccentColor: z.string().regex(/^#[0-9a-f]{6}$/i, 'QR accent color must be a valid hex color.').optional(),
+  qrLogoDataUrl: z.string().max(280_000).regex(/^data:image\/(png|jpeg|jpg|webp);base64,/i, 'QR logo must be a PNG, JPG, or WebP image.').nullable().optional(),
+});
+
+paymentsRouter.get('/settings', requireRoles('ADMIN', 'SUPER_ADMIN'), async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const settings = await prisma.upiPaymentSetting.upsert({
+    where: { tenantId },
+    update: {},
+    create: { tenantId, createdByUserId: req.user?.userId },
+  });
+
+  res.json({ success: true, data: settings, error: null });
+});
+
+paymentsRouter.put('/settings', requireRoles('ADMIN', 'SUPER_ADMIN'), validateBody(paymentSettingsSchema), async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const body = req.body as z.infer<typeof paymentSettingsSchema>;
+  const current = await prisma.upiPaymentSetting.findUnique({ where: { tenantId } });
+  const enabled = body.enabled ?? current?.enabled ?? false;
+  const upiId = body.upiId === undefined ? current?.upiId ?? null : body.upiId;
+  const payeeName = body.payeeName === undefined ? current?.payeeName ?? null : body.payeeName;
+
+  if (enabled && (!upiId || !payeeName)) {
+    res.status(400).json({ success: false, error: 'UPI ID and payee name are required when payment collection is enabled.' });
+    return;
+  }
+
+  const settings = await prisma.upiPaymentSetting.upsert({
+    where: { tenantId },
+    update: {
+      enabled,
+      upiId,
+      payeeName,
+      ...(body.instructions !== undefined ? { instructions: body.instructions } : {}),
+      ...(body.qrBrandName !== undefined ? { qrBrandName: body.qrBrandName } : {}),
+      ...(body.qrAccentColor !== undefined ? { qrAccentColor: body.qrAccentColor } : {}),
+      ...(body.qrLogoDataUrl !== undefined ? { qrLogoDataUrl: body.qrLogoDataUrl } : {}),
+      updatedByUserId: req.user?.userId,
+    },
+    create: {
+      tenantId,
+      enabled,
+      upiId,
+      payeeName,
+      instructions: body.instructions ?? null,
+      qrBrandName: body.qrBrandName ?? null,
+      qrAccentColor: body.qrAccentColor ?? '#ff5a1f',
+      qrLogoDataUrl: body.qrLogoDataUrl ?? null,
+      createdByUserId: req.user?.userId,
+      updatedByUserId: req.user?.userId,
+    },
+  });
+
+  res.json({ success: true, data: settings, error: null });
 });
 
 paymentsRouter.get('/', validateQuery(listPaymentsQuerySchema), async (req: Request, res: Response) => {
@@ -107,6 +171,9 @@ paymentsRouter.post('/', validateBody(createPaymentSchema), async (req: Request,
   const tenantId = req.tenantId!;
   const body = req.body as z.infer<typeof createPaymentSchema>;
   const publicToken = randomUUID().replace(/-/g, '').slice(0, 16);
+  const paymentSettings = await prisma.upiPaymentSetting.findUnique({ where: { tenantId } });
+  const upiId = body.upiId || paymentSettings?.upiId || 'aicloser@upi';
+  const payeeName = paymentSettings?.payeeName || 'AI Closer CRM';
 
   const payment = await prisma.upiPaymentLink.create({
     data: {
@@ -119,8 +186,8 @@ paymentsRouter.post('/', validateBody(createPaymentSchema), async (req: Request,
       durationUnit: UpiPaymentDurationUnit.DAY,
       durationMultiplier: 1,
       currency: 'INR',
-      upiIdSnapshot: body.upiId,
-      payeeNameSnapshot: 'AI Closer CRM',
+      upiIdSnapshot: upiId,
+      payeeNameSnapshot: payeeName,
       customerName: body.customerName,
       customerPhone: body.customerPhone,
       customerEmail: body.customerEmail,

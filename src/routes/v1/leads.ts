@@ -552,7 +552,7 @@ leadsRouter.get('/:id/360', async (req: Request, res: Response) => {
   const lead = check.lead;
 
   // 2. Fetch all child resources strictly isolated to this verified lead
-  const [timeline, tasks, calls, customFieldsDef] = await Promise.all([
+  const [timeline, tasks, calls, customFieldsDef, activityLogs] = await Promise.all([
     prisma.salesLeadTimelineEntry.findMany({
       where: { leadId: lead.id, tenantId },
       orderBy: { createdAt: 'desc' },
@@ -569,6 +569,14 @@ leadsRouter.get('/:id/360', async (req: Request, res: Response) => {
     prisma.customFieldDefinition.findMany({
       where: { tenantId },
       orderBy: { createdAt: 'asc' },
+    }),
+    prisma.salesActivityLog.findMany({
+      where: { assignmentId: lead.id, tenantId },
+      orderBy: { createdAt: 'desc' },
+      take: 100,
+      include: {
+        actor: { select: { displayName: true, email: true } },
+      },
     }),
   ]);
 
@@ -627,6 +635,65 @@ leadsRouter.get('/:id/360', async (req: Request, res: Response) => {
     ? (conversation!.payload as any).messages
     : [];
   const lastMessage = rawMessages.length > 0 ? rawMessages[rawMessages.length - 1] : null;
+  const humanizeHistoryAction = (value: string) => value
+    .replace(/^LEAD_/, '')
+    .replace(/^CALL_/, 'Call ')
+    .replace(/^MOBILE_/, 'Mobile ')
+    .replace(/_/g, ' ')
+    .toLowerCase()
+    .replace(/\b\w/g, (character) => character.toUpperCase());
+  const history: Array<Record<string, unknown>> = [
+    ...timeline.map((entry) => ({
+      id: `timeline:${entry.id}`,
+      kind: entry.type || 'NOTE',
+      title: entry.type === 'NOTE' ? 'Note added' : humanizeHistoryAction(entry.type),
+      body: entry.body,
+      createdAt: entry.createdAt.toISOString(),
+    })),
+    ...activityLogs.map((entry) => ({
+      id: `activity:${entry.id}`,
+      kind: 'ACTIVITY',
+      title: humanizeHistoryAction(entry.action),
+      body: entry.note || humanizeHistoryAction(entry.action),
+      createdAt: entry.createdAt.toISOString(),
+      actorName: entry.actor?.displayName || entry.actor?.email || null,
+      metadata: entry.metadata,
+    })),
+    ...tasks.map((task) => ({
+      id: `task:${task.id}`,
+      kind: 'CALLBACK',
+      title: task.title || 'Follow-up scheduled',
+      body: task.description || 'Follow-up task created for this lead.',
+      createdAt: task.createdAt.toISOString(),
+      dueAt: task.dueAt.toISOString(),
+      status: task.status,
+    })),
+    ...enrichedCalls.map((call) => ({
+      id: `call:${call.id}`,
+      kind: 'CALL',
+      title: `${call.direction === 'INBOUND' ? 'Incoming' : 'Outgoing'} call`,
+      body: [
+        call.outcome,
+        call.note,
+        call.durationSeconds != null ? `${call.durationSeconds}s` : null,
+      ].filter(Boolean).join(' · ') || 'Call activity recorded.',
+      createdAt: call.startedAt.toISOString(),
+    })),
+    ...payments.map((payment) => ({
+      id: `payment:${payment.id}`,
+      kind: 'PAYMENT',
+      title: 'Payment request updated',
+      body: `${payment.status}${payment.totalAmount != null ? ` · ${payment.currency} ${payment.totalAmount}` : ''}`,
+      createdAt: payment.createdAt.toISOString(),
+    })),
+    ...rawMessages.map((message: any, index: number) => ({
+      id: `message:${message.id || index}`,
+      kind: 'MESSAGE',
+      title: message.senderRole === 'customer' ? 'Customer message' : 'Team message',
+      body: String(message.body || '').trim() || 'Message activity recorded.',
+      createdAt: String(message.createdAt || conversation?.updatedAt || new Date().toISOString()),
+    })),
+  ].sort((left, right) => String(right.createdAt).localeCompare(String(left.createdAt)));
 
   const raw360Data = {
     lead,
@@ -639,6 +706,8 @@ leadsRouter.get('/:id/360', async (req: Request, res: Response) => {
     } : null,
     timelineNotes: timeline,
     timeline,
+    activityLogs,
+    history,
     tasks,
     callLogs: enrichedCalls,
     calls: enrichedCalls,
@@ -855,6 +924,45 @@ leadsRouter.patch('/:id', validateBody(updateLeadSchema), async (req: Request, r
       ...(body.followUpAt !== undefined ? { followUpAt: body.followUpAt ? new Date(body.followUpAt) : null } : {}),
     },
   });
+
+  const leadHistoryWrites: Promise<unknown>[] = [];
+  if (body.stage !== undefined && body.stage !== existing.stage) {
+    leadHistoryWrites.push(prisma.salesActivityLog.create({
+      data: {
+        tenantId,
+        assignmentId: existing.id,
+        actorUserId: req.user?.userId,
+        action: 'LEAD_STAGE_CHANGED',
+        note: `Lead stage changed from ${existing.stage} to ${body.stage}`,
+        metadata: { previousStage: existing.stage, newStage: body.stage },
+      },
+    }));
+  }
+  if (targetAgentId) {
+    leadHistoryWrites.push(prisma.salesActivityLog.create({
+      data: {
+        tenantId,
+        assignmentId: existing.id,
+        actorUserId: req.user?.userId,
+        action: 'LEAD_REASSIGNED',
+        note: `Lead reassigned to ${targetAgentId}`,
+        metadata: { previousAgentId: existing.assignedAgentId, newAgentId: targetAgentId },
+      },
+    }));
+  }
+  if (body.followUpAt !== undefined) {
+    leadHistoryWrites.push(prisma.salesActivityLog.create({
+      data: {
+        tenantId,
+        assignmentId: existing.id,
+        actorUserId: req.user?.userId,
+        action: body.followUpAt ? 'CALLBACK_SCHEDULED' : 'CALLBACK_CLEARED',
+        note: body.followUpAt ? `Callback scheduled for ${body.followUpAt}` : 'Callback cleared',
+        metadata: { followUpAt: body.followUpAt },
+      },
+    }));
+  }
+  await Promise.all(leadHistoryWrites).catch(() => undefined);
 
   await persistApiRealtimeEvent({
     tenantId,

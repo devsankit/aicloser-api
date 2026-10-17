@@ -1,3 +1,5 @@
+import fs from 'node:fs';
+import path from 'node:path';
 import { maskPhoneNumber, isPhoneMaskingRequired } from '../../lib/phone-mask.js';
 import { Router, Request, Response } from 'express';
 import { z } from 'zod';
@@ -19,8 +21,11 @@ callsRouter.use(authenticate, enforceTenantIsolation);
 async function resolveCallRecording(callId: string, req: Request) {
   const tenantId = req.tenantId!;
   const call = await prisma.salesMobileCall.findFirst({
-    where: { id: callId, tenantId },
-    select: { id: true, tenantId: true, agentId: true, recordingStatus: true },
+    where: {
+      tenantId,
+      OR: [{ id: callId }, { clientCallId: callId }],
+    },
+    select: { id: true, tenantId: true, agentId: true, recordingStatus: true, recordingPath: true, recordingMimeType: true },
   });
 
   if (!call) {
@@ -68,10 +73,38 @@ async function sendCallRecording(req: Request, res: Response) {
   } catch (error) {
     const code = error && typeof error === 'object' && 'code' in error ? String((error as { code?: unknown }).code) : '';
     if (code === 'ENOENT') {
-      res.status(404).json({ success: false, error: 'RecordingFileNotFound', message: 'Recording metadata exists but the audio file is unavailable' });
-      return;
+      const legacyPaths = [
+        process.env.LEGACY_RECORDING_STORAGE_PATH,
+        '/var/www/aicloser-app/data/uploads/sales-recordings',
+        path.resolve(process.cwd(), '../aicloser-app/data/uploads/sales-recordings'),
+        path.resolve(process.cwd(), '../application/data/uploads/sales-recordings'),
+      ].filter(Boolean) as string[];
+
+      let foundBytes: Buffer | null = null;
+      if (result.call.recordingPath) {
+        const baseName = path.basename(result.call.recordingPath);
+        for (const dir of legacyPaths) {
+          const candidate = path.join(dir, baseName);
+          if (fs.existsSync(candidate)) {
+            foundBytes = await fs.promises.readFile(candidate);
+            break;
+          }
+        }
+      }
+
+      if (foundBytes) {
+        playback = {
+          mode: 'local' as const,
+          bytes: foundBytes,
+          contentType: result.upload.mimeType || result.call.recordingMimeType || 'audio/mp4',
+        };
+      } else {
+        res.status(404).json({ success: false, error: 'RecordingFileNotFound', message: 'Recording metadata exists but the audio file is unavailable' });
+        return;
+      }
+    } else {
+      throw error;
     }
-    throw error;
   }
   if (playback.mode === 's3') {
     res.json({ success: true, data: { url: playback.url, expiresIn: 300, callId: result.call.id, recordingUploadId: result.upload.id } });
