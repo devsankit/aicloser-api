@@ -1,4 +1,5 @@
 import { prisma } from './prisma.js';
+import { persistApiRealtimeEvent } from './realtime.js';
 
 export function normalizeLeadPhone(raw?: string | null): string | null {
   if (!raw) return null;
@@ -165,17 +166,11 @@ export async function deleteContactsAndLinkedLeadsTransactional(
   await prisma.$transaction(async (tx) => {
     // A. Clean up child records and references for all target leads
     if (finalLeadIds.length > 0) {
-      // Unlink pool items so foreign key constraint is not violated and pool items can be claimed again if needed
-      await tx.salesLeadPoolItem.updateMany({
+      // A deleted customer must not reappear as an open, claimable pool item.
+      await tx.salesLeadPoolItem.deleteMany({
         where: {
           tenantId,
           convertedAssignmentId: { in: finalLeadIds },
-        },
-        data: {
-          convertedAssignmentId: null,
-          status: 'OPEN',
-          claimedByAgentId: null,
-          claimedAt: null,
         },
       });
 
@@ -246,6 +241,7 @@ export async function deleteContactsAndLinkedLeadsTransactional(
     }
   });
 
+  await persistApiRealtimeEvent({ tenantId, eventType: 'lead.deleted', payload: { deletedContactIds: finalContactIds, deletedLeadIds: finalLeadIds } }).catch(() => undefined);
   return {
     deletedContactIds: finalContactIds,
     deletedLeadIds: finalLeadIds,

@@ -720,8 +720,16 @@ const handleUpdateContact = async (req: Request, res: Response) => {
   const body = req.body;
   const updateData: Prisma.MarketingContactUpdateInput = {};
 
+  if (body.e164Phone !== undefined && normalizeLeadPhone(body.e164Phone) !== normalizeLeadPhone(existing.e164Phone)) {
+    res.status(400).json({
+      success: false,
+      error: 'ContactPhoneImmutable',
+      message: 'The contact phone number cannot be changed after creation.',
+    });
+    return;
+  }
+
   if (body.fullName) updateData.fullName = body.fullName;
-  if (body.e164Phone) updateData.e164Phone = body.e164Phone.replace(/[\s-]/g, '');
   if (body.email !== undefined) updateData.email = body.email;
   if (body.tags) updateData.tags = body.tags;
   if (body.customFields) updateData.customFields = body.customFields;

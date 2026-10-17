@@ -536,22 +536,24 @@ async function verifyLeadAccess(leadId: string, req: Request) {
 
   if (!lead) return { ok: false as const, status: 404, error: 'NotFound', message: 'Lead not found in this workspace' };
 
-  // Closer scoping: SALES_AGENT can only access leads assigned to them
-  if (user.role === 'SALES_AGENT') {
-    const profile = await prisma.salesAgentProfile.findFirst({
-      where: { userId: user.userId, tenantId },
-      select: { id: true },
-    });
-    if (!profile || lead.assignedAgentId !== profile.id) {
-      return { ok: false as const, status: 403, error: 'Forbidden', message: 'You are not authorized to access this lead' };
+  if (user.role !== 'ADMIN' && user.role !== 'SUPER_ADMIN') {
+    const scope = await getWorkspaceScope(tenantId, user);
+    let allowed = Boolean(lead.assignedAgentId && scope.profileIds.includes(lead.assignedAgentId));
+    if (!allowed && lead.conversationId) {
+      const conversation = await prisma.appConversation.findFirst({ where: { id: lead.conversationId, tenantId }, select: { payload: true } });
+      const payload = conversation?.payload as { shares?: Array<{ userId: string; agentProfileId?: string; permission?: string; revokedAt?: string }> } | null;
+      allowed = Boolean(payload?.shares?.some((share) => !share.revokedAt &&
+        (share.userId === user.userId || Boolean(share.agentProfileId && scope.profileIds.includes(share.agentProfileId))) &&
+        (req.method === 'GET' || req.method === 'HEAD' || share.permission === 'REPLY')));
     }
+    if (!allowed) return { ok: false as const, status: 403, error: 'Forbidden', message: 'You are not authorized to access this lead' };
   }
 
   return { ok: true as const, lead };
 }
 
 // GET /:id/360 - Unified Lead 360 view
-leadsRouter.get('/:id/360', async (req: Request, res: Response) => {
+export async function getLead360(req: Request, res: Response) {
   const tenantId = req.tenantId!;
   const id = String(req.params.id);
 
@@ -764,7 +766,9 @@ leadsRouter.get('/:id/360', async (req: Request, res: Response) => {
     data: raw360Data,
     error: null,
   });
-});
+}
+
+leadsRouter.get('/:id/360', getLead360);
 
 leadsRouter.get('/:id', async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
@@ -853,14 +857,12 @@ leadsRouter.patch('/:id', validateBody(updateLeadSchema), async (req: Request, r
   }
 
   // First verify lead exists in this tenant
-  const existing = await prisma.salesLeadAssignment.findFirst({
-    where: { id, tenantId },
-  });
-
-  if (!existing) {
-    res.status(404).json({ success: false, error: 'NotFound', message: 'Lead not found in this workspace' });
+  const access = await verifyLeadAccess(id, req);
+  if (!access.ok) {
+    res.status(access.status).json({ success: false, error: access.error, message: access.message });
     return;
   }
+  const existing = access.lead;
 
   // The phone is the tenant-scoped lead identity key. It can be set when the
   // lead is created, but changing it would silently detach conversations,

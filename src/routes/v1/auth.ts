@@ -181,7 +181,8 @@ authRouter.get('/me', authenticate, async (req: Request, res: Response) => {
     },
   }) : null;
 
-  const freshPermissions = (dbUser?.salesAgentProfile?.permissions as Record<string, boolean>) || {};
+  const rolePermissions = (dbUser?.AicloserWorkspace?.settings as { rolePermissions?: Record<string, Record<string, boolean>> } | null)?.rolePermissions?.[dbUser?.role || 'SALES_AGENT'] || {};
+  const freshPermissions = { ...rolePermissions, ...((dbUser?.salesAgentProfile?.permissions as Record<string, boolean>) || {}) };
 
   res.json({
     success: true,

@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { prisma } from '../../lib/prisma.js';
 import { authenticate } from '../../middlewares/auth.js';
 import { enforceTenantIsolation } from '../../middlewares/tenant-isolation.js';
-import { requirePermissions, PERM_TEAM_VIEW, PERM_TEAM_MANAGE } from '../../middlewares/rbac.js';
+import { requirePermissions, requireRoles, PERM_TEAM_VIEW, PERM_TEAM_MANAGE } from '../../middlewares/rbac.js';
 import { validateBody } from '../../middlewares/validate.js';
 import { SalesAgentStatus } from '@prisma/client';
 
@@ -302,14 +302,33 @@ teamRouter.get('/permissions/matrix', async (req: Request, res: Response) => {
     },
   };
 
+  const workspace = await prisma.aicloserWorkspace.findUnique({ where: { id: req.tenantId! }, select: { settings: true } });
+  const saved = (workspace?.settings as { rolePermissions?: Record<string, Record<string, boolean>> } | null)?.rolePermissions || {};
   res.json({
     success: true,
     data: {
       catalog: permissionsCatalog,
-      roleDefaults,
+      roleDefaults: Object.fromEntries(Object.entries(roleDefaults).map(([role, defaults]) => [role, { ...defaults, ...(saved[role] || {}) }])),
     },
     error: null,
   });
+});
+
+teamRouter.put('/permissions/matrix', requireRoles('ADMIN', 'SUPER_ADMIN'), validateBody(z.object({
+  roles: z.object({ ADMIN: z.record(z.boolean()).optional(), MANAGER: z.record(z.boolean()).optional(), SALES_AGENT: z.record(z.boolean()).optional() }),
+})), async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const { roles } = req.body as { roles: Record<string, Record<string, boolean>> };
+  await prisma.$transaction(async (tx) => {
+    const workspace = await tx.aicloserWorkspace.findUniqueOrThrow({ where: { id: tenantId }, select: { settings: true } });
+    const settings = (workspace.settings as Record<string, unknown>) || {};
+    const previous = (settings.rolePermissions as Record<string, Record<string, boolean>>) || {};
+    await tx.aicloserWorkspace.update({ where: { id: tenantId }, data: { settings: { ...settings, rolePermissions: { ...previous, ...roles } } } });
+    for (const role of ['ADMIN', 'MANAGER', 'SALES_AGENT'] as const) {
+      if (roles[role]) await tx.salesAgentProfile.updateMany({ where: { tenantId, user: { role } }, data: { permissions: roles[role] } });
+    }
+  });
+  res.json({ success: true, data: { saved: true, roles }, error: null });
 });
 
 // PATCH /:id/manager - Assign agent under a reporting manager

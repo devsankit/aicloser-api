@@ -14,6 +14,7 @@ import { requireRoles, hasPermission, PERM_LEADS_REASSIGN } from '../../middlewa
 import { persistApiRealtimeEvent } from '../../lib/realtime.js';
 import { getWorkspaceScope } from '../../lib/workspace-scope.js';
 import { syncMarketingContactForLead } from '../../lib/lead-contact-sync.js';
+import { getLead360 } from './leads.js';
 
 export const conversationsRouter = Router();
 
@@ -201,8 +202,21 @@ async function verifyCloserAccess(
   conversation: { id: string; customerPhone?: string; assignedFreelancerId?: string | null; payload?: any }
 ): Promise<boolean> {
   const result = await checkConversationAccess(req, conversation);
-  return result.hasAccess;
+  return result.hasAccess && (req.method === 'GET' || req.method === 'HEAD' || result.permission === 'REPLY');
 }
+
+conversationsRouter.get('/:id/360', async (req: Request, res: Response) => {
+  const conversation = await prisma.appConversation.findFirst({ where: { id: String(req.params.id), tenantId: req.tenantId! } });
+  if (!conversation) return void res.status(404).json({ success: false, error: 'NotFound', message: 'Conversation not found' });
+  if (!(await verifyCloserAccess(req, conversation))) return void res.status(403).json({ success: false, error: 'Forbidden', message: 'Conversation access denied' });
+  const lead = await prisma.salesLeadAssignment.findFirst({
+    where: { tenantId: req.tenantId!, OR: [{ conversationId: conversation.id }, ...phoneMatchConditions([conversation.customerPhone])] },
+    select: { id: true },
+  });
+  if (!lead) return void res.json({ success: true, data: { lead: null, notes: [], timeline: [], history: [], tasks: [], calls: [], payments: [] }, error: null });
+  req.params.id = lead.id;
+  await getLead360(req, res);
+});
 
 // 1. GET / - List conversations with strict closer scoping and rich UI fields
 conversationsRouter.get('/', validateQuery(listConversationsQuerySchema), async (req: Request, res: Response) => {

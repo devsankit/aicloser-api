@@ -242,24 +242,16 @@ marketingRouter.get('/contacts', requirePermissions(PERM_CONTACTS_VIEW), async (
     ...(scopedAgentId ? { assignedAgentId: scopedAgentId } : {}),
     ...(groupId ? { groupMemberships: { some: { groupId } } } : {}),
   };
-  const where: Record<string, unknown> = { ...baseWhere };
-  if (search) {
-    where.OR = [
-      { fullName: { contains: search, mode: 'insensitive' } },
-      { e164Phone: { contains: search } },
-    ];
-  }
-
   const searchConstraint = search
     ? { OR: [
         { fullName: { contains: search, mode: 'insensitive' as const } },
         { e164Phone: { contains: search } },
       ] }
     : {};
-  const eligibleWhere = { ...baseWhere, ...searchConstraint, optInStatus: 'OPTED_IN' as const, isBlocked: false };
+  const where = { AND: [baseWhere, searchConstraint] };
+  const eligibleWhere = { AND: [baseWhere, searchConstraint], optInStatus: 'OPTED_IN' as const, isBlocked: false };
   const suppressedWhere = {
-    ...baseWhere,
-    ...(search ? { AND: [searchConstraint] } : {}),
+    AND: [baseWhere, searchConstraint],
     OR: [
       { optInStatus: 'OPTED_OUT' as const },
       { isBlocked: true },
