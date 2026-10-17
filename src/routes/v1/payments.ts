@@ -11,6 +11,7 @@ import { requireRoles } from '../../middlewares/rbac.js';
 import { enforceTenantIsolation } from '../../middlewares/tenant-isolation.js';
 import { validateBody, validateQuery } from '../../middlewares/validate.js';
 import { UpiPaymentDurationUnit, UpiPaymentLinkStatus } from '@prisma/client';
+import { getWorkspaceScope, type WorkspaceScope } from '../../lib/workspace-scope.js';
 
 export const paymentsRouter = Router();
 
@@ -33,6 +34,14 @@ function resolveProofFilePath(relativePath: string): string | null {
     }
   }
   return null;
+}
+
+async function getPaymentScope(req: Request): Promise<WorkspaceScope> {
+  return getWorkspaceScope(req.tenantId!, req.user!);
+}
+
+function canAccessPayment(scope: WorkspaceScope, createdByUserId: string) {
+  return scope.all || scope.userIds.includes(createdByUserId);
 }
 
 paymentsRouter.use(authenticate, enforceTenantIsolation);
@@ -127,12 +136,13 @@ paymentsRouter.get('/', validateQuery(listPaymentsQuerySchema), async (req: Requ
   };
 
   const tenantId = req.tenantId!;
+  const scope = await getPaymentScope(req);
   const where: Record<string, unknown> = { tenantId };
 
-  // Sales agents can only see payment links they created. Tenant admins and
-  // managers keep the workspace-wide view needed for the dashboard totals.
-  if (req.user?.role === 'SALES_AGENT') {
-    where.createdByUserId = req.user.userId;
+  // Admins see the tenant; managers see their reporting team; closers see
+  // their own links. Keep the same scope for rows and summary aggregates.
+  if (!scope.all) {
+    where.createdByUserId = { in: scope.userIds.length ? scope.userIds : ['__NO_ACCESS__'] };
   }
 
   if (status) where.status = status;
@@ -281,6 +291,12 @@ paymentsRouter.post('/:id/approve', async (req: Request, res: Response) => {
     return;
   }
 
+  const scope = await getPaymentScope(req);
+  if (!canAccessPayment(scope, payment.createdByUserId)) {
+    res.status(403).json({ success: false, error: 'Forbidden', message: 'You do not have access to this payment link' });
+    return;
+  }
+
   const updated = await prisma.upiPaymentLink.update({
     where: { id: payment.id },
     data: {
@@ -318,6 +334,12 @@ paymentsRouter.post('/:id/reject', async (req: Request, res: Response) => {
     return;
   }
 
+  const scope = await getPaymentScope(req);
+  if (!canAccessPayment(scope, payment.createdByUserId)) {
+    res.status(403).json({ success: false, error: 'Forbidden', message: 'You do not have access to this payment link' });
+    return;
+  }
+
   const updated = await prisma.upiPaymentLink.update({
     where: { id: payment.id },
     data: {
@@ -343,7 +365,8 @@ paymentsRouter.get('/:id', async (req: Request, res: Response) => {
     return;
   }
 
-  if (req.user?.role === 'SALES_AGENT' && payment.createdByUserId !== req.user.userId) {
+  const scope = await getPaymentScope(req);
+  if (!canAccessPayment(scope, payment.createdByUserId)) {
     res.status(403).json({ success: false, error: 'Forbidden', message: 'You can only view your own payment links' });
     return;
   }
@@ -374,7 +397,8 @@ paymentsRouter.post('/:id/proof', upload.any(), async (req: Request, res: Respon
     }
 
     // Sales agent can only attach proof to their own payment links
-    if (req.user?.role === 'SALES_AGENT' && payment.createdByUserId !== req.user.userId) {
+    const scope = await getPaymentScope(req);
+    if (!canAccessPayment(scope, payment.createdByUserId)) {
       res.status(403).json({ success: false, error: 'Forbidden', message: 'You can only attach proof to your own payment links' });
       return;
     }
@@ -487,7 +511,8 @@ paymentsRouter.get('/:id/proof', async (req: Request, res: Response) => {
     }
 
     // Sales agent can only view proof of their own links
-    if (req.user?.role === 'SALES_AGENT' && payment.createdByUserId !== req.user.userId) {
+    const scope = await getPaymentScope(req);
+    if (!canAccessPayment(scope, payment.createdByUserId)) {
       res.status(403).json({ success: false, error: 'Forbidden', message: 'You can only view payment proof for your own links' });
       return;
     }

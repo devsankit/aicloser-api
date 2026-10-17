@@ -1,17 +1,48 @@
 import { maskPhoneNumber, isPhoneMaskingRequired } from '../../lib/phone-mask.js';
 import { Router, Request, Response } from 'express';
 import { z } from 'zod';
-import { Prisma } from '@prisma/client';
+import { Prisma, SalesLeadStage } from '@prisma/client';
 import { prisma } from '../../lib/prisma.js';
 import { authenticate } from '../../middlewares/auth.js';
 import { enforceTenantIsolation } from '../../middlewares/tenant-isolation.js';
-import { requireRoles } from '../../middlewares/rbac.js';
+import { requireRoles, requirePermissions, PERM_CONTACTS_VIEW } from '../../middlewares/rbac.js';
 import { validateBody, validateQuery } from '../../middlewares/validate.js';
 import { logger } from '../../lib/logger.js';
+import { normalizeLeadPhone, syncMarketingContactForLead } from '../../lib/lead-contact-sync.js';
+import { upsertCompanyLead } from '../../lib/lead-upsert-pipeline.js';
+import { getWorkspaceScope } from '../../lib/workspace-scope.js';
 
 export const contactsRouter = Router();
 
 contactsRouter.use(authenticate, enforceTenantIsolation);
+
+async function getContactVisibilityConditions(req: Request, tenantId: string): Promise<Prisma.MarketingContactWhereInput[]> {
+  const conditions: Prisma.MarketingContactWhereInput[] = [{ tenantId }];
+  if (req.user?.role === 'ADMIN' || req.user?.role === 'SUPER_ADMIN') return conditions;
+  if (req.user?.role !== 'SALES_AGENT' && req.user?.role !== 'MANAGER') {
+    conditions.push({ id: '__NO_ACCESS__' });
+    return conditions;
+  }
+
+  const scope = await getWorkspaceScope(tenantId, req.user);
+  const assignedLeads = scope.profileIds.length
+    ? await prisma.salesLeadAssignment.findMany({
+        where: { tenantId, assignedAgentId: { in: scope.profileIds } },
+        select: { id: true, customerPhone: true },
+      })
+    : [];
+  const leadIds = assignedLeads.map((lead) => lead.id);
+  const phones = assignedLeads
+    .map((lead) => normalizeLeadPhone(lead.customerPhone))
+    .filter((phone): phone is string => Boolean(phone));
+
+  const visibilityOr = [
+    ...(leadIds.length ? [{ leadId: { in: leadIds } }] : []),
+    ...(phones.length ? [{ e164Phone: { in: phones } }] : []),
+  ];
+  conditions.push({ OR: visibilityOr.length ? visibilityOr : [{ id: '__NO_ACCESS__' }] });
+  return conditions;
+}
 
 // 1. GET / - List contacts with pagination, search, and tag filters
 const listContactsQuerySchema = z.object({
@@ -21,7 +52,7 @@ const listContactsQuerySchema = z.object({
   tag: z.string().optional(),
 });
 
-contactsRouter.get('/', validateQuery(listContactsQuerySchema), async (req: Request, res: Response) => {
+contactsRouter.get('/', requirePermissions(PERM_CONTACTS_VIEW), validateQuery(listContactsQuerySchema), async (req: Request, res: Response) => {
   const { page, limit, search, tag } = req.query as unknown as {
     page: number;
     limit: number;
@@ -30,19 +61,21 @@ contactsRouter.get('/', validateQuery(listContactsQuerySchema), async (req: Requ
   };
 
   const tenantId = req.tenantId!;
-  const where: Record<string, unknown> = { tenantId };
+  const andConditions = await getContactVisibilityConditions(req, tenantId);
 
   if (tag) {
-    where.tags = { has: tag };
+    andConditions.push({ tags: { has: tag } });
   }
 
   if (search) {
-    where.OR = [
+    andConditions.push({ OR: [
       { fullName: { contains: search, mode: 'insensitive' } },
       { e164Phone: { contains: search } },
       { email: { contains: search, mode: 'insensitive' } },
-    ];
+    ] });
   }
+
+  const where: Prisma.MarketingContactWhereInput = { AND: andConditions };
 
   const [total, contacts] = await Promise.all([
     prisma.marketingContact.count({ where }),
@@ -54,6 +87,54 @@ contactsRouter.get('/', validateQuery(listContactsQuerySchema), async (req: Requ
     }),
   ]);
 
+  const contactAgentIds = contacts.map((contact) => contact.assignedAgentId).filter((id): id is string => Boolean(id));
+  const linkedLeadIds = contacts.map((contact) => contact.leadId).filter((id): id is string => Boolean(id));
+  const [assignedProfiles, linkedLeads] = await Promise.all([
+    contactAgentIds.length
+      ? prisma.salesAgentProfile.findMany({
+          where: { tenantId, OR: [{ id: { in: contactAgentIds } }, { userId: { in: contactAgentIds } }] },
+          select: { id: true, userId: true, agentCode: true, user: { select: { displayName: true, email: true, phone: true } } },
+        })
+      : Promise.resolve([]),
+    linkedLeadIds.length
+      ? prisma.salesLeadAssignment.findMany({
+          where: { tenantId, id: { in: linkedLeadIds } },
+          select: {
+            id: true,
+            stage: true,
+            notes: true,
+            followUpAt: true,
+            assignedAgentId: true,
+            assignedAgent: {
+              select: { id: true, agentCode: true, user: { select: { displayName: true, email: true, phone: true } } },
+            },
+          },
+        })
+      : Promise.resolve([]),
+  ]);
+  const profileById = new Map(assignedProfiles.flatMap((profile) => [
+    [profile.id, profile],
+    [profile.userId, profile],
+  ]));
+  const leadById = new Map(linkedLeads.map((lead) => [lead.id, lead]));
+  const enrichedContacts = contacts.map((contact) => {
+    const lead = contact.leadId ? leadById.get(contact.leadId) : undefined;
+    const profile = profileById.get(contact.assignedAgentId || '');
+    const assignedAgent = lead?.assignedAgent
+      ? { id: lead.assignedAgent.id, agentCode: lead.assignedAgent.agentCode, displayName: lead.assignedAgent.user?.displayName, email: lead.assignedAgent.user?.email, phone: lead.assignedAgent.user?.phone }
+      : profile
+        ? { id: profile.id, agentCode: profile.agentCode, displayName: profile.user?.displayName, email: profile.user?.email, phone: profile.user?.phone }
+        : null;
+    return {
+      ...contact,
+      assignedAgentId: lead?.assignedAgentId ?? contact.assignedAgentId,
+      assignedAgent,
+      stage: lead?.stage ?? null,
+      notes: lead?.notes ?? (contact.customFields && typeof contact.customFields === 'object' && typeof (contact.customFields as Record<string, unknown>).notes === 'string' ? (contact.customFields as Record<string, unknown>).notes : null),
+      followUpAt: lead?.followUpAt ?? null,
+    };
+  });
+
   const wsSettingsForContacts = await prisma.aicloserWorkspace.findUnique({
     where: { id: tenantId },
     select: { settings: true },
@@ -61,8 +142,8 @@ contactsRouter.get('/', validateQuery(listContactsQuerySchema), async (req: Requ
   const shouldMask = isPhoneMaskingRequired(req.user, wsSettingsForContacts?.settings as Record<string, any>);
 
   const sanitizedContacts = shouldMask
-    ? contacts.map((c) => ({ ...c, e164Phone: maskPhoneNumber(c.e164Phone, true) }))
-    : contacts;
+    ? enrichedContacts.map((c) => ({ ...c, e164Phone: maskPhoneNumber(c.e164Phone, true) }))
+    : enrichedContacts;
 
   res.json({
     success: true,
@@ -88,14 +169,28 @@ const createContactSchema = z.object({
   tags: z.array(z.string()).default([]),
   customFields: z.record(z.unknown()).optional(),
   source: z.string().default('MANUAL'),
+  assignedAgentId: z.string().optional(),
+  stage: z.nativeEnum(SalesLeadStage).optional(),
+  notes: z.string().optional().nullable(),
 });
 
-contactsRouter.post('/', validateBody(createContactSchema), async (req: Request, res: Response) => {
+contactsRouter.post('/', requirePermissions(PERM_CONTACTS_VIEW), validateBody(createContactSchema), async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
-  const { fullName, e164Phone, email, tags, customFields, source } = req.body;
+  const { fullName, e164Phone, email, tags, customFields, source, assignedAgentId, stage, notes } = req.body;
+  const ownProfile = req.user?.role === 'SALES_AGENT'
+    ? await prisma.salesAgentProfile.findFirst({
+        where: { userId: req.user.userId, tenantId, status: 'ACTIVE' },
+        select: { id: true },
+      })
+    : null;
+  // A closer may create a contact for their own queue only. Admins/managers
+  // can provide an explicit assignee from the assignment controls.
+  const effectiveAssignedAgentId = req.user?.role === 'SALES_AGENT'
+    ? ownProfile?.id
+    : assignedAgentId;
 
   // Clean phone
-  const cleanPhone = e164Phone.replace(/[\s-]/g, '');
+  const cleanPhone = normalizeLeadPhone(e164Phone) || e164Phone.replace(/[\s-]/g, '');
 
   // Tenant-scoped deduplication check
   const existing = await prisma.marketingContact.findUnique({
@@ -108,6 +203,33 @@ contactsRouter.post('/', validateBody(createContactSchema), async (req: Request,
   });
 
   if (existing) {
+    const leadResult = await upsertCompanyLead({
+      tenantId,
+      customerName: fullName,
+      customerPhone: cleanPhone,
+      customerEmail: email,
+      source: source || 'MANUAL',
+      customFields: customFields as Record<string, any> | undefined,
+      stage,
+      notes,
+      assignedAgentId: effectiveAssignedAgentId,
+      createdById: req.user?.userId,
+      actorUserId: req.user?.userId,
+      duplicateAction: 'UPDATE',
+    });
+    const linkedLead = leadResult.lead;
+
+    if (linkedLead) {
+      const synced = await syncMarketingContactForLead(linkedLead).catch(() => existing);
+      res.status(200).json({
+        success: true,
+        deduplicated: true,
+        message: 'Contact already exists in this workspace and is linked to its CRM lead',
+        data: synced,
+        error: null,
+      });
+      return;
+    }
     res.status(200).json({
       success: true,
       deduplicated: true,
@@ -118,15 +240,31 @@ contactsRouter.post('/', validateBody(createContactSchema), async (req: Request,
     return;
   }
 
-  const contact = await prisma.marketingContact.create({
+  const leadResult = await upsertCompanyLead({
+    tenantId,
+    customerName: fullName,
+    customerPhone: cleanPhone,
+    customerEmail: email,
+    source: source || 'MANUAL',
+    customFields: customFields as Record<string, any> | undefined,
+    stage,
+    notes,
+    assignedAgentId: effectiveAssignedAgentId,
+    createdById: req.user?.userId,
+    actorUserId: req.user?.userId,
+    duplicateAction: 'UPDATE',
+  });
+
+  const contact = await prisma.marketingContact.update({
+    where: { tenantId_e164Phone: { tenantId, e164Phone: cleanPhone } },
     data: {
-      tenantId,
       fullName,
-      e164Phone: cleanPhone,
       email: email || null,
       tags: Array.isArray(tags) ? tags : [],
       customFields: customFields ? (customFields as Prisma.InputJsonValue) : Prisma.JsonNull,
       source: source || 'MANUAL',
+      leadId: leadResult.lead.id,
+      assignedAgentId: leadResult.lead.assignedAgentId,
     },
   });
 
@@ -134,7 +272,7 @@ contactsRouter.post('/', validateBody(createContactSchema), async (req: Request,
 });
 
 // 3. GET /duplicates - Detect duplicate contacts by phone or email
-contactsRouter.get('/duplicates', async (req: Request, res: Response) => {
+contactsRouter.get('/duplicates', requirePermissions(PERM_CONTACTS_VIEW), async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
 
   // Group by phone
@@ -179,7 +317,7 @@ const mergeContactsSchema = z.object({
   secondaryContactId: z.string().min(1, 'Secondary contact ID is required'),
 });
 
-contactsRouter.post('/merge', requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN'), validateBody(mergeContactsSchema), async (req: Request, res: Response) => {
+contactsRouter.post('/merge', requirePermissions(PERM_CONTACTS_VIEW), requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN'), validateBody(mergeContactsSchema), async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const { primaryContactId, secondaryContactId } = req.body;
 
@@ -188,9 +326,10 @@ contactsRouter.post('/merge', requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN'), v
     return;
   }
 
+  const visibilityConditions = await getContactVisibilityConditions(req, tenantId);
   const [primary, secondary] = await Promise.all([
-    prisma.marketingContact.findFirst({ where: { id: primaryContactId, tenantId } }),
-    prisma.marketingContact.findFirst({ where: { id: secondaryContactId, tenantId } }),
+    prisma.marketingContact.findFirst({ where: { AND: [...visibilityConditions, { id: primaryContactId }] } }),
+    prisma.marketingContact.findFirst({ where: { AND: [...visibilityConditions, { id: secondaryContactId }] } }),
   ]);
 
   if (!primary || !secondary) {
@@ -253,7 +392,7 @@ const importJobSchema = z.object({
   ).min(1, 'Contacts list is required and cannot be empty'),
 });
 
-contactsRouter.post('/import-job', requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN'), validateBody(importJobSchema), async (req: Request, res: Response) => {
+contactsRouter.post('/import-job', requirePermissions(PERM_CONTACTS_VIEW), requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN'), validateBody(importJobSchema), async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const { fileName, source, contacts } = req.body as z.infer<typeof importJobSchema>;
 
@@ -387,7 +526,7 @@ contactsRouter.post('/import-job', requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN
 });
 
 // 6. GET /import-job/:jobId - Poll import job progress & inspect row errors
-contactsRouter.get('/import-job/:jobId', async (req: Request, res: Response) => {
+contactsRouter.get('/import-job/:jobId', requirePermissions(PERM_CONTACTS_VIEW), async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const jobId = String(req.params.jobId);
 
@@ -411,7 +550,7 @@ contactsRouter.get('/import-job/:jobId', async (req: Request, res: Response) => 
 });
 
 // 7. GET /import-jobs - List past import jobs for tenant
-contactsRouter.get('/import-jobs', async (req: Request, res: Response) => {
+contactsRouter.get('/import-jobs', requirePermissions(PERM_CONTACTS_VIEW), async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const jobs = await prisma.contactImportJob.findMany({
     where: { tenantId },
@@ -430,7 +569,7 @@ contactsRouter.get('/import-jobs', async (req: Request, res: Response) => {
 });
 
 // 8. GET /whatsapp/scanner - Live WhatsApp QR / sync scanner status
-contactsRouter.get('/whatsapp/scanner', async (req: Request, res: Response) => {
+contactsRouter.get('/whatsapp/scanner', requirePermissions(PERM_CONTACTS_VIEW), async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
 
   const channel = await prisma.whatsAppChannel.findFirst({
@@ -477,28 +616,25 @@ contactsRouter.get('/whatsapp/scanner', async (req: Request, res: Response) => {
 });
 
 // 9. GET /email-inbox - Workspace Email Inbox communications
-contactsRouter.get('/email-inbox', async (req: Request, res: Response) => {
+contactsRouter.get('/email-inbox', requirePermissions(PERM_CONTACTS_VIEW), async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const page = Math.max(1, Number(req.query.page) || 1);
   const limit = Math.min(50, Math.max(1, Number(req.query.limit) || 20));
   const search = typeof req.query.search === 'string' ? req.query.search : undefined;
 
-  // Find contacts and leads with emails
+  const emailConditions = await getContactVisibilityConditions(req, tenantId);
+  emailConditions.push({ email: search ? { contains: search, mode: 'insensitive' } : { not: null } });
+
+  // Find only email threads visible to the current workspace role.
   const [contactsWithEmail, totalContacts] = await Promise.all([
     prisma.marketingContact.findMany({
-      where: {
-        tenantId,
-        email: search ? { contains: search, mode: 'insensitive' } : { not: null },
-      },
+      where: { AND: emailConditions },
       skip: (page - 1) * limit,
       take: limit,
       orderBy: { updatedAt: 'desc' },
     }),
     prisma.marketingContact.count({
-      where: {
-        tenantId,
-        email: search ? { contains: search, mode: 'insensitive' } : { not: null },
-      },
+      where: { AND: emailConditions },
     }),
   ]);
 
@@ -536,7 +672,7 @@ contactsRouter.get('/email-inbox', async (req: Request, res: Response) => {
 });
 
 // 10. GET /:id - Get single contact detail
-contactsRouter.get('/:id', async (req: Request, res: Response) => {
+contactsRouter.get('/:id', requirePermissions(PERM_CONTACTS_VIEW), async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const id = String(req.params.id);
 
@@ -545,7 +681,7 @@ contactsRouter.get('/:id', async (req: Request, res: Response) => {
   }
 
   const contact = await prisma.marketingContact.findFirst({
-    where: { id, tenantId },
+    where: { AND: [...await getContactVisibilityConditions(req, tenantId), { id }] },
   });
 
   if (!contact) {
@@ -564,6 +700,8 @@ const updateContactSchema = z.object({
   tags: z.array(z.string()).optional(),
   customFields: z.record(z.any()).optional(),
   isBlocked: z.boolean().optional(),
+  stage: z.nativeEnum(SalesLeadStage).optional(),
+  notes: z.string().optional().nullable(),
 });
 
 const handleUpdateContact = async (req: Request, res: Response) => {
@@ -571,7 +709,7 @@ const handleUpdateContact = async (req: Request, res: Response) => {
   const id = String(req.params.id);
 
   const existing = await prisma.marketingContact.findFirst({
-    where: { id, tenantId },
+    where: { AND: [...await getContactVisibilityConditions(req, tenantId), { id }] },
   });
 
   if (!existing) {
@@ -594,6 +732,35 @@ const handleUpdateContact = async (req: Request, res: Response) => {
     data: updateData,
   });
 
+  if (existing.leadId && (body.fullName !== undefined || body.email !== undefined || body.stage !== undefined || body.notes !== undefined)) {
+    const linkedLead = await prisma.salesLeadAssignment.findFirst({ where: { id: existing.leadId, tenantId } });
+    if (linkedLead) {
+      const leadChanged = body.stage !== undefined && body.stage !== linkedLead.stage;
+      const updatedLead = await prisma.salesLeadAssignment.update({
+        where: { id: linkedLead.id },
+        data: {
+          ...(body.fullName !== undefined ? { customerName: body.fullName } : {}),
+          ...(body.email !== undefined ? { customerEmail: body.email || null } : {}),
+          ...(body.stage !== undefined ? { stage: body.stage, ...(leadChanged ? { stageChangedAt: new Date() } : {}) } : {}),
+          ...(body.notes !== undefined ? { notes: body.notes || null } : {}),
+        },
+      });
+      await syncMarketingContactForLead(updatedLead).catch(() => undefined);
+      if (leadChanged || body.notes !== undefined) {
+        await prisma.salesActivityLog.create({
+          data: {
+            tenantId,
+            assignmentId: linkedLead.id,
+            actorUserId: req.user?.userId,
+            action: leadChanged ? 'LEAD_STAGE_CHANGED' : 'LEAD_DETAILS_UPDATED',
+            note: leadChanged ? `Lead stage changed from ${linkedLead.stage} to ${body.stage}` : 'Lead notes updated from Contacts',
+            metadata: { source: 'CONTACTS_API', ...(leadChanged ? { previousStage: linkedLead.stage, newStage: body.stage } : {}), ...(body.notes !== undefined ? { notesUpdated: true } : {}) },
+          },
+        }).catch(() => undefined);
+      }
+    }
+  }
+
   res.json({
     success: true,
     message: 'Contact updated successfully',
@@ -602,16 +769,16 @@ const handleUpdateContact = async (req: Request, res: Response) => {
   });
 };
 
-contactsRouter.put('/:id', validateBody(updateContactSchema), handleUpdateContact);
-contactsRouter.patch('/:id', validateBody(updateContactSchema), handleUpdateContact);
+contactsRouter.put('/:id', requirePermissions(PERM_CONTACTS_VIEW), validateBody(updateContactSchema), handleUpdateContact);
+contactsRouter.patch('/:id', requirePermissions(PERM_CONTACTS_VIEW), validateBody(updateContactSchema), handleUpdateContact);
 
 // 12. DELETE /:id - Delete a contact (Admin / Manager only)
-contactsRouter.delete('/:id', requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN'), async (req: Request, res: Response) => {
+contactsRouter.delete('/:id', requirePermissions(PERM_CONTACTS_VIEW), requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN'), async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const id = String(req.params.id);
 
   const existing = await prisma.marketingContact.findFirst({
-    where: { id, tenantId },
+    where: { AND: [...await getContactVisibilityConditions(req, tenantId), { id }] },
   });
 
   if (!existing) {

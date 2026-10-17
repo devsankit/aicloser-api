@@ -4,9 +4,11 @@ import { z } from 'zod';
 import { prisma } from '../../lib/prisma.js';
 import { authenticate } from '../../middlewares/auth.js';
 import { enforceTenantIsolation } from '../../middlewares/tenant-isolation.js';
-import { requireRoles } from '../../middlewares/rbac.js';
+import { requireRoles, requirePermissions, PERM_CONTACTS_VIEW } from '../../middlewares/rbac.js';
 import { validateBody, validateQuery } from '../../middlewares/validate.js';
 import { logger } from '../../lib/logger.js';
+import { getWorkspaceScope } from '../../lib/workspace-scope.js';
+import { normalizeLeadPhone } from '../../lib/lead-contact-sync.js';
 
 export const marketingRouter = Router();
 
@@ -204,13 +206,43 @@ marketingRouter.post('/templates/media', requireRoles('ADMIN', 'SUPER_ADMIN'), a
 // 2. Marketing Contacts & Groups
 // ==========================================
 
-marketingRouter.get('/contacts', async (req: Request, res: Response) => {
+marketingRouter.get('/contacts', requirePermissions(PERM_CONTACTS_VIEW), async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const page = Math.max(1, Number(req.query.page || 1));
   const limit = Math.min(100, Math.max(1, Number(req.query.limit || 25)));
   const search = req.query.search ? String(req.query.search) : undefined;
+  const requestedAgentId = req.query.agentId ? String(req.query.agentId) : undefined;
+  const groupId = req.query.groupId ? String(req.query.groupId) : undefined;
 
-  const where: Record<string, unknown> = { tenantId };
+  // Marketing follows the same ownership boundary as the CRM. Admins see the
+  // tenant; managers see their reporting tree; closers see only their own
+  // assigned leads. The lead link and normalized phone fallback keep older
+  // contacts visible while they are being backfilled with assignedAgentId.
+  const scope = await getWorkspaceScope(tenantId, req.user!);
+  let scopedAgentId = requestedAgentId;
+  if (!scope.all) scopedAgentId = req.user?.role === 'SALES_AGENT' ? scope.profileIds[0] : requestedAgentId;
+
+  const scopedLeads = scope.all || !scope.profileIds.length
+    ? []
+    : await prisma.salesLeadAssignment.findMany({
+        where: { tenantId, assignedAgentId: { in: scope.profileIds } },
+        select: { id: true, customerPhone: true },
+      });
+  const scopeOr = scope.all
+    ? []
+    : [
+        ...(scope.profileIds.length ? [{ assignedAgentId: { in: scope.profileIds } }] : []),
+        ...(scopedLeads.length ? [{ leadId: { in: scopedLeads.map((lead) => lead.id) } }] : []),
+        ...(scopedLeads.length ? [{ e164Phone: { in: scopedLeads.map((lead) => normalizeLeadPhone(lead.customerPhone)).filter((phone): phone is string => Boolean(phone)) } }] : []),
+      ];
+
+  const baseWhere: Record<string, unknown> = {
+    tenantId,
+    ...(!scope.all ? { OR: scopeOr.length ? scopeOr : [{ id: '__NO_ACCESS__' }] } : {}),
+    ...(scopedAgentId ? { assignedAgentId: scopedAgentId } : {}),
+    ...(groupId ? { groupMemberships: { some: { groupId } } } : {}),
+  };
+  const where: Record<string, unknown> = { ...baseWhere };
   if (search) {
     where.OR = [
       { fullName: { contains: search, mode: 'insensitive' } },
@@ -218,8 +250,26 @@ marketingRouter.get('/contacts', async (req: Request, res: Response) => {
     ];
   }
 
-  const [total, contacts] = await Promise.all([
+  const searchConstraint = search
+    ? { OR: [
+        { fullName: { contains: search, mode: 'insensitive' as const } },
+        { e164Phone: { contains: search } },
+      ] }
+    : {};
+  const eligibleWhere = { ...baseWhere, ...searchConstraint, optInStatus: 'OPTED_IN' as const, isBlocked: false };
+  const suppressedWhere = {
+    ...baseWhere,
+    ...(search ? { AND: [searchConstraint] } : {}),
+    OR: [
+      { optInStatus: 'OPTED_OUT' as const },
+      { isBlocked: true },
+    ],
+  };
+
+  const [total, eligible, suppressed, contacts] = await Promise.all([
     prisma.marketingContact.count({ where }),
+    prisma.marketingContact.count({ where: eligibleWhere }),
+    prisma.marketingContact.count({ where: suppressedWhere }),
     prisma.marketingContact.findMany({
       where,
       skip: (page - 1) * limit,
@@ -241,12 +291,18 @@ marketingRouter.get('/contacts', async (req: Request, res: Response) => {
         limit,
         totalPages: Math.ceil(total / limit),
       },
+      summary: {
+        total,
+        eligible,
+        suppressed,
+        unknown: Math.max(0, total - eligible - suppressed),
+      },
     },
     error: null,
   });
 });
 
-marketingRouter.post('/contacts', async (req: Request, res: Response) => {
+marketingRouter.post('/contacts', requirePermissions(PERM_CONTACTS_VIEW), async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const { fullName, phone, email, tags, groupId } = req.body;
 
@@ -284,7 +340,7 @@ marketingRouter.post('/contacts', async (req: Request, res: Response) => {
   res.status(201).json({ success: true, data: contact, error: null });
 });
 
-marketingRouter.post('/contacts/import', requireRoles('ADMIN', 'SUPER_ADMIN'), async (req: Request, res: Response) => {
+marketingRouter.post('/contacts/import', requirePermissions(PERM_CONTACTS_VIEW), requireRoles('ADMIN', 'SUPER_ADMIN'), async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const { contacts, groupId } = req.body as { contacts: Array<{ fullName: string; phone: string; email?: string }>; groupId?: string };
 
@@ -843,7 +899,7 @@ marketingRouter.post('/templates/:id/preview', async (req: Request, res: Respons
 });
 
 // POST /contacts/:id/suppress - Suppress contact from marketing campaigns
-marketingRouter.post('/contacts/:id/suppress', requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN'), async (req: Request, res: Response) => {
+marketingRouter.post('/contacts/:id/suppress', requirePermissions(PERM_CONTACTS_VIEW), requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN'), async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const id = String(req.params.id);
 
@@ -877,7 +933,7 @@ marketingRouter.post('/contacts/:id/suppress', requireRoles('ADMIN', 'MANAGER', 
 });
 
 // POST /contacts/:id/unsuppress - Unsuppress contact
-marketingRouter.post('/contacts/:id/unsuppress', requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN'), async (req: Request, res: Response) => {
+marketingRouter.post('/contacts/:id/unsuppress', requirePermissions(PERM_CONTACTS_VIEW), requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN'), async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const id = String(req.params.id);
 

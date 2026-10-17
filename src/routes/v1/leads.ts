@@ -11,6 +11,8 @@ import { validateBody, validateQuery } from '../../middlewares/validate.js';
 import { SalesLeadStage, salesLeadStageSchema } from '../../types/leads.js';
 import { hasPermission, requirePermissions, PERM_LEADS_CLAIM, PERM_LEADS_REASSIGN } from '../../middlewares/rbac.js';
 import { persistApiRealtimeEvent } from '../../lib/realtime.js';
+import { syncMarketingContactForLead } from '../../lib/lead-contact-sync.js';
+import { getWorkspaceScope } from '../../lib/workspace-scope.js';
 
 export const leadsRouter = Router();
 
@@ -45,13 +47,11 @@ leadsRouter.get('/', validateQuery(listLeadsQuerySchema), async (req: Request, r
 
   if (stage) where.stage = stage;
 
-  // Strict closer scoping: SALES_AGENT can only see their own assigned leads
-  if (req.user?.role === 'SALES_AGENT') {
-    const profile = await prisma.salesAgentProfile.findFirst({
-      where: { userId: req.user.userId, tenantId },
-      select: { id: true },
-    });
-    where.assignedAgentId = profile?.id ?? '__NO_ACCESS__';
+  // Admins see the tenant; managers see their reporting team; closers see
+  // only their own assigned leads.
+  if (req.user?.role === 'SALES_AGENT' || req.user?.role === 'MANAGER') {
+    const scope = await getWorkspaceScope(tenantId, req.user);
+    where.assignedAgentId = { in: scope.profileIds.length ? scope.profileIds : ['__NO_ACCESS__'] };
   } else if (assignedAgentId) {
     where.assignedAgentId = assignedAgentId;
   }
@@ -179,6 +179,8 @@ leadsRouter.post('/', validateBody(createLeadSchema), async (req: Request, res: 
         },
       });
 
+      await syncMarketingContactForLead(updated).catch(() => undefined);
+
       await prisma.salesActivityLog.create({
         data: {
           tenantId,
@@ -249,6 +251,8 @@ leadsRouter.post('/', validateBody(createLeadSchema), async (req: Request, res: 
     },
   });
 
+  await syncMarketingContactForLead(lead).catch(() => undefined);
+
   await persistApiRealtimeEvent({
     tenantId,
     eventType: 'lead.created',
@@ -261,10 +265,19 @@ leadsRouter.post('/', validateBody(createLeadSchema), async (req: Request, res: 
 
 leadsRouter.get('/pipeline-aggregates', async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
+  const where: any = { tenantId };
+
+  // Pipeline totals must use the same visibility scope as the lead list.
+  // Otherwise a newly-created sales user sees workspace totals on Dashboard
+  // while Kanban correctly shows only their assigned leads.
+  if (req.user?.role === 'SALES_AGENT' || req.user?.role === 'MANAGER') {
+    const scope = await getWorkspaceScope(tenantId, req.user);
+    where.assignedAgentId = { in: scope.profileIds.length ? scope.profileIds : ['__NO_ACCESS__'] };
+  }
 
   const aggregates = await prisma.salesLeadAssignment.groupBy({
     by: ['stage'],
-    where: { tenantId },
+    where,
     _count: { id: true },
     _sum: { budgetAmount: true },
   });
@@ -301,12 +314,9 @@ leadsRouter.get('/dashboard-summary', async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const where: any = { tenantId };
 
-  if (req.user?.role === 'SALES_AGENT') {
-    const profile = await prisma.salesAgentProfile.findFirst({
-      where: { userId: req.user.userId, tenantId },
-      select: { id: true },
-    });
-    where.assignedAgentId = profile?.id ?? '__NO_ACCESS__';
+  if (req.user?.role === 'SALES_AGENT' || req.user?.role === 'MANAGER') {
+    const scope = await getWorkspaceScope(tenantId, req.user);
+    where.assignedAgentId = { in: scope.profileIds.length ? scope.profileIds : ['__NO_ACCESS__'] };
   } else if (req.query.assignedAgentId) {
     where.assignedAgentId = String(req.query.assignedAgentId);
   }
@@ -856,32 +866,16 @@ leadsRouter.patch('/:id', validateBody(updateLeadSchema), async (req: Request, r
     return;
   }
 
-  // Phone numbers are tenant-unique. Return a conflict instead of allowing a
-  // database constraint error to surface as an opaque 500 response.
-  if (typeof body.customerPhone === 'string' && body.customerPhone.trim() && body.customerPhone.trim() !== existing.customerPhone) {
-    const rawPhone = body.customerPhone.trim();
-    const cleanDigits = rawPhone.replace(/\D/g, '');
-    const last10 = cleanDigits.length >= 10 ? cleanDigits.slice(-10) : cleanDigits;
-    const duplicate = await prisma.salesLeadAssignment.findFirst({
-      where: {
-        tenantId,
-        NOT: { id },
-        OR: [
-          { customerPhone: rawPhone },
-          ...(last10.length >= 7 ? [{ customerPhone: { contains: last10 } }] : []),
-        ],
-      },
-      select: { id: true, customerName: true },
+  // The phone is the tenant-scoped lead identity key. It can be set when the
+  // lead is created, but changing it would silently detach conversations,
+  // notes, calls, and payment history from the original customer.
+  if (body.customerPhone !== undefined && body.customerPhone !== existing.customerPhone) {
+    res.status(400).json({
+      success: false,
+      error: 'LeadPhoneImmutable',
+      message: 'A lead phone number is its identity key and cannot be changed after creation.',
     });
-    if (duplicate) {
-      res.status(409).json({
-        success: false,
-        error: 'DuplicateLeadPhone',
-        message: `This phone number already belongs to ${duplicate.customerName || 'another lead'} in this workspace`,
-        data: { existingLeadId: duplicate.id },
-      });
-      return;
-    }
+    return;
   }
 
   // Strict closer scoping: Closers can only update leads assigned to them and cannot reassign
@@ -926,7 +920,6 @@ leadsRouter.patch('/:id', validateBody(updateLeadSchema), async (req: Request, r
     where: { id },
     data: {
       ...(body.customerName !== undefined ? { customerName: body.customerName } : {}),
-      ...(body.customerPhone !== undefined ? { customerPhone: body.customerPhone || null } : {}),
       ...(body.customerEmail !== undefined ? { customerEmail: body.customerEmail || null } : {}),
       ...(body.serviceInterest !== undefined ? { serviceInterest: body.serviceInterest || null } : {}),
       ...(body.segment !== undefined ? { segment: body.segment || null } : {}),
@@ -1109,7 +1102,10 @@ async function handlePoolClaim(req: Request, res: Response) {
     },
   });
 
-  if (!profile || profile.status !== 'ACTIVE' || !profile.canClaimLeads) {
+  // `leads:claim` is the single permission source of truth. Older profiles
+  // may have canClaimLeads=false while the admin has granted the granular
+  // permission, so do not reject those users a second time here.
+  if (!profile || profile.status !== 'ACTIVE') {
     res.status(403).json({ success: false, error: 'Forbidden', message: 'Only active sales closers with lead-claim access can claim leads' });
     return;
   }

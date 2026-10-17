@@ -5,6 +5,7 @@ import { prisma } from '../lib/prisma.js';
 export const PERM_TEAM_VIEW = 'team:view';
 export const PERM_TEAM_MANAGE = 'team:manage';
 export const PERM_LEADS_VIEW_ALL = 'leads:view_all';
+export const PERM_CONTACTS_VIEW = 'contacts:view';
 export const PERM_LEADS_CLAIM = 'leads:claim';
 export const PERM_LEADS_REASSIGN = 'leads:reassign';
 export const PERM_LEADS_EXPORT = 'leads:export';
@@ -23,7 +24,35 @@ export async function hasPermission(
     return true;
   }
 
-  // Check AppAuthUser permissions array
+  // Check the canonical profile permission map for managers and closers.
+  // An explicit false must deny access; previously managers bypassed this
+  // branch and therefore saw contacts even after an admin disabled access.
+  if (role === 'MANAGER' || role === 'SALES_AGENT') {
+    const profile = await prisma.salesAgentProfile.findFirst({
+      where: { userId, tenantId },
+      select: { permissions: true, canClaimLeads: true },
+    });
+
+    if (profile) {
+      const perms = profile.permissions && typeof profile.permissions === 'object'
+        ? profile.permissions as Record<string, boolean>
+        : {};
+      if (Object.prototype.hasOwnProperty.call(perms, permission)) {
+        return perms[permission] === true;
+      }
+
+      // Backward-compatible defaults for profiles created before the matrix
+      // was persisted. The legacy claim flag remains a fallback only for the
+      // lead-claim permission.
+      if (permission === PERM_LEADS_CLAIM) return profile.canClaimLeads;
+      if (permission === PERM_TEAM_MANAGE) return false;
+      if (permission === PERM_CONTACTS_VIEW) return true;
+      return true;
+    }
+  }
+
+  // Legacy AppAuthUser permissions remain supported for roles without a
+  // canonical sales profile, but never override an explicit profile denial.
   const authUser = await prisma.appAuthUser.findFirst({
     where: { id: userId, tenantId },
     select: { permissions: true },
@@ -31,32 +60,6 @@ export async function hasPermission(
 
   if (authUser?.permissions && authUser.permissions.includes(permission)) {
     return true;
-  }
-
-  // Manager defaults
-  if (role === 'MANAGER') {
-    const managerDenied = [PERM_TEAM_MANAGE];
-    if (!managerDenied.includes(permission)) {
-      return true;
-    }
-  }
-
-  // Check granular agent profile permissions for SALES_AGENT
-  if (role === 'SALES_AGENT') {
-    const profile = await prisma.salesAgentProfile.findFirst({
-      where: { userId, tenantId },
-      select: { permissions: true, canClaimLeads: true },
-    });
-
-    if (profile) {
-      if (profile.permissions && typeof profile.permissions === 'object') {
-        const perms = profile.permissions as Record<string, boolean>;
-        if (perms[permission] === true) return true;
-      }
-      if (permission === PERM_LEADS_CLAIM && profile.canClaimLeads) {
-        return true;
-      }
-    }
   }
 
   return false;

@@ -12,6 +12,7 @@ import { enforceTenantIsolation } from '../../middlewares/tenant-isolation.js';
 import { validateBody, validateQuery } from '../../middlewares/validate.js';
 import { requireRoles, hasPermission, PERM_LEADS_REASSIGN } from '../../middlewares/rbac.js';
 import { persistApiRealtimeEvent } from '../../lib/realtime.js';
+import { getWorkspaceScope } from '../../lib/workspace-scope.js';
 
 export const conversationsRouter = Router();
 
@@ -75,27 +76,23 @@ async function getChatVisibilityMode(tenantId: string): Promise<'ASSIGNED_ONLY' 
 
 // Helper: Verify closer access to conversation
 async function verifyCloserAccess(req: Request, conversation: { id: string; customerPhone?: string; assignedFreelancerId?: string | null }): Promise<boolean> {
-  if (req.user?.role !== 'SALES_AGENT') return true;
+  if (req.user?.role !== 'SALES_AGENT' && req.user?.role !== 'MANAGER') return true;
 
   const tenantId = req.tenantId!;
-  const mode = await getChatVisibilityMode(tenantId);
+  const mode = req.user.role === 'SALES_AGENT' ? await getChatVisibilityMode(tenantId) : 'ASSIGNED_ONLY';
   if (mode === 'COMPANY_WIDE') {
     return true;
   }
 
-  const profile = await prisma.salesAgentProfile.findFirst({
-    where: { userId: req.user.userId, tenantId },
-    select: { id: true },
-  });
-
-  if (!profile) return false;
-  if (conversation.assignedFreelancerId === profile.id) return true;
+  const scope = await getWorkspaceScope(tenantId, req.user);
+  if (!scope.profileIds.length) return false;
+  if (conversation.assignedFreelancerId && scope.profileIds.includes(conversation.assignedFreelancerId)) return true;
 
   // Check if lead with this conversation or phone is assigned to this closer
   const lead = await prisma.salesLeadAssignment.findFirst({
     where: {
       tenantId,
-      assignedAgentId: profile.id,
+      assignedAgentId: { in: scope.profileIds },
       OR: [
         { conversationId: conversation.id },
         ...(conversation.customerPhone ? [{ customerPhone: conversation.customerPhone }] : []),
@@ -121,7 +118,8 @@ conversationsRouter.get('/', validateQuery(listConversationsQuerySchema), async 
   const tenantId = req.tenantId!;
   const andConditions: any[] = [{ tenantId }];
 
-  // Strict SALES_AGENT permission scoping
+  // Closers see their assigned conversations. Managers see their reporting
+  // team. Admins retain the tenant-wide inbox.
   if (req.user?.role === 'SALES_AGENT') {
     const mode = await getChatVisibilityMode(tenantId);
     if (mode !== 'COMPANY_WIDE') {
@@ -148,6 +146,23 @@ conversationsRouter.get('/', validateQuery(listConversationsQuerySchema), async 
         ],
       });
     }
+  } else if (req.user?.role === 'MANAGER') {
+    const scope = await getWorkspaceScope(tenantId, req.user);
+    const assignedLeads = scope.profileIds.length
+      ? await prisma.salesLeadAssignment.findMany({
+          where: { tenantId, assignedAgentId: { in: scope.profileIds } },
+          select: { customerPhone: true, conversationId: true },
+        })
+      : [];
+    const phones = assignedLeads.map((lead) => lead.customerPhone).filter(Boolean) as string[];
+    const convIds = assignedLeads.map((lead) => lead.conversationId).filter(Boolean) as string[];
+    andConditions.push({
+      OR: [
+        ...(scope.profileIds.length ? [{ assignedFreelancerId: { in: scope.profileIds } }] : []),
+        ...(convIds.length ? [{ id: { in: convIds } }] : []),
+        ...(phones.length ? [{ customerPhone: { in: phones } }] : []),
+      ],
+    });
   }
 
   if (status) andConditions.push({ status });

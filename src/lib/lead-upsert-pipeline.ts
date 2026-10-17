@@ -1,6 +1,8 @@
 import { prisma } from './prisma.js';
+import { SalesLeadStage } from '@prisma/client';
 import { logger } from './logger.js';
 import { assignLeadToNextCloser } from './lead-assignment-engine.js';
+import { normalizeLeadPhone, syncMarketingContactForLead } from './lead-contact-sync.js';
 
 export interface UpsertLeadParams {
   tenantId: string;
@@ -11,6 +13,7 @@ export interface UpsertLeadParams {
   serviceInterest?: string | null;
   budgetAmount?: number | null;
   notes?: string | null;
+  stage?: SalesLeadStage;
   customFields?: Record<string, any>;
   conversationId?: string | null;
   assignedAgentId?: string | null;
@@ -30,18 +33,7 @@ export interface UpsertLeadResult {
 /**
  * Normalize phone number to consistent E.164-compatible representation
  */
-export function normalizePhoneNumber(raw?: string | null): string | null {
-  if (!raw) return null;
-  const digits = String(raw).replace(/\D/g, '');
-  if (!digits) return null;
-  if (String(raw).trim().startsWith('+')) {
-    return `+${digits}`;
-  }
-  if (digits.length === 10) {
-    return `+91${digits}`;
-  }
-  return `+${digits}`;
-}
+export const normalizePhoneNumber = normalizeLeadPhone;
 
 /**
  * Universal Tenant-Isolated Lead Upsert & Ingestion Pipeline.
@@ -58,6 +50,7 @@ export async function upsertCompanyLead(params: UpsertLeadParams): Promise<Upser
     serviceInterest,
     budgetAmount,
     notes,
+    stage,
     customFields,
     conversationId,
     createdById,
@@ -99,6 +92,7 @@ export async function upsertCompanyLead(params: UpsertLeadParams): Promise<Upser
   // 2. Handle Duplicate Lead
   if (existingLead) {
     if (duplicateAction === 'SKIP') {
+      await syncMarketingContactForLead(existingLead).catch(() => undefined);
       return {
         lead: existingLead,
         isDuplicate: true,
@@ -124,6 +118,7 @@ export async function upsertCompanyLead(params: UpsertLeadParams): Promise<Upser
         serviceInterest: serviceInterest || existingLead.serviceInterest,
         budgetAmount: budgetAmount !== undefined && budgetAmount !== null ? budgetAmount : existingLead.budgetAmount,
         notes: updatedNotes,
+        ...(stage ? { stage, ...(stage !== existingLead.stage ? { stageChangedAt: new Date() } : {}) } : {}),
         customFields: mergedCustomFields,
         conversationId: conversationId || existingLead.conversationId,
         lastContactedAt: new Date(),
@@ -152,6 +147,8 @@ export async function upsertCompanyLead(params: UpsertLeadParams): Promise<Upser
         metadata: { source: upperSource },
       },
     }).catch(() => undefined);
+
+    await syncMarketingContactForLead(updated).catch(() => undefined);
 
     return {
       lead: updated,
@@ -196,32 +193,13 @@ export async function upsertCompanyLead(params: UpsertLeadParams): Promise<Upser
       notes: notes || `Lead created via ${upperSource}`,
       customFields: customFields || {},
       conversationId: conversationId || null,
-      stage: 'NEW',
+      stage: stage || 'NEW',
     },
   });
 
-  // 4. Synchronize to Marketing Contacts
-  if (normalizedPhone) {
-    await prisma.marketingContact.upsert({
-      where: {
-        tenantId_e164Phone: {
-          tenantId,
-          e164Phone: normalizedPhone,
-        },
-      },
-      create: {
-        tenantId,
-        fullName: customerName,
-        e164Phone: normalizedPhone,
-        email: normalizedEmail,
-        source: upperSource,
-      },
-      update: {
-        fullName: customerName,
-        email: normalizedEmail || undefined,
-      },
-    }).catch(() => undefined);
-  }
+  // 4. Synchronize to Marketing Contacts, including the canonical lead link
+  // and owner so both screens use the same source of truth.
+  await syncMarketingContactForLead(newLead).catch(() => undefined);
 
   // 5. Create Timeline Entry & Activity Log
   await prisma.salesLeadTimelineEntry.create({
@@ -252,6 +230,10 @@ export async function upsertCompanyLead(params: UpsertLeadParams): Promise<Upser
   const finalizedLead = await prisma.salesLeadAssignment.findUnique({
     where: { id: newLead.id },
   });
+
+  if (finalizedLead) {
+    await syncMarketingContactForLead(finalizedLead).catch(() => undefined);
+  }
 
   return {
     lead: finalizedLead || newLead,

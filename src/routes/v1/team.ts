@@ -251,6 +251,7 @@ teamRouter.patch('/:id', requirePermissions(PERM_TEAM_MANAGE), validateBody(upda
 teamRouter.get('/permissions/matrix', async (req: Request, res: Response) => {
   const permissionsCatalog = [
     { key: 'leads:view', label: 'View Leads', category: 'CRM' },
+    { key: 'contacts:view', label: 'View Contacts', category: 'CRM' },
     { key: 'leads:create', label: 'Create Leads', category: 'CRM' },
     { key: 'leads:claim', label: 'Claim Pool Leads', category: 'CRM' },
     { key: 'leads:reassign', label: 'Reassign Leads', category: 'CRM' },
@@ -269,6 +270,7 @@ teamRouter.get('/permissions/matrix', async (req: Request, res: Response) => {
     ADMIN: permissionsCatalog.reduce((acc, p) => ({ ...acc, [p.key]: true }), {}),
     MANAGER: {
       'leads:view': true,
+      'contacts:view': true,
       'leads:create': true,
       'leads:claim': true,
       'leads:reassign': true,
@@ -284,6 +286,7 @@ teamRouter.get('/permissions/matrix', async (req: Request, res: Response) => {
     },
     SALES_AGENT: {
       'leads:view': true,
+      'contacts:view': true,
       'leads:create': true,
       'leads:claim': true,
       'leads:reassign': false,
