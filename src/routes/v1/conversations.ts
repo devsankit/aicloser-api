@@ -1080,6 +1080,13 @@ conversationsRouter.get('/:id/shares', async (req: Request, res: Response) => {
       conversationId: conversation.id,
       assignedAgentId: conversation.assignedFreelancerId,
       assignedAgentName: conversation.assignedFreelancerName,
+      companyAdminAccess: {
+        hasAccess: true,
+        role: 'ADMIN',
+        permission: 'REPLY',
+        isPermanent: true,
+        description: 'Company administrators have permanent visibility and reply access to all company conversations',
+      },
       sharesCount: enrichedShares.length,
       shares: enrichedShares,
     },
@@ -1148,6 +1155,25 @@ conversationsRouter.post('/:id/shares', validateBody(createShareSchema), async (
     }
     targetUserId = targetUser.id;
     targetDisplayName = targetUser.displayName;
+  }
+
+  // Company Administrators already have permanent access to all conversations
+  const targetUserRole = targetAgentProfile?.user?.role;
+  if (targetUserRole === 'ADMIN' || targetUserRole === 'SUPER_ADMIN') {
+    res.status(200).json({
+      success: true,
+      code: 'ADMIN_PERMANENT_ACCESS',
+      message: `${targetDisplayName || 'Admin'} is a Company Administrator and already has permanent full access to all company conversations`,
+      data: {
+        userId: targetUserId,
+        displayName: targetDisplayName,
+        role: targetUserRole,
+        permission: 'REPLY',
+        isPermanent: true,
+      },
+      error: null,
+    });
+    return;
   }
 
   // Prevent sharing with the currently assigned agent (they already have primary access)
@@ -1279,6 +1305,24 @@ conversationsRouter.delete('/:id/shares/:userId', async (req: Request, res: Resp
       success: false,
       error: 'Forbidden',
       message: 'Only workspace administrators or the assigned agent can revoke chat shares',
+    });
+    return;
+  }
+
+  // Administrators have permanent company access and cannot be unshared
+  const targetUserCheck = await prisma.appAuthUser.findFirst({
+    where: {
+      tenantId,
+      OR: [{ id: targetUserParam }],
+    },
+    select: { role: true },
+  });
+
+  if (targetUserCheck?.role === 'ADMIN' || targetUserCheck?.role === 'SUPER_ADMIN') {
+    res.status(400).json({
+      success: false,
+      error: 'CannotRevokeAdminAccess',
+      message: 'Company administrators have permanent company access to all conversations and cannot be revoked',
     });
     return;
   }
