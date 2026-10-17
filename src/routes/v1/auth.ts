@@ -8,6 +8,7 @@ import { authenticate } from '../../middlewares/auth.js';
 import { validateBody } from '../../middlewares/validate.js';
 import { AuthenticatedUser } from '../../types/auth.js';
 import { acquireClientSession, ClientSlotOccupiedError, closeClientSession, touchClientSession } from '../../lib/client-sessions.js';
+import { logger } from '../../lib/logger.js';
 
 export const authRouter = Router();
 
@@ -328,6 +329,23 @@ authRouter.post('/signup', validateBody(signupSchema), async (req: Request, res:
     return { workspace: ws, user: usr };
   });
 
+  const installationId = req.body.installationId || req.header('x-installation-id') || ('web-session-' + randomUUID().slice(0, 12));
+  let clientSession;
+  try {
+    clientSession = await acquireClientSession({
+      userId: user.id,
+      tenantId: workspace.id,
+      channel: 'DESKTOP',
+      installationId,
+      deviceId: installationId,
+      deviceName: 'Desktop Web',
+      platform: 'WEB',
+      replaceExisting: true,
+    });
+  } catch (err) {
+    logger.warn('Failed to acquire initial client session during signup', { error: err instanceof Error ? err.message : err });
+  }
+
   // 4. Issue session JWT
   const userPayload: AuthenticatedUser = {
     userId: user.id,
@@ -336,6 +354,7 @@ authRouter.post('/signup', validateBody(signupSchema), async (req: Request, res:
     displayName: user.displayName,
     phone: user.phone ?? '',
     email: user.email,
+    sessionId: clientSession?.session?.sessionId || randomUUID(),
     clientType: 'DESKTOP',
   };
 
