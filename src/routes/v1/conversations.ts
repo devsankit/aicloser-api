@@ -886,8 +886,9 @@ conversationsRouter.patch('/:id/stage', async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const id = String(req.params.id);
   const { stage } = req.body as { stage: string };
+  const requestedStage = String(stage || '').trim().toUpperCase();
 
-  if (!stage) {
+  if (!requestedStage) {
     res.status(400).json({ success: false, error: 'InvalidRequest', message: 'stage is required' });
     return;
   }
@@ -901,28 +902,76 @@ conversationsRouter.patch('/:id/stage', async (req: Request, res: Response) => {
     return;
   }
 
+  const workspace = await prisma.aicloserWorkspace.findUnique({
+    where: { id: tenantId },
+    select: { settings: true },
+  });
+  const workspaceSettings = (workspace?.settings as Record<string, any>) || {};
+  const configuredStages = Array.isArray(workspaceSettings.pipelineStages) ? workspaceSettings.pipelineStages : [];
+  const supportedStages = new Set([
+    'NEW', 'CONTACTED', 'QUALIFIED', 'QUOTE_SENT', 'PAYMENT_PENDING', 'PAID',
+    'HANDOFF', 'CLOSED', 'LOST', 'CONVERTED_FREE', 'ASSIGNED', 'INTERESTED',
+    'WEBINAR_INVITED', 'WEBINAR_ATTENDED', 'FOLLOW_UP', 'NEGOTIATION',
+    'CLOSED_WON', 'CLOSED_LOST', 'NOT_REACHABLE', 'RECYCLED',
+  ]);
+  const isConfiguredCustomStage = configuredStages.some((configured: any) =>
+    String(configured?.key ?? configured?.id ?? '').trim().toUpperCase() === requestedStage,
+  );
+  if (!supportedStages.has(requestedStage) && !isConfiguredCustomStage) {
+    res.status(400).json({ success: false, error: 'InvalidStage', message: 'Choose a live workspace stage.' });
+    return;
+  }
+
+  const phoneDigits = String(conversation.customerPhone || '').replace(/\D/g, '');
+  const phoneSuffix = phoneDigits.length >= 10 ? phoneDigits.slice(-10) : '';
+
   const linkedLeads = await prisma.salesLeadAssignment.findMany({
     where: {
       tenantId,
       OR: [
         { conversationId: id },
         ...(conversation.customerPhone ? [{ customerPhone: conversation.customerPhone }] : []),
+        ...(phoneSuffix ? [{ customerPhone: { endsWith: phoneSuffix } }] : []),
       ],
     },
-    select: { id: true, stage: true },
+    select: { id: true, stage: true, customFields: true },
   });
 
-  const updateResult = await prisma.salesLeadAssignment.updateMany({
-    where: {
-      tenantId,
-      OR: [
-        { conversationId: id },
-        ...(conversation.customerPhone ? [{ customerPhone: conversation.customerPhone }] : []),
-      ],
-    },
+  if (!linkedLeads.length) {
+    res.status(404).json({ success: false, error: 'NotFound', message: 'No linked lead record found for this conversation' });
+    return;
+  }
+
+  if (supportedStages.has(requestedStage)) {
+    await prisma.salesLeadAssignment.updateMany({
+      where: { id: { in: linkedLeads.map((linkedLead) => linkedLead.id) } },
+      data: { stage: requestedStage as any, stageChangedAt: new Date(), conversationId: id },
+    });
+  } else {
+    await Promise.all(linkedLeads.map((linkedLead) => {
+      const currentCustomFields = linkedLead.customFields && typeof linkedLead.customFields === 'object' && !Array.isArray(linkedLead.customFields)
+        ? linkedLead.customFields as Record<string, unknown>
+        : {};
+      return prisma.salesLeadAssignment.update({
+        where: { id: linkedLead.id },
+        data: {
+          customFields: { ...currentCustomFields, customStage: requestedStage },
+          stageChangedAt: new Date(),
+          conversationId: id,
+        },
+      });
+    }));
+  }
+
+  const currentPayload = conversation.payload && typeof conversation.payload === 'object' && !Array.isArray(conversation.payload)
+    ? conversation.payload as Record<string, unknown>
+    : {};
+  await prisma.appConversation.update({
+    where: { id },
     data: {
-      stage: stage as any,
-      stageChangedAt: new Date(),
+      leadStatusId: requestedStage,
+      payload: { ...currentPayload, leadStatusId: requestedStage, updatedAt: new Date().toISOString() },
+      updatedAt: new Date(),
     },
   });
 
@@ -932,19 +981,19 @@ conversationsRouter.patch('/:id/stage', async (req: Request, res: Response) => {
       assignmentId: linkedLead.id,
       actorUserId: req.user?.userId,
       action: 'LEAD_STAGE_CHANGED',
-      note: `Lead stage changed from ${linkedLead.stage} to ${stage}`,
-      metadata: { previousStage: linkedLead.stage, newStage: stage, conversationId: id },
+      note: `Lead stage changed from ${linkedLead.stage} to ${requestedStage}`,
+      metadata: { previousStage: linkedLead.stage, newStage: requestedStage, conversationId: id },
     },
   }).catch(() => undefined)));
 
   await persistApiRealtimeEvent({
     tenantId,
     eventType: 'lead.stage_changed',
-    payload: { conversationId: id, stage },
+    payload: { conversationId: id, stage: requestedStage },
     actorUserId: req.user?.userId,
   }).catch(() => undefined);
 
-  res.json({ success: true, message: 'Lead stage updated successfully', affectedLeads: updateResult.count, error: null });
+  res.json({ success: true, message: 'Lead stage updated successfully', affectedLeads: linkedLeads.length, error: null });
 });
 
 // 9. POST /:id/notes - Add note to linked lead

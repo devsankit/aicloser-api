@@ -15,6 +15,11 @@ export interface RoundRobinSettings {
   enabled: boolean;
   mode: 'STRICT_ROUND_ROBIN' | 'WEIGHTED' | 'LOAD_BALANCED';
   maxActiveLeadsPerCloser: number;
+  allowNonAdminModifyLeads: boolean;
+  allowNonAdminDeleteLeads: boolean;
+  allowNonAdminImportData: boolean;
+  allowNonAdminExportData: boolean;
+  allowNonAdminBulkCampaigns: boolean;
   workingHoursOnly: boolean;
   workingHours: {
     start: string; // HH:mm
@@ -31,6 +36,11 @@ const DEFAULT_ROUND_ROBIN_SETTINGS: RoundRobinSettings = {
   enabled: true,
   mode: 'STRICT_ROUND_ROBIN',
   maxActiveLeadsPerCloser: 50,
+  allowNonAdminModifyLeads: true,
+  allowNonAdminDeleteLeads: false,
+  allowNonAdminImportData: true,
+  allowNonAdminExportData: false,
+  allowNonAdminBulkCampaigns: false,
   workingHoursOnly: false,
   workingHours: {
     start: '09:00',
@@ -139,6 +149,11 @@ const updateSettingsSchema = z.object({
   enabled: z.boolean().optional(),
   mode: z.enum(['STRICT_ROUND_ROBIN', 'WEIGHTED', 'LOAD_BALANCED']).optional(),
   maxActiveLeadsPerCloser: z.number().int().min(1).max(5000).optional(),
+  allowNonAdminModifyLeads: z.boolean().optional(),
+  allowNonAdminDeleteLeads: z.boolean().optional(),
+  allowNonAdminImportData: z.boolean().optional(),
+  allowNonAdminExportData: z.boolean().optional(),
+  allowNonAdminBulkCampaigns: z.boolean().optional(),
   workingHoursOnly: z.boolean().optional(),
   workingHours: z.object({
     start: z.string().regex(/^\d{2}:\d{2}$/),

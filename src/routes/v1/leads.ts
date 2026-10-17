@@ -704,7 +704,7 @@ leadsRouter.get('/:id/360', async (req: Request, res: Response) => {
       email: lead.assignedAgent.user?.email,
       phone: lead.assignedAgent.user?.phone,
     } : null,
-    timelineNotes: timeline,
+    timelineNotes: timeline.filter((entry) => entry.type === 'NOTE'),
     timeline,
     activityLogs,
     history,
@@ -825,6 +825,26 @@ leadsRouter.patch('/:id', validateBody(updateLeadSchema), async (req: Request, r
   const tenantId = req.tenantId!;
   const id = String(req.params.id);
   const body = req.body;
+
+  // The CRM settings toggle is enforced here as well as in the UI. This keeps
+  // direct API calls and the Kanban/list controls on the same permission rule.
+  if (req.user?.role !== 'ADMIN' && req.user?.role !== 'SUPER_ADMIN') {
+    const workspace = await prisma.aicloserWorkspace.findUnique({
+      where: { id: tenantId },
+      select: { settings: true },
+    });
+    const workspaceSettings = (workspace?.settings as Record<string, any>) || {};
+    const roundRobinSettings = (workspaceSettings.roundRobinSettings as Record<string, any>) || {};
+    if (roundRobinSettings.allowNonAdminModifyLeads === false) {
+      res.status(403).json({
+        success: false,
+        code: 'PERMISSION_DENIED',
+        error: 'Forbidden',
+        message: 'Only workspace administrators can modify leads. Ask an administrator to enable lead modification access.',
+      });
+      return;
+    }
+  }
 
   // First verify lead exists in this tenant
   const existing = await prisma.salesLeadAssignment.findFirst({
@@ -959,6 +979,23 @@ leadsRouter.patch('/:id', validateBody(updateLeadSchema), async (req: Request, r
         action: body.followUpAt ? 'CALLBACK_SCHEDULED' : 'CALLBACK_CLEARED',
         note: body.followUpAt ? `Callback scheduled for ${body.followUpAt}` : 'Callback cleared',
         metadata: { followUpAt: body.followUpAt },
+      },
+    }));
+  }
+
+  const historyHandledFields = new Set(['stage', 'assignedAgentId', 'followUpAt']);
+  const changedDetailFields = Object.keys(body)
+    .filter((field) => !historyHandledFields.has(field))
+    .filter((field) => JSON.stringify((existing as any)[field] ?? null) !== JSON.stringify((body as any)[field] ?? null));
+  if (changedDetailFields.length > 0) {
+    leadHistoryWrites.push(prisma.salesActivityLog.create({
+      data: {
+        tenantId,
+        assignmentId: existing.id,
+        actorUserId: req.user?.userId,
+        action: 'LEAD_DETAILS_UPDATED',
+        note: `Lead details updated: ${changedDetailFields.join(', ')}`,
+        metadata: { changedFields: changedDetailFields },
       },
     }));
   }
@@ -1229,7 +1266,8 @@ leadsRouter.get('/:id/notes', async (req: Request, res: Response) => {
   }
 
   const entries = await prisma.salesLeadTimelineEntry.findMany({
-    where: { leadId: check.lead.id, tenantId },
+    // Keep follow-up/task entries in the 360 history stream, not in notes.
+    where: { leadId: check.lead.id, tenantId, type: 'NOTE' },
     orderBy: { createdAt: 'desc' },
   });
 
@@ -1309,6 +1347,17 @@ leadsRouter.patch('/:id/notes/:noteId', async (req: Request, res: Response) => {
     data: { body: body.trim() },
   });
 
+  await prisma.salesActivityLog.create({
+    data: {
+      tenantId,
+      assignmentId: check.lead.id,
+      actorUserId: req.user?.userId,
+      action: 'NOTE_UPDATED',
+      note: 'Lead note updated',
+      metadata: { noteId, previousBody: existingNote.body, body: updated.body },
+    },
+  }).catch(() => undefined);
+
   res.json({ success: true, message: 'Note updated successfully', data: updated });
 });
 
@@ -1341,6 +1390,17 @@ leadsRouter.delete('/:id/notes/:noteId', async (req: Request, res: Response) => 
   await prisma.salesLeadTimelineEntry.delete({
     where: { id: noteId },
   });
+
+  await prisma.salesActivityLog.create({
+    data: {
+      tenantId,
+      assignmentId: check.lead.id,
+      actorUserId: req.user?.userId,
+      action: 'NOTE_DELETED',
+      note: 'Lead note deleted',
+      metadata: { noteId, body: existingNote.body },
+    },
+  }).catch(() => undefined);
 
   res.json({ success: true, message: 'Note deleted successfully', data: { deletedNoteId: noteId } });
 });
@@ -1396,6 +1456,17 @@ leadsRouter.post('/:id/tasks', async (req: Request, res: Response) => {
     },
   });
 
+  await prisma.salesActivityLog.create({
+    data: {
+      tenantId: check.lead.tenantId,
+      assignmentId: check.lead.id,
+      actorUserId: req.user?.userId,
+      action: 'FOLLOW_UP_CREATED',
+      note: `Follow-up created: ${task.title}`,
+      metadata: { taskId: task.id, dueAt: task.dueAt, priority: task.priority },
+    },
+  }).catch(() => undefined);
+
   res.status(201).json({ success: true, data: task });
 });
 
@@ -1427,6 +1498,17 @@ leadsRouter.patch('/:id/tasks/:taskId', async (req: Request, res: Response) => {
     },
   });
 
+  await prisma.salesActivityLog.create({
+    data: {
+      tenantId: check.lead.tenantId,
+      assignmentId: check.lead.id,
+      actorUserId: req.user?.userId,
+      action: 'FOLLOW_UP_UPDATED',
+      note: `Follow-up ${task.title} updated to ${task.status}`,
+      metadata: { taskId: task.id, previousStatus: existingTask.status, status: task.status },
+    },
+  }).catch(() => undefined);
+
   res.json({ success: true, data: task });
 });
 
@@ -1452,6 +1534,17 @@ leadsRouter.delete('/:id/tasks/:taskId', async (req: Request, res: Response) => 
   await prisma.gxLeadTask.delete({
     where: { id: taskId },
   });
+
+  await prisma.salesActivityLog.create({
+    data: {
+      tenantId: check.lead.tenantId,
+      assignmentId: check.lead.id,
+      actorUserId: req.user?.userId,
+      action: 'FOLLOW_UP_DELETED',
+      note: `Follow-up deleted: ${existingTask.title}`,
+      metadata: { taskId, dueAt: existingTask.dueAt, status: existingTask.status },
+    },
+  }).catch(() => undefined);
 
   res.json({ success: true, message: 'Task deleted successfully' });
 });

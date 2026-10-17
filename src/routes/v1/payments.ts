@@ -2,6 +2,9 @@ import { persistApiRealtimeEvent } from '../../lib/realtime.js';
 import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import { randomUUID } from 'crypto';
+import fs from 'fs';
+import path from 'path';
+import multer from 'multer';
 import { prisma } from '../../lib/prisma.js';
 import { authenticate } from '../../middlewares/auth.js';
 import { requireRoles } from '../../middlewares/rbac.js';
@@ -10,6 +13,27 @@ import { validateBody, validateQuery } from '../../middlewares/validate.js';
 import { UpiPaymentDurationUnit, UpiPaymentLinkStatus } from '@prisma/client';
 
 export const paymentsRouter = Router();
+
+const upload = multer({
+  limits: { fileSize: 15 * 1024 * 1024 },
+  storage: multer.memoryStorage(),
+});
+
+const PROOF_BASE_DIR = path.resolve(process.cwd(), 'data', 'uploads', 'upi-payment-proofs');
+
+function resolveProofFilePath(relativePath: string): string | null {
+  const candidates = [
+    path.resolve(PROOF_BASE_DIR, relativePath),
+    path.resolve(process.cwd(), 'data', 'uploads', relativePath),
+    path.resolve(process.cwd(), relativePath),
+  ];
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) {
+      return candidate;
+    }
+  }
+  return null;
+}
 
 paymentsRouter.use(authenticate, enforceTenantIsolation);
 
@@ -282,4 +306,177 @@ paymentsRouter.post('/:id/reject', async (req: Request, res: Response) => {
   });
 
   res.json({ success: true, data: updated, message: 'Payment link rejected/cancelled' });
+});
+
+paymentsRouter.get('/:id', async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const id = String(req.params.id);
+
+  const payment = await prisma.upiPaymentLink.findFirst({
+    where: { id, tenantId },
+  });
+
+  if (!payment) {
+    res.status(404).json({ success: false, error: 'NotFound', message: 'Payment link not found' });
+    return;
+  }
+
+  if (req.user?.role === 'SALES_AGENT' && payment.createdByUserId !== req.user.userId) {
+    res.status(403).json({ success: false, error: 'Forbidden', message: 'You can only view your own payment links' });
+    return;
+  }
+
+  res.json({
+    success: true,
+    data: {
+      ...payment,
+      hasProof: Boolean(payment.proofStoragePath),
+      paymentUrl: 'https://app.aicloser.in/pay/' + payment.publicToken,
+    },
+    error: null,
+  });
+});
+
+paymentsRouter.post('/:id/proof', upload.any(), async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const id = String(req.params.id);
+
+  const payment = await prisma.upiPaymentLink.findFirst({
+    where: { id, tenantId },
+  });
+
+  if (!payment) {
+    res.status(404).json({ success: false, error: 'NotFound', message: 'Payment link not found' });
+    return;
+  }
+
+  // Sales agent can only attach proof to their own payment links
+  if (req.user?.role === 'SALES_AGENT' && payment.createdByUserId !== req.user.userId) {
+    res.status(403).json({ success: false, error: 'Forbidden', message: 'You can only attach proof to your own payment links' });
+    return;
+  }
+
+  if (!['PENDING', 'CUSTOMER_CONFIRMED'].includes(payment.status)) {
+    res.status(400).json({ success: false, error: 'InvalidStatus', message: 'This payment link is no longer awaiting proof' });
+    return;
+  }
+
+  const file = (req.files && Array.isArray(req.files) ? req.files[0] : req.file);
+  const { utrReference, note, confirmationNote, base64Data, mimeType: bodyMimeType } = req.body as {
+    utrReference?: string;
+    note?: string;
+    confirmationNote?: string;
+    base64Data?: string;
+    mimeType?: string;
+  };
+
+  let fileBuffer: Buffer | null = null;
+  let mimeType = 'image/jpeg';
+  let sizeBytes = 0;
+  let ext = 'jpg';
+
+  if (file) {
+    fileBuffer = file.buffer;
+    mimeType = file.mimetype || 'image/jpeg';
+    sizeBytes = file.size;
+    if (mimeType.includes('png')) ext = 'png';
+    else if (mimeType.includes('webp')) ext = 'webp';
+    else if (mimeType.includes('pdf')) ext = 'pdf';
+    else ext = 'jpg';
+  } else if (base64Data) {
+    const cleanBase64 = base64Data.replace(/^data:.*?;base64,/, '');
+    fileBuffer = Buffer.from(cleanBase64, 'base64');
+    mimeType = bodyMimeType || 'image/jpeg';
+    sizeBytes = fileBuffer.length;
+    if (mimeType.includes('png')) ext = 'png';
+    else if (mimeType.includes('webp')) ext = 'webp';
+    else if (mimeType.includes('pdf')) ext = 'pdf';
+    else ext = 'jpg';
+  }
+
+  if (!fileBuffer || fileBuffer.length === 0) {
+    res.status(400).json({ success: false, error: 'FileRequired', message: 'Please provide a payment proof screenshot file or base64Data' });
+    return;
+  }
+
+  const filename = `${payment.id}-${randomUUID().slice(0, 8)}.${ext}`;
+  const proofRelativePath = path.join(tenantId, filename);
+  const storageFilePath = path.resolve(PROOF_BASE_DIR, proofRelativePath);
+
+  fs.mkdirSync(path.dirname(storageFilePath), { recursive: true });
+  fs.writeFileSync(storageFilePath, fileBuffer);
+
+  const updated = await prisma.upiPaymentLink.update({
+    where: { id: payment.id },
+    data: {
+      proofStoragePath: proofRelativePath,
+      proofMimeType: mimeType,
+      proofSizeBytes: sizeBytes,
+      status: UpiPaymentLinkStatus.CUSTOMER_CONFIRMED,
+      confirmedAt: new Date(),
+      confirmedByUserId: req.user?.userId || null,
+      utrReference: utrReference ? String(utrReference).trim() : payment.utrReference,
+      confirmationNote: (note || confirmationNote) ? String(note || confirmationNote).trim() : payment.confirmationNote,
+    },
+  });
+
+  await persistApiRealtimeEvent({
+    tenantId,
+    eventType: 'payment.proof_attached',
+    payload: {
+      paymentId: updated.id,
+      amount: updated.totalAmount,
+      customerName: updated.customerName,
+      customerPhone: updated.customerPhone,
+      hasProof: true,
+      status: updated.status,
+    },
+    actorUserId: req.user?.userId,
+  }).catch(() => undefined);
+
+  res.status(200).json({
+    success: true,
+    data: {
+      ...updated,
+      hasProof: true,
+      proofUrl: `/api/v1/payments/${updated.id}/proof`,
+    },
+    message: 'Payment screenshot attached successfully',
+    error: null,
+  });
+});
+
+paymentsRouter.get('/:id/proof', async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const id = String(req.params.id);
+
+  const payment = await prisma.upiPaymentLink.findFirst({
+    where: { id, tenantId },
+  });
+
+  if (!payment) {
+    res.status(404).json({ success: false, error: 'NotFound', message: 'Payment link not found' });
+    return;
+  }
+
+  // Sales agent can only view proof of their own links
+  if (req.user?.role === 'SALES_AGENT' && payment.createdByUserId !== req.user.userId) {
+    res.status(403).json({ success: false, error: 'Forbidden', message: 'You can only view payment proof for your own links' });
+    return;
+  }
+
+  if (!payment.proofStoragePath) {
+    res.status(404).json({ success: false, error: 'ProofNotFound', message: 'No proof screenshot attached to this payment link' });
+    return;
+  }
+
+  const filePath = resolveProofFilePath(payment.proofStoragePath);
+  if (!filePath || !fs.existsSync(filePath)) {
+    res.status(404).json({ success: false, error: 'FileNotFound', message: 'Proof file could not be found on storage' });
+    return;
+  }
+
+  res.setHeader('Content-Type', payment.proofMimeType || 'image/jpeg');
+  res.setHeader('Cache-Control', 'private, max-age=86400');
+  res.sendFile(filePath);
 });
