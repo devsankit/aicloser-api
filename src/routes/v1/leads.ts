@@ -23,6 +23,7 @@ const listLeadsQuerySchema = z.object({
   page: z.string().optional().transform((v) => (v ? Math.max(1, Number(v)) : 1)),
   limit: z.string().optional().transform((v) => (v ? Math.min(100, Math.max(1, Number(v))) : 25)),
   stage: salesLeadStageSchema.optional(),
+  status: salesLeadStageSchema.optional(),
   search: z.string().optional(),
   assignedAgentId: z.string().optional(),
   sortBy: z.enum(['kanbanPosition', 'createdAt', 'updatedAt', 'followUpAt', 'budgetAmount']).optional(),
@@ -918,6 +919,7 @@ leadsRouter.patch('/:id', validateBody(updateLeadSchema), async (req: Request, r
     targetAgentId = targetAgent.id;
   }
 
+  const targetStage = body.stage ?? body.status;
   const updated = await prisma.salesLeadAssignment.update({
     where: { id },
     data: {
@@ -925,7 +927,7 @@ leadsRouter.patch('/:id', validateBody(updateLeadSchema), async (req: Request, r
       ...(body.customerEmail !== undefined ? { customerEmail: body.customerEmail || null } : {}),
       ...(body.serviceInterest !== undefined ? { serviceInterest: body.serviceInterest || null } : {}),
       ...(body.segment !== undefined ? { segment: body.segment || null } : {}),
-      ...(body.stage !== undefined ? { stage: body.stage } : {}),
+      ...(targetStage !== undefined ? { stage: targetStage } : {}),
       ...(body.kanbanPosition !== undefined ? { kanbanPosition: body.kanbanPosition } : {}),
       ...(body.priority !== undefined ? { priority: body.priority } : {}),
       ...(body.notes !== undefined ? { notes: body.notes } : {}),
@@ -941,15 +943,16 @@ leadsRouter.patch('/:id', validateBody(updateLeadSchema), async (req: Request, r
   });
 
   const leadHistoryWrites: Promise<unknown>[] = [];
-  if (body.stage !== undefined && body.stage !== existing.stage) {
+  if (targetStage !== undefined && targetStage !== existing.stage) {
+    const newStageVal = targetStage;
     leadHistoryWrites.push(prisma.salesActivityLog.create({
       data: {
         tenantId,
         assignmentId: existing.id,
         actorUserId: req.user?.userId,
         action: 'LEAD_STAGE_CHANGED',
-        note: `Lead stage changed from ${existing.stage} to ${body.stage}`,
-        metadata: { previousStage: existing.stage, newStage: body.stage },
+        note: `Lead stage changed from ${existing.stage} to ${newStageVal}`,
+        metadata: { previousStage: existing.stage, newStage: newStageVal },
       },
     }));
   }
@@ -1013,7 +1016,7 @@ leadsRouter.patch('/:id', validateBody(updateLeadSchema), async (req: Request, r
   // Sync mirrored marketing contact with updated lead fields (name, email, assignee)
   await syncMarketingContactForLead(updated).catch(() => undefined);
 
-  res.json({ success: true, data: updated, error: null });
+  res.json({ success: true, data: { ...updated, status: updated.stage }, error: null });
 });
 
 leadsRouter.delete('/:id', async (req: Request, res: Response) => {

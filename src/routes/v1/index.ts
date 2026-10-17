@@ -68,6 +68,7 @@ v1Router.use('/workspace', workspaceRouter);
 // Integrations (WhatsApp, Instagram, Google Drive)
 v1Router.use('/integrations', integrationsRouter);
 v1Router.use('/integrations/google-drive', googleDriveRouter);
+v1Router.use('/google-drive', googleDriveRouter);
 
 // Marketing, Campaigns & Templates
 v1Router.use('/marketing', marketingRouter);

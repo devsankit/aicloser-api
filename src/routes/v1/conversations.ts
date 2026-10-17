@@ -13,6 +13,7 @@ import { validateBody, validateQuery } from '../../middlewares/validate.js';
 import { requireRoles, hasPermission, PERM_LEADS_REASSIGN } from '../../middlewares/rbac.js';
 import { persistApiRealtimeEvent } from '../../lib/realtime.js';
 import { getWorkspaceScope } from '../../lib/workspace-scope.js';
+import { syncMarketingContactForLead } from '../../lib/lead-contact-sync.js';
 
 export const conversationsRouter = Router();
 
@@ -270,6 +271,8 @@ conversationsRouter.get('/', validateQuery(listConversationsQuerySchema), async 
         customerName: true,
         customerPhone: true,
         status: true,
+        assignedFreelancerId: true,
+        assignedFreelancerName: true,
         payload: true,
         createdAt: true,
         updatedAt: true,
@@ -352,7 +355,12 @@ conversationsRouter.get('/', validateQuery(listConversationsQuerySchema), async 
             email: lead.assignedAgent.user?.email,
             phone: lead.assignedAgent.user?.phone,
           }
-        : null,
+        : c.assignedFreelancerId
+          ? {
+              id: c.assignedFreelancerId,
+              displayName: c.assignedFreelancerName || 'Assigned team member',
+            }
+          : null,
       adMetadata: (payload.adMetadata as any) || (lead?.customFields as any)?.adMetadata || null,
       isSharedWithMe: Boolean(
         Array.isArray(payload.shares) &&
@@ -647,6 +655,11 @@ conversationsRouter.post('/:id/read', async (req: Request, res: Response) => {
     return;
   }
 
+  if (!(await verifyCloserAccess(req, conversation))) {
+    res.status(403).json({ success: false, error: 'Forbidden', message: 'You do not have access to mark this conversation as read' });
+    return;
+  }
+
   const payload = (conversation.payload as Record<string, unknown>) || {};
   const readState = (payload.readStateByAudience as Record<string, string>) || {};
   readState.sales = new Date().toISOString();
@@ -675,6 +688,11 @@ conversationsRouter.post('/:id/attachments', upload.single('file'), async (req: 
 
   if (!conversation) {
     res.status(404).json({ success: false, data: null, error: 'NotFound', message: 'Conversation not found' });
+    return;
+  }
+
+  if (!(await verifyCloserAccess(req, conversation))) {
+    res.status(403).json({ success: false, data: null, error: 'Forbidden', message: 'You do not have access to upload attachments in this conversation' });
     return;
   }
 
@@ -756,6 +774,11 @@ conversationsRouter.get('/:id/attachments/:filename', async (req: Request, res: 
 
   if (!conversation) {
     res.status(404).json({ success: false, error: 'NotFound', message: 'Conversation not found' });
+    return;
+  }
+
+  if (!(await verifyCloserAccess(req, conversation))) {
+    res.status(403).json({ success: false, error: 'Forbidden', message: 'You do not have access to this attachment' });
     return;
   }
 
@@ -907,6 +930,7 @@ const handleAssignConversation = async (req: Request, res: Response) => {
     },
     select: { id: true, assignedAgentId: true },
   });
+
   await prisma.salesLeadAssignment.updateMany({
     where: {
       tenantId,
@@ -1008,6 +1032,13 @@ const handleUnassignConversation = async (req: Request, res: Response) => {
         note: 'Lead removed from the assigned team member',
         metadata: { previousAgentId: linkedLead.assignedAgentId, conversationId: id },
       },
+    }).catch(() => undefined);
+  }
+
+  if (conversation.customerPhone) {
+    await prisma.marketingContact.updateMany({
+      where: { tenantId, e164Phone: conversation.customerPhone },
+      data: { assignedAgentId: null, updatedAt: new Date() },
     }).catch(() => undefined);
   }
 
@@ -1139,6 +1170,7 @@ conversationsRouter.post('/:id/shares', validateBody(createShareSchema), async (
   let targetUserId = targetAgentProfile?.userId;
   let targetDisplayName = targetAgentProfile?.user?.displayName;
   let targetProfileId = targetAgentProfile?.id;
+  let targetUserRole = targetAgentProfile?.user?.role;
 
   if (!targetUserId) {
     const targetUser = await prisma.appAuthUser.findFirst({
@@ -1155,10 +1187,10 @@ conversationsRouter.post('/:id/shares', validateBody(createShareSchema), async (
     }
     targetUserId = targetUser.id;
     targetDisplayName = targetUser.displayName;
+    targetUserRole = targetUser.role;
   }
 
   // Company Administrators already have permanent access to all conversations
-  const targetUserRole = targetAgentProfile?.user?.role;
   if (targetUserRole === 'ADMIN' || targetUserRole === 'SUPER_ADMIN') {
     res.status(200).json({
       success: true,
@@ -1310,13 +1342,16 @@ conversationsRouter.delete('/:id/shares/:userId', async (req: Request, res: Resp
   }
 
   // Administrators have permanent company access and cannot be unshared
-  const targetUserCheck = await prisma.appAuthUser.findFirst({
-    where: {
-      tenantId,
-      OR: [{ id: targetUserParam }],
-    },
-    select: { role: true },
+  const targetProfile = await prisma.salesAgentProfile.findFirst({
+    where: { tenantId, OR: [{ id: targetUserParam }, { userId: targetUserParam }] },
+    select: { userId: true, user: { select: { role: true } } },
   });
+  const targetUserCheck = targetProfile
+    ? { id: targetProfile.userId, role: targetProfile.user.role }
+    : await prisma.appAuthUser.findFirst({
+        where: { tenantId, id: targetUserParam },
+        select: { id: true, role: true },
+      });
 
   if (targetUserCheck?.role === 'ADMIN' || targetUserCheck?.role === 'SUPER_ADMIN') {
     res.status(400).json({
@@ -1545,6 +1580,11 @@ conversationsRouter.patch('/:id/stage', async (req: Request, res: Response) => {
     return;
   }
 
+  if (!(await verifyCloserAccess(req, conversation))) {
+    res.status(403).json({ success: false, error: 'Forbidden', message: 'You do not have access to change this lead stage' });
+    return;
+  }
+
   const workspace = await prisma.aicloserWorkspace.findUnique({
     where: { id: tenantId },
     select: { settings: true },
@@ -1636,6 +1676,12 @@ conversationsRouter.patch('/:id/stage', async (req: Request, res: Response) => {
     actorUserId: req.user?.userId,
   }).catch(() => undefined);
 
+  // Sync mirrored marketing contact with updated lead stage
+  const updatedStageLeads = await prisma.salesLeadAssignment.findMany({
+    where: { id: { in: linkedLeads.map((linkedLead) => linkedLead.id) }, tenantId },
+  });
+  await Promise.all(updatedStageLeads.map((l) => syncMarketingContactForLead(l))).catch(() => undefined);
+
   res.json({ success: true, message: 'Lead stage updated successfully', affectedLeads: linkedLeads.length, error: null });
 });
 
@@ -1656,6 +1702,11 @@ conversationsRouter.post('/:id/notes', async (req: Request, res: Response) => {
 
   if (!conversation) {
     res.status(404).json({ success: false, error: 'NotFound', message: 'Conversation not found' });
+    return;
+  }
+
+  if (!(await verifyCloserAccess(req, conversation))) {
+    res.status(403).json({ success: false, error: 'Forbidden', message: 'You do not have access to add notes to this conversation' });
     return;
   }
 
@@ -1708,6 +1759,11 @@ conversationsRouter.post('/:id/callback', async (req: Request, res: Response) =>
     return;
   }
 
+  if (!(await verifyCloserAccess(req, conversation))) {
+    res.status(403).json({ success: false, error: 'Forbidden', message: 'You do not have access to schedule a follow-up for this conversation' });
+    return;
+  }
+
   const lead = await prisma.salesLeadAssignment.findFirst({
     where: {
       tenantId,
@@ -1724,6 +1780,10 @@ conversationsRouter.post('/:id/callback', async (req: Request, res: Response) =>
   }
 
   const parsedDate = new Date(followUpAt);
+  if (Number.isNaN(parsedDate.getTime())) {
+    res.status(400).json({ success: false, error: 'InvalidRequest', message: 'followUpAt must be a valid date string' });
+    return;
+  }
   await prisma.salesLeadAssignment.update({
     where: { id: lead.id },
     data: { followUpAt: parsedDate },

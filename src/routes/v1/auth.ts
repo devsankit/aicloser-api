@@ -171,12 +171,38 @@ authRouter.post('/heartbeat', authenticate, async (req: Request, res: Response) 
   res.json({ success: true, data: { lastActiveAt: session.lastActiveAt } });
 });
 
-authRouter.get('/me', authenticate, (req: Request, res: Response) => {
+authRouter.get('/me', authenticate, async (req: Request, res: Response) => {
+  const userId = req.user?.userId;
+  const dbUser = userId ? await prisma.appAuthUser.findUnique({
+    where: { id: userId },
+    include: {
+      salesAgentProfile: true,
+      AicloserWorkspace: true,
+    },
+  }) : null;
+
+  const freshPermissions = (dbUser?.salesAgentProfile?.permissions as Record<string, boolean>) || {};
+
   res.json({
     success: true,
     data: {
-      user: req.user,
-      tenantId: req.user?.tenantId,
+      user: {
+        ...req.user,
+        role: (dbUser?.role as AuthenticatedUser['role']) || req.user?.role,
+        displayName: dbUser?.displayName || req.user?.displayName,
+        email: dbUser?.email || req.user?.email,
+        phone: dbUser?.phone || req.user?.phone,
+        agentProfileId: dbUser?.salesAgentProfile?.id,
+        agentCode: dbUser?.salesAgentProfile?.agentCode,
+        permissions: freshPermissions,
+      },
+      tenantId: dbUser?.tenantId || req.user?.tenantId,
+      workspace: dbUser?.AicloserWorkspace ? {
+        id: dbUser.AicloserWorkspace.id,
+        name: dbUser.AicloserWorkspace.name,
+        slug: dbUser.AicloserWorkspace.slug,
+        planTier: dbUser.AicloserWorkspace.planTier,
+      } : null,
     },
   });
 });

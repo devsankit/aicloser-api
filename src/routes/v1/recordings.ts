@@ -181,10 +181,30 @@ recordingsRouter.get('/:id/playback', async (req: Request, res: Response) => {
       });
       const call = await prisma.salesMobileCall.findFirst({
         where: { id: upload.callId, tenantId: req.tenantId! },
-        select: { agentId: true },
+        select: { agentId: true, assignmentId: true },
       });
-      if (!profile || call?.agentId !== profile.id) {
-        res.status(403).json({ success: false, error: 'Forbidden', message: 'You can only listen to recordings for your own calls' });
+      let hasAccess = Boolean(profile && call?.agentId === profile.id);
+      if (!hasAccess && profile && call?.assignmentId) {
+        const assignment = await prisma.salesLeadAssignment.findFirst({
+          where: { id: call.assignmentId, tenantId: req.tenantId! },
+          select: { id: true, assignedAgentId: true, conversationId: true },
+        });
+        if (assignment?.assignedAgentId === profile.id) {
+          hasAccess = true;
+        } else if (assignment?.conversationId) {
+          const conv = await prisma.appConversation.findFirst({
+            where: { id: assignment.conversationId, tenantId: req.tenantId! },
+            select: { payload: true },
+          });
+          const payload = (conv?.payload as any) || {};
+          const sharedUserIds = Array.isArray(payload.sharedUserIds) ? payload.sharedUserIds : [];
+          if (sharedUserIds.includes(req.user.userId) || sharedUserIds.includes(profile.id)) {
+            hasAccess = true;
+          }
+        }
+      }
+      if (!hasAccess) {
+        res.status(403).json({ success: false, error: 'Forbidden', message: 'You can only listen to recordings for your own or shared calls' });
         return;
       }
     }
