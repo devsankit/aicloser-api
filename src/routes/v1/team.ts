@@ -1,4 +1,4 @@
-﻿import { Router, Request, Response } from 'express';
+import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import { prisma } from '../../lib/prisma.js';
 import { authenticate } from '../../middlewares/auth.js';
@@ -17,7 +17,11 @@ const updateAgentSchema = z.object({
   canClaimLeads: z.boolean().optional(),
   maxActiveLeads: z.number().optional(),
   parentAgentId: z.string().nullable().optional(),
-  permissions: z.record(z.boolean()).optional(),
+  permissions: z.record(z.any()).optional(),
+  role: z.enum(['ADMIN', 'MANAGER', 'SALES_AGENT', 'SUPER_ADMIN']).optional(),
+  displayName: z.string().optional(),
+  phone: z.string().optional(),
+  email: z.string().optional(),
 });
 
 // GET /me - Get own profile (accessible by any authenticated workspace user)
@@ -225,6 +229,18 @@ teamRouter.patch('/:id', requirePermissions(PERM_TEAM_MANAGE), validateBody(upda
     },
   });
 
+  if (profile.userId && (body.role || body.displayName || body.phone || body.email)) {
+    await prisma.user.update({
+      where: { id: profile.userId },
+      data: {
+        ...(body.role ? { role: body.role as any } : {}),
+        ...(body.displayName ? { displayName: body.displayName } : {}),
+        ...(body.phone ? { phone: body.phone } : {}),
+        ...(body.email ? { email: body.email } : {}),
+      },
+    }).catch(() => undefined);
+  }
+
   await prisma.salesActivityLog.create({
     data: {
       tenantId,
@@ -314,11 +330,17 @@ teamRouter.get('/permissions/matrix', async (req: Request, res: Response) => {
   });
 });
 
-teamRouter.put('/permissions/matrix', requireRoles('ADMIN', 'SUPER_ADMIN'), validateBody(z.object({
-  roles: z.object({ ADMIN: z.record(z.boolean()).optional(), MANAGER: z.record(z.boolean()).optional(), SALES_AGENT: z.record(z.boolean()).optional() }),
-})), async (req: Request, res: Response) => {
+const matrixBodySchema = z.union([
+  z.object({
+    roles: z.record(z.record(z.any())),
+  }),
+  z.record(z.record(z.any())),
+]);
+
+teamRouter.put('/permissions/matrix', requireRoles('ADMIN', 'SUPER_ADMIN'), validateBody(matrixBodySchema), async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
-  const { roles } = req.body as { roles: Record<string, Record<string, boolean>> };
+  const rawBody = req.body as any;
+  const roles: Record<string, Record<string, any>> = (rawBody && 'roles' in rawBody && rawBody.roles) ? rawBody.roles : rawBody;
   await prisma.$transaction(async (tx) => {
     const workspace = await tx.aicloserWorkspace.findUniqueOrThrow({ where: { id: tenantId }, select: { settings: true } });
     const settings = (workspace.settings as Record<string, unknown>) || {};
@@ -512,14 +534,18 @@ teamRouter.get('/:id/permissions', requirePermissions(PERM_TEAM_VIEW), async (re
 });
 
 // Update permissions schema
-const updatePermissionsSchema = z.object({
-  permissions: z.record(z.boolean()),
-});
+const updatePermissionsSchema = z.union([
+  z.object({
+    permissions: z.record(z.any()),
+  }),
+  z.record(z.any()),
+]);
 
 const handleUpdatePermissions = async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const id = String(req.params.id);
-  const { permissions } = req.body;
+  const rawBody = req.body as any;
+  const permissions = (rawBody && 'permissions' in rawBody && rawBody.permissions) ? rawBody.permissions : rawBody;
 
   const profile = await prisma.salesAgentProfile.findFirst({
     where: {

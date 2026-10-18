@@ -117,8 +117,8 @@ leadsRouter.get('/', validateQuery(listLeadsQuerySchema), async (req: Request, r
 const createLeadSchema = z.object({
   customerName: z.string().min(1, 'Customer name is required'),
   customerPhone: z.string().min(5, 'Phone number is required'),
-  customerEmail: z.string().email().optional(),
-  assignedAgentId: z.string().min(1, 'Assigned agent is required'),
+  customerEmail: z.string().email().optional().or(z.literal('')).transform((v) => v || undefined),
+  assignedAgentId: z.string().optional(),
   serviceInterest: z.string().optional(),
   segment: z.string().optional(),
   priority: z.string().default('normal'),
@@ -131,8 +131,8 @@ leadsRouter.post('/', validateBody(createLeadSchema), async (req: Request, res: 
   const tenantId = req.tenantId!;
   const body = req.body;
 
-  // Verify that the assigned agent belongs to the same tenant (resolving SalesAgentProfile.id or User.id)
-  const agent = await prisma.salesAgentProfile.findFirst({
+  // Resolve assigned agent: explicit ID -> caller profile -> first active agent -> auto-created agent profile
+  let agent = body.assignedAgentId ? await prisma.salesAgentProfile.findFirst({
     where: {
       tenantId,
       OR: [
@@ -140,13 +140,45 @@ leadsRouter.post('/', validateBody(createLeadSchema), async (req: Request, res: 
         { userId: body.assignedAgentId },
       ],
     },
-  });
+  }) : null;
+
+  if (!agent && req.user?.userId) {
+    agent = await prisma.salesAgentProfile.findFirst({
+      where: {
+        tenantId,
+        userId: req.user.userId,
+      },
+    });
+  }
+
+  if (!agent) {
+    agent = await prisma.salesAgentProfile.findFirst({
+      where: {
+        tenantId,
+        status: 'ACTIVE',
+      },
+    });
+  }
+
+  if (!agent && req.user?.userId) {
+    // Auto-create agent profile for workspace user if none exists
+    const agentCode = `AG-${Math.floor(1000 + Math.random() * 9000)}`;
+    agent = await prisma.salesAgentProfile.create({
+      data: {
+        tenantId,
+        userId: req.user.userId,
+        agentCode,
+        status: 'ACTIVE',
+        canClaimLeads: true,
+      },
+    });
+  }
 
   if (!agent) {
     res.status(400).json({
       success: false,
       error: 'InvalidAgent',
-      message: 'Assigned agent does not exist within your workspace',
+      message: 'No active sales agent profile found in workspace',
     });
     return;
   }
