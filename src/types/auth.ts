@@ -9,6 +9,7 @@ export interface AuthenticatedUser {
   email?: string | null;
   sessionId?: string;
   clientType?: 'MOBILE' | 'DESKTOP';
+  themePreference?: string | null;
 }
 
 declare global {

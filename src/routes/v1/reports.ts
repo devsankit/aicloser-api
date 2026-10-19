@@ -56,6 +56,7 @@ const getSummaryHandler = async (req: Request, res: Response) => {
     callDuration,
     leadsByStage,
     profiles,
+    paymentLinks,
   ] = await Promise.all([
     prisma.salesLeadAssignment.count({ where: { tenantId, ...dateFilter } }),
     prisma.salesLeadAssignment.count({ where: { tenantId, stage: 'CLOSED_WON', ...dateFilter } }),
@@ -87,12 +88,27 @@ const getSummaryHandler = async (req: Request, res: Response) => {
       },
       take: 20,
     }),
+    prisma.upiPaymentLink.findMany({
+      where: { tenantId },
+      select: { createdByUserId: true, status: true, totalAmount: true },
+    }),
   ]);
 
   const closedDealsCount = wonLeads + lostLeads;
   const winRatePercent = closedDealsCount > 0 ? Math.round((wonLeads / closedDealsCount) * 100) : 0;
   const totalCallSeconds = callDuration._sum?.durationSeconds || 0;
   const totalCallHours = Math.round((totalCallSeconds / 3600) * 10) / 10;
+
+  // Real Pipeline Value = shared payment URLs pending client completion
+  const pendingPaymentLinks = paymentLinks.filter(
+    (pl) => pl.status === 'PENDING' || pl.status === 'CUSTOMER_CONFIRMED'
+  );
+  const paidPaymentLinks = paymentLinks.filter((pl) => pl.status === 'PAID');
+  const paymentPendingRevenue = pendingPaymentLinks.reduce((sum, pl) => sum + Number(pl.totalAmount || 0), 0);
+  const paymentClosedRevenue = paidPaymentLinks.reduce((sum, pl) => sum + Number(pl.totalAmount || 0), 0);
+
+  const finalClosedRevenue = paymentClosedRevenue > 0 ? paymentClosedRevenue : Number(wonRevenue._sum?.budgetAmount || 0);
+  const finalPipelineRevenue = paymentPendingRevenue > 0 ? paymentPendingRevenue : Number(pipelineRevenue._sum?.budgetAmount || 0);
 
   const funnelStages = ['NEW', 'CONTACTED', 'QUALIFIED', 'INTERESTED', 'FOLLOW_UP', 'NEGOTIATION', 'PAYMENT_PENDING', 'CLOSED_WON', 'CLOSED_LOST'];
   const stageCountMap = new Map(leadsByStage.map((s) => [s.stage, s._count.id]));
@@ -107,6 +123,9 @@ const getSummaryHandler = async (req: Request, res: Response) => {
     const pRevenue = p.leadAssignments
       .filter((a) => a.stage === 'CLOSED_WON')
       .reduce((acc, a) => acc + Number(a.budgetAmount || 0), 0);
+    const userPaidLinks = paidPaymentLinks.filter((pl) => pl.createdByUserId === p.user.id || pl.createdByUserId === p.id);
+    const userWonRevenue = userPaidLinks.reduce((sum, pl) => sum + Number(pl.totalAmount || 0), 0);
+    const finalUserRevenue = userWonRevenue > 0 ? userWonRevenue : pRevenue;
     const pWinRate = pWonLeads + pLostLeads > 0 ? Math.round((pWonLeads / (pWonLeads + pLostLeads)) * 100) : 0;
 
     return {
@@ -118,7 +137,7 @@ const getSummaryHandler = async (req: Request, res: Response) => {
       wonLeads: pWonLeads,
       totalCalls: pCalls,
       totalDurationMinutes: Math.round(pDurationSec / 60),
-      closedRevenue: pRevenue,
+      closedRevenue: finalUserRevenue,
       winRate: pWinRate,
     };
   });
@@ -127,8 +146,9 @@ const getSummaryHandler = async (req: Request, res: Response) => {
     totalLeads,
     wonLeads,
     lostLeads,
-    closedRevenue: Number(wonRevenue._sum?.budgetAmount || 0),
-    pipelineRevenue: Number(pipelineRevenue._sum?.budgetAmount || 0),
+    closedRevenue: finalClosedRevenue,
+    pipelineRevenue: finalPipelineRevenue,
+    pendingPaymentLinksCount: pendingPaymentLinks.length,
     winRatePercent,
     totalCalls,
     totalCallHours,

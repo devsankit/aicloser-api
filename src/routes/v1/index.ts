@@ -1,4 +1,4 @@
-﻿import { Router } from 'express';
+import { Router } from 'express';
 import { authRouter } from './auth.js';
 import { leadsRouter } from './leads.js';
 import { contactsRouter } from './contacts.js';
@@ -28,11 +28,13 @@ import { payoutsRouter } from './payouts.js';
 import { referralsRouter } from './referrals.js';
 import { roundRobinRouter } from './round-robin.js';
 import { whatsappFlowsRouter } from './whatsapp-flows.js';
+import { usersRouter } from './users.js';
 
 export const v1Router = Router();
 
 // Core Canonical V1 API Domains
 v1Router.use('/auth', authRouter);
+v1Router.use('/users', usersRouter);
 v1Router.use('/leads', leadsRouter);
 v1Router.use('/contacts', contactsRouter);
 v1Router.use('/calls', callsRouter);

@@ -50,11 +50,27 @@ export const DEFAULT_AI_PROVIDERS: AiProviderConfig[] = [
     timeoutMs: 4000,
   },
   {
+    id: 'deepseek',
+    name: 'DeepSeek (V3 & R1)',
+    enabled: true,
+    model: 'deepseek-chat',
+    priority: 4,
+    timeoutMs: 6000,
+  },
+  {
+    id: 'grok',
+    name: 'xAI Grok (Grok-2 & Beta)',
+    enabled: true,
+    model: 'grok-2-latest',
+    priority: 5,
+    timeoutMs: 5000,
+  },
+  {
     id: 'fallback',
     name: 'Deterministic Consultative Closer Engine',
     enabled: true,
     model: 'aicloser-consultative-v1',
-    priority: 4,
+    priority: 6,
     timeoutMs: 500,
   },
 ];
@@ -170,6 +186,82 @@ async function callOpenAI(apiKey: string, model: string, systemPrompt: string, u
     const data = (await res.json()) as any;
     const text = data?.choices?.[0]?.message?.content?.trim();
     if (!text) throw new Error('Empty completion from OpenAI');
+    return text;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Helper: Call DeepSeek API
+async function callDeepSeek(apiKey: string, model: string, systemPrompt: string, userMessage: string, timeoutMs: number): Promise<string> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const res = await fetch('https://api.deepseek.com/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model: model || 'deepseek-chat',
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userMessage },
+        ],
+        temperature: 0.5,
+        max_tokens: 350,
+      }),
+      signal: controller.signal,
+    });
+
+    if (!res.ok) {
+      const errText = await res.text().catch(() => '');
+      throw new Error(`DeepSeek API HTTP ${res.status}: ${errText.slice(0, 150)}`);
+    }
+
+    const data = (await res.json()) as any;
+    const text = data?.choices?.[0]?.message?.content?.trim();
+    if (!text) throw new Error('Empty completion from DeepSeek');
+    return text;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Helper: Call xAI Grok API
+async function callGrok(apiKey: string, model: string, systemPrompt: string, userMessage: string, timeoutMs: number): Promise<string> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const res = await fetch('https://api.x.ai/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model: model || 'grok-2-latest',
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userMessage },
+        ],
+        temperature: 0.5,
+        max_tokens: 350,
+      }),
+      signal: controller.signal,
+    });
+
+    if (!res.ok) {
+      const errText = await res.text().catch(() => '');
+      throw new Error(`xAI Grok API HTTP ${res.status}: ${errText.slice(0, 150)}`);
+    }
+
+    const data = (await res.json()) as any;
+    const text = data?.choices?.[0]?.message?.content?.trim();
+    if (!text) throw new Error('Empty completion from xAI Grok');
     return text;
   } finally {
     clearTimeout(timer);
@@ -339,6 +431,40 @@ export async function generateAiCloserReply(params: {
         };
       }
 
+      if (provider.id === 'deepseek') {
+        const apiKey = (provider.apiKey ? decryptSecret(provider.apiKey) : null) || process.env.DEEPSEEK_API_KEY;
+        if (!apiKey) continue;
+        const text = await callDeepSeek(apiKey, provider.model, systemPrompt, messageText, provider.timeoutMs || 6000);
+        return {
+          reply: text,
+          provider: 'deepseek',
+          model: provider.model,
+          confidence: 0.94,
+          tokensUsed: 120,
+          latencyMs: Date.now() - pStart,
+          suggestedFollowUps: ['Schedule Call', 'Share Proposal PDF'],
+          matchedIntent: 'AI_AGENT_GENERATED',
+          sources: ['deepseek_ai'],
+        };
+      }
+
+      if (provider.id === 'grok') {
+        const apiKey = (provider.apiKey ? decryptSecret(provider.apiKey) : null) || process.env.GROK_API_KEY || process.env.XAI_API_KEY;
+        if (!apiKey) continue;
+        const text = await callGrok(apiKey, provider.model, systemPrompt, messageText, provider.timeoutMs || 5000);
+        return {
+          reply: text,
+          provider: 'grok',
+          model: provider.model,
+          confidence: 0.95,
+          tokensUsed: 125,
+          latencyMs: Date.now() - pStart,
+          suggestedFollowUps: ['Schedule Call', 'Share Proposal PDF'],
+          matchedIntent: 'AI_AGENT_GENERATED',
+          sources: ['xai_grok'],
+        };
+      }
+
       if (provider.id === 'fallback') {
         const fallback = executeDeterministicFallback(messageText, customerName, botConfig);
         return {
@@ -402,6 +528,14 @@ export async function testAiProvider(params: {
       const key = apiKey || process.env.OPENAI_API_KEY;
       if (!key) throw new Error('Missing OpenAI API key');
       reply = await callOpenAI(key, model || 'gpt-4o-mini', sys, prompt, 6000);
+    } else if (providerId === 'deepseek') {
+      const key = apiKey || process.env.DEEPSEEK_API_KEY;
+      if (!key) throw new Error('Missing DeepSeek API key');
+      reply = await callDeepSeek(key, model || 'deepseek-chat', sys, prompt, 6000);
+    } else if (providerId === 'grok') {
+      const key = apiKey || process.env.GROK_API_KEY || process.env.XAI_API_KEY;
+      if (!key) throw new Error('Missing xAI Grok API key');
+      reply = await callGrok(key, model || 'grok-2-latest', sys, prompt, 6000);
     } else if (providerId === 'fallback') {
       const fb = executeDeterministicFallback(prompt, 'Friend', {});
       reply = fb.reply;

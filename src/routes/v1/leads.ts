@@ -358,12 +358,18 @@ leadsRouter.get('/dashboard-summary', async (req: Request, res: Response) => {
   const startOfDay = new Date(now.getFullYear(), now.getMonth(), now.getDate());
   const endOfDay = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59, 999);
 
+  const paymentLinkWhere: any = { tenantId };
+  if (req.user?.role === 'SALES_AGENT') {
+    paymentLinkWhere.createdByUserId = req.user.userId;
+  }
+
   const [
     totalLeads,
     hotLeads,
     followUpsToday,
     followUpsPending,
     stageAggregates,
+    paymentLinks,
   ] = await Promise.all([
     prisma.salesLeadAssignment.count({ where }),
     prisma.salesLeadAssignment.count({
@@ -391,27 +397,40 @@ leadsRouter.get('/dashboard-summary', async (req: Request, res: Response) => {
       _count: { id: true },
       _sum: { budgetAmount: true },
     }),
+    prisma.upiPaymentLink.findMany({
+      where: paymentLinkWhere,
+      select: { status: true, totalAmount: true },
+    }),
   ]);
 
   let wonCount = 0;
   let wonAmount = 0;
   let lostCount = 0;
-  let pipelineValue = 0;
   const stageCounts: Record<string, number> = {};
 
   for (const item of stageAggregates) {
     const count = item._count?.id ?? 0;
-    const value = Number(item._sum?.budgetAmount ?? 0);
     stageCounts[item.stage] = count;
 
     if (item.stage === 'CLOSED_WON' || (item.stage as string) === 'PAID') {
       wonCount += count;
-      wonAmount += value;
     } else if (item.stage === 'CLOSED_LOST' || (item.stage as string) === 'LOST') {
       lostCount += count;
-    } else {
-      pipelineValue += value;
     }
+  }
+
+  // Real Payment-Centric Pipeline Value:
+  // Total sum of payment URLs shared with leads where payment is PENDING or CUSTOMER_CONFIRMED (not paid yet)
+  const pendingLinks = paymentLinks.filter(
+    (pl) => pl.status === 'PENDING' || pl.status === 'CUSTOMER_CONFIRMED'
+  );
+  const paidLinks = paymentLinks.filter((pl) => pl.status === 'PAID');
+
+  const pipelineValue = pendingLinks.reduce((sum, pl) => sum + Number(pl.totalAmount || 0), 0);
+  const paidAmount = paidLinks.reduce((sum, pl) => sum + Number(pl.totalAmount || 0), 0);
+  if (paidLinks.length > 0) {
+    wonCount = paidLinks.length;
+    wonAmount = paidAmount;
   }
 
   const conversionRate = totalLeads > 0 ? Number(((wonCount / totalLeads) * 100).toFixed(1)) : 0;
@@ -427,6 +446,7 @@ leadsRouter.get('/dashboard-summary', async (req: Request, res: Response) => {
       wonAmount,
       lostCount,
       pipelineValue,
+      pendingPaymentLinksCount: pendingLinks.length,
       conversionRate,
       stageCounts,
     },

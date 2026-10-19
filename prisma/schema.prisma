@@ -2037,6 +2037,7 @@ model AppAuthUser {
   otpCode                    String
   permissions                String[]
   isSeeded                   Boolean                        @default(false)
+  themePreference            String?                        @default("light")
   createdAt                  DateTime                       @default(now())
   createdByUserId            String?
   lastLoginAt                DateTime?

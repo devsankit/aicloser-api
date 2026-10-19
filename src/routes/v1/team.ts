@@ -29,33 +29,46 @@ teamRouter.get('/me', async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const user = req.user!;
 
-  const profile = await prisma.salesAgentProfile.findFirst({
-    where: { userId: user.userId, tenantId },
-    include: {
-      user: {
-        select: {
-          id: true,
-          displayName: true,
-          email: true,
-          phone: true,
-          role: true,
+  const [profile, myPaymentLinks] = await Promise.all([
+    prisma.salesAgentProfile.findFirst({
+      where: { userId: user.userId, tenantId },
+      include: {
+        user: {
+          select: {
+            id: true,
+            displayName: true,
+            email: true,
+            phone: true,
+            role: true,
+          },
+        },
+        parentAgent: {
+          select: {
+            id: true,
+            agentCode: true,
+            user: { select: { displayName: true, email: true } },
+          },
+        },
+        _count: {
+          select: {
+            leadAssignments: true,
+            mobileCalls: true,
+          },
         },
       },
-      parentAgent: {
-        select: {
-          id: true,
-          agentCode: true,
-          user: { select: { displayName: true, email: true } },
-        },
-      },
-      _count: {
-        select: {
-          leadAssignments: true,
-          mobileCalls: true,
-        },
-      },
-    },
-  });
+    }),
+    prisma.upiPaymentLink.findMany({
+      where: { tenantId, createdByUserId: user.userId },
+      select: { status: true, totalAmount: true },
+    }),
+  ]);
+
+  const myPending = myPaymentLinks.filter(
+    (pl) => pl.status === 'PENDING' || pl.status === 'CUSTOMER_CONFIRMED'
+  );
+  const myPaid = myPaymentLinks.filter((pl) => pl.status === 'PAID');
+  const myPipelineValue = myPending.reduce((sum, pl) => sum + Number(pl.totalAmount || 0), 0);
+  const myDealsWon = myPaid.length;
 
   if (!profile) {
     res.json({
@@ -73,6 +86,8 @@ teamRouter.get('/me', async (req: Request, res: Response) => {
         permissions: {},
         assignedLeadsCount: 0,
         callsCount: 0,
+        pipelineValue: myPipelineValue,
+        dealsWon: myDealsWon,
       },
     });
     return;
@@ -101,6 +116,8 @@ teamRouter.get('/me', async (req: Request, res: Response) => {
       permissions: profile.permissions || {},
       assignedLeadsCount: profile._count.leadAssignments,
       callsCount: profile._count.mobileCalls,
+      pipelineValue: myPipelineValue,
+      dealsWon: myDealsWon,
       createdAt: profile.createdAt,
     },
   });
@@ -120,7 +137,7 @@ teamRouter.get('/', requirePermissions(PERM_TEAM_VIEW), async (req: Request, res
     whereClause.status = 'ACTIVE';
   }
 
-  const [workspace, profiles] = await Promise.all([
+  const [workspace, profiles, paymentLinks] = await Promise.all([
     prisma.aicloserWorkspace.findUnique({
       where: { id: tenantId },
       select: { id: true, name: true },
@@ -153,6 +170,15 @@ teamRouter.get('/', requirePermissions(PERM_TEAM_VIEW), async (req: Request, res
       },
       orderBy: { createdAt: 'desc' },
     }),
+    prisma.upiPaymentLink.findMany({
+      where: { tenantId },
+      select: {
+        id: true,
+        createdByUserId: true,
+        status: true,
+        totalAmount: true,
+      },
+    }),
   ]);
 
   const canSeeCommissions = user.role === 'SUPER_ADMIN' || user.role === 'ADMIN';
@@ -165,31 +191,50 @@ teamRouter.get('/', requirePermissions(PERM_TEAM_VIEW), async (req: Request, res
     );
   }
 
-  const team = filteredProfiles.map((p) => ({
-    id: p.id,
-    userId: p.user.id,
-    displayName: p.user.displayName,
-    email: p.user.email,
-    phone: p.user.phone,
-    role: p.user.role,
-    agentCode: p.agentCode,
-    status: p.status,
-    commissionPercent: canSeeCommissions || p.userId === user.userId
-      ? (p.commissionPercent ? Number(p.commissionPercent) : 0)
-      : undefined,
-    canClaimLeads: p.canClaimLeads,
-    maxActiveLeads: p.maxActiveLeads,
-    parentAgentId: p.parentAgentId,
-    reportingManager: p.parentAgent ? {
-      id: p.parentAgent.id,
-      agentCode: p.parentAgent.agentCode,
-      name: p.parentAgent.user?.displayName,
-    } : null,
-    permissions: p.permissions,
-    assignedLeadsCount: p._count.leadAssignments,
-    callsCount: p._count.mobileCalls,
-    createdAt: p.createdAt,
-  }));
+  const team = filteredProfiles.map((p) => {
+    // Real Pipeline Value: sum of payment URLs shared with leads where payment is NOT received yet (PENDING / CUSTOMER_CONFIRMED)
+    const memberLinks = paymentLinks.filter(
+      (pl) => pl.createdByUserId === p.user.id || pl.createdByUserId === p.id
+    );
+    const pendingLinks = memberLinks.filter(
+      (pl) => pl.status === 'PENDING' || pl.status === 'CUSTOMER_CONFIRMED'
+    );
+    const paidLinks = memberLinks.filter((pl) => pl.status === 'PAID');
+
+    const pipelineValue = pendingLinks.reduce((sum, pl) => sum + Number(pl.totalAmount || 0), 0);
+    const dealsWon = paidLinks.length;
+    const wonAmount = paidLinks.reduce((sum, pl) => sum + Number(pl.totalAmount || 0), 0);
+
+    return {
+      id: p.id,
+      userId: p.user.id,
+      displayName: p.user.displayName,
+      email: p.user.email,
+      phone: p.user.phone,
+      role: p.user.role,
+      agentCode: p.agentCode,
+      status: p.status,
+      commissionPercent: canSeeCommissions || p.userId === user.userId
+        ? (p.commissionPercent ? Number(p.commissionPercent) : 0)
+        : undefined,
+      canClaimLeads: p.canClaimLeads,
+      maxActiveLeads: p.maxActiveLeads,
+      parentAgentId: p.parentAgentId,
+      reportingManager: p.parentAgent ? {
+        id: p.parentAgent.id,
+        agentCode: p.parentAgent.agentCode,
+        name: p.parentAgent.user?.displayName,
+      } : null,
+      permissions: p.permissions,
+      assignedLeadsCount: p._count.leadAssignments,
+      callsCount: p._count.mobileCalls,
+      pipelineValue,
+      dealsWon,
+      wonAmount,
+      pendingPaymentsCount: pendingLinks.length,
+      createdAt: p.createdAt,
+    };
+  });
 
   res.json({
     success: true,
@@ -575,3 +620,120 @@ const handleUpdatePermissions = async (req: Request, res: Response) => {
 // PUT /:id/permissions & PATCH /:id/permissions - Direct permissions map update (accepts profile ID or user ID)
 teamRouter.patch('/:id/permissions', requirePermissions(PERM_TEAM_MANAGE), validateBody(updatePermissionsSchema), handleUpdatePermissions);
 teamRouter.put('/:id/permissions', requirePermissions(PERM_TEAM_MANAGE), validateBody(updatePermissionsSchema), handleUpdatePermissions);
+
+// DELETE /:id - Permanently delete / remove team member from workspace
+teamRouter.delete('/:id', requirePermissions(PERM_TEAM_MANAGE), async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const id = String(req.params.id);
+
+  try {
+    const profile = await prisma.salesAgentProfile.findFirst({
+      where: {
+        tenantId,
+        OR: [{ id }, { userId: id }],
+      },
+      include: {
+        user: { select: { id: true, email: true, role: true, displayName: true } },
+      },
+    });
+
+    if (!profile) {
+      // Check if direct AppAuthUser
+      const directUser = await prisma.appAuthUser.findFirst({
+        where: { id, tenantId },
+      });
+      if (directUser) {
+        if (directUser.role === 'ADMIN' || directUser.role === 'SUPER_ADMIN') {
+          res.status(400).json({ success: false, error: 'CannotDeleteAdmin', message: 'Workspace admin cannot be deleted' });
+          return;
+        }
+        await prisma.salesAgentProfile.deleteMany({ where: { userId: directUser.id, tenantId } }).catch(() => undefined);
+        await prisma.appAuthUser.delete({ where: { id: directUser.id } }).catch(async () => {
+          await prisma.appAuthUser.update({ where: { id: directUser.id }, data: { packageStatus: 'PAUSED' } });
+        });
+        res.json({ success: true, message: 'Team member removed from workspace', data: { id: directUser.id } });
+        return;
+      }
+
+      res.status(404).json({ success: false, error: 'NotFound', message: 'Team member profile not found in workspace' });
+      return;
+    }
+
+    // Safety guard: Admin / Super Admin cannot be deleted
+    if (profile.user?.role === 'ADMIN' || profile.user?.role === 'SUPER_ADMIN') {
+      res.status(400).json({
+        success: false,
+        error: 'CannotDeleteAdmin',
+        message: 'Workspace owner/admin account cannot be removed.',
+      });
+      return;
+    }
+
+    const userId = profile.userId;
+
+    // 1. Unassign active lead assignments
+    await prisma.salesLeadAssignment.deleteMany({
+      where: { assignedAgentId: profile.id },
+    }).catch(() => undefined);
+
+    // 2. Unassign reporting children to prevent foreign key errors
+    await prisma.salesAgentProfile.updateMany({
+      where: { parentAgentId: profile.id },
+      data: { parentAgentId: null },
+    }).catch(() => undefined);
+
+    // 3. Delete SalesAgentProfile
+    await prisma.salesAgentProfile.delete({
+      where: { id: profile.id },
+    }).catch(async (err) => {
+      console.warn('[teamRouter.delete] Profile delete fallback:', err.message);
+      await prisma.salesAgentProfile.update({
+        where: { id: profile.id },
+        data: { status: SalesAgentStatus.SUSPENDED, permissions: {} },
+      });
+    });
+
+    // 4. Delete associated AppAuthUser
+    if (userId) {
+      await prisma.appAuthUser.delete({
+        where: { id: userId },
+      }).catch(async (err) => {
+        console.warn('[teamRouter.delete] AppAuthUser delete fallback:', err.message);
+        await prisma.appAuthUser.update({
+          where: { id: userId },
+          data: { packageStatus: 'PAUSED' },
+        }).catch(() => undefined);
+      });
+
+      // Clear sessions
+      await prisma.appClientSession.deleteMany({
+        where: { userId },
+      }).catch(() => undefined);
+    }
+
+    // 5. Activity log
+    await prisma.salesActivityLog.create({
+      data: {
+        tenantId,
+        actorUserId: req.user?.userId,
+        action: 'TEAM_MEMBER_DELETED',
+        note: `Team member ${profile.user?.displayName || profile.agentCode} removed from workspace`,
+        metadata: { targetProfileId: profile.id, userId },
+      },
+    }).catch(() => undefined);
+
+    res.json({
+      success: true,
+      message: 'Team member permanently deleted from workspace',
+      data: { id: profile.id, userId },
+      error: null,
+    });
+  } catch (error) {
+    console.error('[teamRouter.delete] Error deleting team member:', error);
+    res.status(500).json({
+      success: false,
+      error: 'DeleteFailed',
+      message: error instanceof Error ? error.message : 'Could not delete team member',
+    });
+  }
+});

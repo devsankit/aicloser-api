@@ -947,7 +947,7 @@ aiRouter.get('/providers', async (req: Request, res: Response) => {
 const updateProvidersSchema = z.object({
   providers: z.array(
     z.object({
-      id: z.enum(['groq', 'gemini', 'openai', 'fallback']),
+      id: z.enum(['groq', 'gemini', 'openai', 'deepseek', 'grok', 'fallback']),
       enabled: z.boolean().optional(),
       model: z.string().optional(),
       apiKey: z.string().optional(),
@@ -1020,7 +1020,7 @@ aiRouter.patch('/providers', requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN'), va
 
 // POST /test-provider - Test connectivity to a specific provider
 const testProviderSchema = z.object({
-  providerId: z.enum(['groq', 'gemini', 'openai', 'fallback']),
+  providerId: z.enum(['groq', 'gemini', 'openai', 'deepseek', 'grok', 'fallback']),
   apiKey: z.string().optional(),
   model: z.string().optional(),
   prompt: z.string().optional(),

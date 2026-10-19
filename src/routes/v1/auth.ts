@@ -65,6 +65,7 @@ authRouter.post('/login', validateBody(loginSchema), async (req: Request, res: R
       email: true,
       passwordHash: true,
       passwordSalt: true,
+      themePreference: true,
     },
   });
 
@@ -127,6 +128,7 @@ authRouter.post('/login', validateBody(loginSchema), async (req: Request, res: R
     email: user.email,
     sessionId: clientSession.session.sessionId,
     clientType,
+    themePreference: user.themePreference || 'light',
   };
 
   const token = jwt.sign(userPayload, env.JWT_SECRET, { expiresIn: '30d' });
@@ -197,6 +199,7 @@ authRouter.get('/me', authenticate, async (req: Request, res: Response) => {
         agentProfileId: dbUser?.salesAgentProfile?.id,
         agentCode: dbUser?.salesAgentProfile?.agentCode,
         permissions: freshPermissions,
+        themePreference: dbUser?.themePreference || 'light',
       },
       tenantId: dbUser?.tenantId || req.user?.tenantId,
       workspace: dbUser?.AicloserWorkspace ? {
@@ -207,6 +210,20 @@ authRouter.get('/me', authenticate, async (req: Request, res: Response) => {
       } : null,
     },
   });
+});
+
+authRouter.patch('/theme', authenticate, async (req: Request, res: Response) => {
+  const userId = req.user?.userId;
+  if (!userId) {
+    res.status(401).json({ success: false, error: 'Unauthorized' });
+    return;
+  }
+  const themePref = String(req.body.themePreference || req.body.theme || '').toLowerCase() === 'dark' ? 'dark' : 'light';
+  await prisma.appAuthUser.update({
+    where: { id: userId },
+    data: { themePreference: themePref },
+  });
+  res.json({ success: true, data: { themePreference: themePref } });
 });
 
 authRouter.post('/logout', authenticate, async (req: Request, res: Response) => {
