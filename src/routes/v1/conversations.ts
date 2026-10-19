@@ -578,16 +578,35 @@ conversationsRouter.get('/:id/messages', async (req: Request, res: Response) => 
   const startIndex = Math.max(0, endIndex - limit);
   const sliced = rawMessages.slice(startIndex, endIndex);
 
-  const messages: CleanChatMessage[] = sliced.map((m) => ({
-    id: String(m.id || randomUUID()),
-    body: String(m.body || ''),
-    lane: m.lane === 'internal' ? 'internal' : 'customer',
-    createdAt: String(m.createdAt || new Date().toISOString()),
-    senderRole: (m.senderRole === 'sales' ? 'sales' : m.senderRole === 'system' ? 'system' : m.senderRole === 'ai' ? 'ai' : 'customer'),
-    senderLabel: typeof m.senderLabel === 'string' ? m.senderLabel : undefined,
-    status: (m.status as CleanChatMessage['status']) || 'delivered',
-    attachments: Array.isArray(m.attachments) ? (m.attachments as CleanChatMessage['attachments']) : undefined,
-  }));
+  const messages: CleanChatMessage[] = sliced.map((m) => {
+    const isOutbound =
+      m.fromMe === true ||
+      m.direction === 'OUTBOUND' ||
+      m.senderRole === 'sales' ||
+      m.senderRole === 'admin' ||
+      m.senderRole === 'closer' ||
+      m.senderRole === 'agent' ||
+      m.senderRole === 'ai' ||
+      (typeof m.senderLabel === 'string' &&
+        (m.senderLabel.toLowerCase() === 'admin' ||
+          m.senderLabel.toLowerCase() === 'sales closer'));
+
+    return {
+      id: String(m.id || randomUUID()),
+      body: String(m.body || ''),
+      lane: m.lane === 'internal' ? 'internal' : 'customer',
+      createdAt: String(m.createdAt || new Date().toISOString()),
+      senderRole: isOutbound
+        ? 'sales'
+        : m.senderRole === 'system'
+        ? 'system'
+        : 'customer',
+      senderLabel: typeof m.senderLabel === 'string' ? m.senderLabel : undefined,
+      senderType: (m.senderType === 'AI' ? 'AI' : isOutbound ? 'HUMAN' : 'CUSTOMER') as CleanChatMessage['senderType'],
+      status: (m.status as CleanChatMessage['status']) || (m.deliveryStatus as CleanChatMessage['status']) || 'delivered',
+      attachments: Array.isArray(m.attachments) ? (m.attachments as CleanChatMessage['attachments']) : undefined,
+    };
+  });
 
   res.json({
     success: true,
