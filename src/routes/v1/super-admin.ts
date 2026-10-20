@@ -99,6 +99,36 @@ superAdminRouter.get('/tenants', validateQuery(listTenantsQuerySchema), async (r
   });
 });
 
+const createTenantSchema = z.object({
+  name: z.string().min(2, 'Name required'),
+  slug: z.string().min(2).optional(),
+  ownerEmail: z.string().email().optional(),
+  ownerPhone: z.string().optional(),
+  maxSeats: z.coerce.number().int().min(1).default(5),
+});
+
+// POST /tenants - Provision new tenant workspace
+superAdminRouter.post('/tenants', validateBody(createTenantSchema), async (req: Request, res: Response) => {
+  const { name, slug, ownerEmail, ownerPhone, maxSeats } = req.body as z.infer<typeof createTenantSchema>;
+  const workspaceId = 'ws-' + randomUUID().slice(0, 10);
+  const baseSlug = (slug || name).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'workspace';
+  const workspaceSlug = `${baseSlug}-${Math.random().toString(36).slice(2, 6)}`;
+
+  const workspace = await prisma.aicloserWorkspace.create({
+    data: {
+      id: workspaceId,
+      name,
+      slug: workspaceSlug,
+      ownerEmail: ownerEmail || null,
+      ownerPhone: ownerPhone || null,
+      status: 'ACTIVE',
+      maxSeats,
+    },
+  });
+
+  res.status(201).json({ success: true, data: workspace });
+});
+
 // GET /tenants/:id - Workspace detail
 superAdminRouter.get('/tenants/:id', async (req: Request, res: Response) => {
   const { id } = req.params;
@@ -375,7 +405,7 @@ const listWorkspaceUsersQuerySchema = z.object({
   page: z.coerce.number().int().min(1).default(1),
   limit: z.coerce.number().int().min(1).max(100).default(25),
   search: z.string().trim().optional(),
-  role: z.enum(['ADMIN', 'MANAGER', 'SALES_AGENT']).optional(),
+  role: z.enum(['ADMIN', 'MANAGER', 'SALES_AGENT', 'USER']).optional(),
   status: z.enum(['ACTIVE', 'PAUSED', 'EXPIRED']).optional(),
 });
 
@@ -389,7 +419,7 @@ superAdminRouter.get('/tenants/:tenantId/users', validateQuery(listWorkspaceUser
   };
 
   if (role) {
-    where.role = role;
+    where.role = role === 'USER' ? 'SALES_AGENT' : role;
   }
 
   if (status) {
@@ -541,7 +571,7 @@ superAdminRouter.post('/tenants/:tenantId/users', validateBody(createUserSchema)
       id: user.id,
       email: user.email,
       displayName: user.displayName,
-      role: user.role,
+      role: user.role === 'SALES_AGENT' ? 'USER' : user.role,
       temporaryPassword: body.password ? undefined : rawPassword,
     },
     message: 'User created successfully in workspace',
@@ -550,7 +580,7 @@ superAdminRouter.post('/tenants/:tenantId/users', validateBody(createUserSchema)
 
 const updateUserSchema = z.object({
   displayName: z.string().trim().min(1).optional(),
-  role: z.enum(['ADMIN', 'MANAGER', 'SALES_AGENT']).optional(),
+  role: z.enum(['ADMIN', 'MANAGER', 'SALES_AGENT', 'USER']).optional(),
   password: z.string().min(6, 'Password must be at least 6 characters').optional(),
   phone: z.string().trim().optional(),
   packageStatus: z.enum(['ACTIVE', 'PAUSED', 'EXPIRED']).optional(),
@@ -582,7 +612,7 @@ superAdminRouter.patch('/tenants/:tenantId/users/:userId', validateBody(updateUs
     data: {
       ...(body.displayName ? { displayName: body.displayName } : {}),
       ...(body.phone !== undefined ? { phone: body.phone } : {}),
-      ...(body.role ? { role: body.role as any, assignedRole: body.role as any } : {}),
+      ...(body.role ? { role: (body.role === 'USER' ? 'SALES_AGENT' : body.role) as any, assignedRole: (body.role === 'USER' ? 'SALES_AGENT' : body.role) as any } : {}),
       ...(body.packageStatus ? { packageStatus: body.packageStatus as any } : {}),
       ...passwordData,
     },
