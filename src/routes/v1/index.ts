@@ -4,6 +4,7 @@ import { leadsRouter } from './leads.js';
 import { contactsRouter } from './contacts.js';
 import { callsRouter } from './calls.js';
 import { conversationsRouter } from './conversations.js';
+import { chatRouter } from './chat.js';
 import { superAdminRouter } from './super-admin.js';
 import { webhooksRouter } from './webhooks.js';
 import { recordingsRouter } from './recordings.js';
@@ -29,6 +30,7 @@ import { referralsRouter } from './referrals.js';
 import { roundRobinRouter } from './round-robin.js';
 import { whatsappFlowsRouter } from './whatsapp-flows.js';
 import { usersRouter } from './users.js';
+import { developerRouter } from './developer.js';
 
 export const v1Router = Router();
 
@@ -39,6 +41,7 @@ v1Router.use('/leads', leadsRouter);
 v1Router.use('/contacts', contactsRouter);
 v1Router.use('/calls', callsRouter);
 v1Router.use('/conversations', conversationsRouter);
+v1Router.use('/chat', chatRouter);
 v1Router.use('/super-admin', superAdminRouter);
 v1Router.use('/webhooks', webhooksRouter);
 v1Router.use('/recordings', recordingsRouter);
@@ -81,3 +84,6 @@ v1Router.use('/sales/whatsapp-flows', whatsappFlowsRouter);
 
 // Dedicated AI Engine (Consultative Reply, Lead Scoring, Transcribe, Objection Handling, Copilot, Bot)
 v1Router.use('/ai', aiRouter);
+
+// Developer Hub & Sandbox Request Runner
+v1Router.use('/developer', developerRouter);

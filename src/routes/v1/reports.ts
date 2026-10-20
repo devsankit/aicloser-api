@@ -33,7 +33,7 @@ function escapeCsvField(val: any): string {
   return '"' + str.replace(/"/g, '""') + '"';
 }
 
-// 1. GET /summary & /overview
+// 1. GET /unified, /overview & /summary - Unified Analytics & Reporting Engine
 const getSummaryHandler = async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const from = req.query.from ? new Date(String(req.query.from)) : null;
@@ -46,18 +46,28 @@ const getSummaryHandler = async (req: Request, res: Response) => {
     }
   } : {};
 
+  const startOfToday = new Date();
+  startOfToday.setHours(0, 0, 0, 0);
+
   const [
     totalLeads,
     wonLeads,
     lostLeads,
     wonRevenue,
     pipelineRevenue,
-    totalCalls,
-    callDuration,
     leadsByStage,
+    totalCalls,
+    callsToday,
+    connectedCalls,
+    inboundCalls,
+    outboundCalls,
+    callDurationAgg,
+    totalCampaigns,
+    campaignCountsAgg,
     profiles,
     paymentLinks,
   ] = await Promise.all([
+    // Funnel queries
     prisma.salesLeadAssignment.count({ where: { tenantId, ...dateFilter } }),
     prisma.salesLeadAssignment.count({ where: { tenantId, stage: 'CLOSED_WON', ...dateFilter } }),
     prisma.salesLeadAssignment.count({ where: { tenantId, stage: 'CLOSED_LOST', ...dateFilter } }),
@@ -69,16 +79,29 @@ const getSummaryHandler = async (req: Request, res: Response) => {
       where: { tenantId, stage: { not: 'CLOSED_LOST' }, ...dateFilter },
       _sum: { budgetAmount: true },
     }),
-    prisma.salesMobileCall.count({ where: { tenantId, ...dateFilter } }),
-    prisma.salesMobileCall.aggregate({
-      where: { tenantId, ...dateFilter },
-      _sum: { durationSeconds: true },
-    }),
     prisma.salesLeadAssignment.groupBy({
       by: ['stage'],
       where: { tenantId, ...dateFilter },
       _count: { id: true },
     }),
+    // Telephony queries
+    prisma.salesMobileCall.count({ where: { tenantId, ...dateFilter } }),
+    prisma.salesMobileCall.count({ where: { tenantId, createdAt: { gte: startOfToday } } }),
+    prisma.salesMobileCall.count({ where: { tenantId, durationSeconds: { gt: 0 }, ...dateFilter } }),
+    prisma.salesMobileCall.count({ where: { tenantId, direction: 'INBOUND', ...dateFilter } }),
+    prisma.salesMobileCall.count({ where: { tenantId, direction: 'OUTBOUND', ...dateFilter } }),
+    prisma.salesMobileCall.aggregate({
+      where: { tenantId, ...dateFilter },
+      _sum: { durationSeconds: true },
+      _avg: { durationSeconds: true },
+    }),
+    // Marketing campaign queries
+    prisma.whatsAppCampaign.count({ where: { tenantId, ...dateFilter } }),
+    prisma.whatsAppCampaign.aggregate({
+      where: { tenantId, ...dateFilter },
+      _sum: { sentCount: true, deliveredCount: true, readCount: true, repliedCount: true },
+    }),
+    // Closer profiles
     prisma.salesAgentProfile.findMany({
       where: { tenantId },
       include: {
@@ -86,8 +109,9 @@ const getSummaryHandler = async (req: Request, res: Response) => {
         leadAssignments: { where: dateFilter, select: { id: true, stage: true, budgetAmount: true } },
         mobileCalls: { where: dateFilter, select: { id: true, durationSeconds: true } },
       },
-      take: 20,
+      take: 50,
     }),
+    // Payment links
     prisma.upiPaymentLink.findMany({
       where: { tenantId },
       select: { createdByUserId: true, status: true, totalAmount: true },
@@ -95,11 +119,12 @@ const getSummaryHandler = async (req: Request, res: Response) => {
   ]);
 
   const closedDealsCount = wonLeads + lostLeads;
-  const winRatePercent = closedDealsCount > 0 ? Math.round((wonLeads / closedDealsCount) * 100) : 0;
-  const totalCallSeconds = callDuration._sum?.durationSeconds || 0;
+  const winRatePercent = closedDealsCount > 0 ? Number(((wonLeads / closedDealsCount) * 100).toFixed(1)) : 0;
+  const totalCallSeconds = callDurationAgg._sum?.durationSeconds || 0;
+  const averageDurationSeconds = Math.round(callDurationAgg._avg?.durationSeconds || 0);
   const totalCallHours = Math.round((totalCallSeconds / 3600) * 10) / 10;
 
-  // Real Pipeline Value = shared payment URLs pending client completion
+  // Real Payment Calculations
   const pendingPaymentLinks = paymentLinks.filter(
     (pl) => pl.status === 'PENDING' || pl.status === 'CUSTOMER_CONFIRMED'
   );
@@ -110,10 +135,57 @@ const getSummaryHandler = async (req: Request, res: Response) => {
   const finalClosedRevenue = paymentClosedRevenue > 0 ? paymentClosedRevenue : Number(wonRevenue._sum?.budgetAmount || 0);
   const finalPipelineRevenue = paymentPendingRevenue > 0 ? paymentPendingRevenue : Number(pipelineRevenue._sum?.budgetAmount || 0);
 
-  const funnelStages = ['NEW', 'CONTACTED', 'QUALIFIED', 'INTERESTED', 'FOLLOW_UP', 'NEGOTIATION', 'PAYMENT_PENDING', 'CLOSED_WON', 'CLOSED_LOST'];
+  // a) Funnel Conversion
   const stageCountMap = new Map(leadsByStage.map((s) => [s.stage, s._count.id]));
-  const funnel = funnelStages.map((stage) => ({ stage, count: stageCountMap.get(stage as any) || 0 }));
+  const funnelCounts: Record<string, number> = {
+    NEW: stageCountMap.get('NEW' as any) || 0,
+    CONTACTED: stageCountMap.get('CONTACTED' as any) || 0,
+    PITCHED: (stageCountMap.get('PITCHED' as any) || stageCountMap.get('QUALIFIED' as any) || 0),
+    NEGOTIATION: stageCountMap.get('NEGOTIATION' as any) || 0,
+    CLOSED_WON: wonLeads,
+    CLOSED_LOST: lostLeads,
+  };
 
+  const funnelList = [
+    { stage: 'NEW', count: funnelCounts.NEW },
+    { stage: 'CONTACTED', count: funnelCounts.CONTACTED },
+    { stage: 'PITCHED', count: funnelCounts.PITCHED },
+    { stage: 'NEGOTIATION', count: funnelCounts.NEGOTIATION },
+    { stage: 'CLOSED_WON', count: funnelCounts.CLOSED_WON },
+    { stage: 'CLOSED_LOST', count: funnelCounts.CLOSED_LOST },
+  ];
+
+  // b) Telephony Floor Stats
+  const telephony = {
+    totalCalls,
+    totalCallsToday: callsToday,
+    totalConnected: connectedCalls,
+    averageDurationSeconds,
+    totalDurationSeconds: totalCallSeconds,
+    totalCallHours,
+    inboundCount: inboundCalls,
+    outboundCount: outboundCalls,
+    connectionRatePercent: totalCalls > 0 ? Number(((connectedCalls / totalCalls) * 100).toFixed(1)) : 0,
+  };
+
+  // c) WhatsApp Campaign ROI
+  const totalSent = campaignCountsAgg._sum?.sentCount || 0;
+  const totalDelivered = campaignCountsAgg._sum?.deliveredCount || 0;
+  const totalRead = campaignCountsAgg._sum?.readCount || 0;
+  const totalReplied = campaignCountsAgg._sum?.repliedCount || 0;
+
+  const marketing = {
+    totalCampaigns,
+    totalSent,
+    totalDelivered,
+    totalRead,
+    totalReplied,
+    deliveryRatePercent: totalSent > 0 ? Number(((totalDelivered / totalSent) * 100).toFixed(1)) : 0,
+    readRatePercent: totalDelivered > 0 ? Number(((totalRead / totalDelivered) * 100).toFixed(1)) : (totalSent > 0 ? Number(((totalRead / totalSent) * 100).toFixed(1)) : 0),
+    replyRatePercent: totalRead > 0 ? Number(((totalReplied / totalRead) * 100).toFixed(1)) : (totalSent > 0 ? Number(((totalReplied / totalSent) * 100).toFixed(1)) : 0),
+  };
+
+  // d) Closer Leaderboard
   const leaderboard = profiles.map((p) => {
     const pTotalLeads = p.leadAssignments.length;
     const pWonLeads = p.leadAssignments.filter((a) => a.stage === 'CLOSED_WON').length;
@@ -126,13 +198,15 @@ const getSummaryHandler = async (req: Request, res: Response) => {
     const userPaidLinks = paidPaymentLinks.filter((pl) => pl.createdByUserId === p.user.id || pl.createdByUserId === p.id);
     const userWonRevenue = userPaidLinks.reduce((sum, pl) => sum + Number(pl.totalAmount || 0), 0);
     const finalUserRevenue = userWonRevenue > 0 ? userWonRevenue : pRevenue;
-    const pWinRate = pWonLeads + pLostLeads > 0 ? Math.round((pWonLeads / (pWonLeads + pLostLeads)) * 100) : 0;
+    const pWinRate = pWonLeads + pLostLeads > 0 ? Number(((pWonLeads / (pWonLeads + pLostLeads)) * 100).toFixed(1)) : 0;
 
     return {
       agentId: p.id,
       agentCode: p.agentCode,
       displayName: p.user?.displayName || 'Closer',
       email: p.user?.email,
+      leadsClosed: pWonLeads,
+      revenueClosed: finalUserRevenue,
       totalLeads: pTotalLeads,
       wonLeads: pWonLeads,
       totalCalls: pCalls,
@@ -140,9 +214,23 @@ const getSummaryHandler = async (req: Request, res: Response) => {
       closedRevenue: finalUserRevenue,
       winRate: pWinRate,
     };
-  });
+  }).sort((a, b) => b.revenueClosed - a.revenueClosed || b.leadsClosed - a.leadsClosed);
 
-  const payloadData = {
+  const unifiedData = {
+    funnel: {
+      counts: funnelCounts,
+      stageCounts: funnelList,
+      totalLeads,
+      wonLeads,
+      lostLeads,
+      totalPipelineValue: finalPipelineRevenue,
+      closedWonValue: finalClosedRevenue,
+      winRatePercent,
+    },
+    telephony,
+    marketing,
+    leaderboard,
+    // Flat convenience aggregates for legacy dashboard widgets
     totalLeads,
     wonLeads,
     lostLeads,
@@ -152,22 +240,23 @@ const getSummaryHandler = async (req: Request, res: Response) => {
     winRatePercent,
     totalCalls,
     totalCallHours,
-    funnel,
-    leaderboard,
   };
 
   res.json({
     success: true,
     ok: true,
-    data: payloadData,
-    funnel,
+    data: unifiedData,
+    funnel: funnelList,
     leaderboard,
+    telephony,
+    marketing,
     error: null,
   });
 };
 
-reportsRouter.get('/summary', getSummaryHandler);
+reportsRouter.get('/unified', getSummaryHandler);
 reportsRouter.get('/overview', getSummaryHandler);
+reportsRouter.get('/summary', getSummaryHandler);
 
 // 2. GET /closers
 reportsRouter.get('/closers', async (req: Request, res: Response) => {

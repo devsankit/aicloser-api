@@ -403,3 +403,50 @@ authRouter.post('/signup', validateBody(signupSchema), async (req: Request, res:
     error: null,
   });
 });
+
+// ==========================================
+// Developer Token Endpoints
+// ==========================================
+
+const issueDevTokenHandler = async (req: Request, res: Response, isCreate: boolean) => {
+  const user = req.user!;
+  const tenantId = user.tenantId || req.tenantId;
+
+  if (!tenantId) {
+    res.status(400).json({ success: false, error: 'TenantRequired', message: 'User must belong to a workspace' });
+    return;
+  }
+
+  const token = jwt.sign(
+    {
+      userId: user.userId,
+      tenantId,
+      role: user.role,
+      displayName: user.displayName,
+      email: user.email,
+      tokenType: 'DEVELOPER_API_TOKEN',
+    },
+    env.JWT_SECRET,
+    { expiresIn: '365d' }
+  );
+
+  const payload = {
+    token,
+    prefix: token.slice(0, 14) + '...',
+    scopes: ['leads:read', 'leads:write', 'campaigns:read', 'webhooks:write', 'forms:manage'],
+    expiresIn: '365d',
+    tenantId,
+    createdAt: new Date().toISOString(),
+  };
+
+  res.status(isCreate ? 201 : 200).json({
+    success: true,
+    message: isCreate ? 'Fresh developer API token generated' : 'Developer API token retrieved',
+    data: payload,
+    token,
+    error: null,
+  });
+};
+
+authRouter.get('/developer-token', authenticate, (req: Request, res: Response) => issueDevTokenHandler(req, res, false));
+authRouter.post('/developer-token', authenticate, (req: Request, res: Response) => issueDevTokenHandler(req, res, true));
