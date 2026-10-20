@@ -277,6 +277,219 @@ superAdminRouter.get('/tenants/:id', async (req: Request, res: Response) => {
   res.json({ success: true, data: workspace });
 });
 
+// ==========================================
+// WORKSPACE GENERAL UPDATE & CASCADE DELETE
+// ==========================================
+
+const updateGeneralTenantSchema = z.object({
+  name: z.string().min(2, 'Name must be at least 2 characters').optional(),
+  slug: z.string().min(2, 'Slug must be at least 2 characters').optional(),
+  ownerEmail: z.string().email('Invalid email address').optional(),
+  ownerPhone: z.string().optional(),
+  maxSeats: z.coerce.number().int().min(1, 'maxSeats must be at least 1').optional(),
+  planTier: z.enum(['FREE', 'STARTER', 'GROWTH', 'PRO', 'AGENCY', 'ENTERPRISE']).optional(),
+  status: z.enum(['ACTIVE', 'SUSPENDED', 'LOCKED']).optional(),
+  monthlyAmount: z.coerce.number().min(0, 'Monthly amount cannot be negative').optional(),
+  paymentStatus: z.enum(['PAID', 'PENDING']).optional(),
+  expiresAt: z.string().optional(),
+});
+
+// PATCH /tenants/:id - General Workspace Update
+superAdminRouter.patch('/tenants/:id', validateBody(updateGeneralTenantSchema), async (req: Request, res: Response) => {
+  const { id } = req.params;
+  const body = req.body as z.infer<typeof updateGeneralTenantSchema>;
+
+  const workspace = await prisma.aicloserWorkspace.findUnique({
+    where: { id: String(id) },
+  });
+
+  if (!workspace) {
+    res.status(404).json({ success: false, error: 'NotFound', message: 'Workspace not found' });
+    return;
+  }
+
+  // Check slug uniqueness if slug is being changed
+  if (body.slug && body.slug !== workspace.slug) {
+    const existingSlug = await prisma.aicloserWorkspace.findUnique({
+      where: { slug: body.slug },
+    });
+    if (existingSlug && existingSlug.id !== workspace.id) {
+      res.status(400).json({ success: false, error: 'SlugConflict', message: `Slug "${body.slug}" is already in use by another workspace` });
+      return;
+    }
+  }
+
+  const existingSettings = (workspace.settings as Record<string, any>) || {};
+  const updatedSettings = {
+    ...existingSettings,
+    ...(body.monthlyAmount !== undefined ? { monthlyAmount: body.monthlyAmount } : {}),
+    ...(body.paymentStatus !== undefined ? { paymentStatus: body.paymentStatus } : {}),
+    ...(body.expiresAt !== undefined ? { subscriptionExpiresAt: body.expiresAt, expiresAt: body.expiresAt } : {}),
+  };
+
+  const expiryDate = body.expiresAt ? new Date(body.expiresAt) : null;
+
+  // 1. Update workspace in PostgreSQL
+  const updated = await prisma.aicloserWorkspace.update({
+    where: { id: workspace.id },
+    data: {
+      name: body.name ?? undefined,
+      slug: body.slug ?? undefined,
+      ownerEmail: body.ownerEmail ?? undefined,
+      ownerPhone: body.ownerPhone ?? undefined,
+      maxSeats: body.maxSeats ?? undefined,
+      planTier: body.planTier ?? undefined,
+      status: body.status ?? undefined,
+      settings: updatedSettings,
+      updatedAt: new Date(),
+    },
+    include: {
+      _count: {
+        select: {
+          users: true,
+          leads: true,
+          mobileCalls: true,
+        },
+      },
+    },
+  });
+
+  // 2. If expiry changed, sync to users in workspace
+  if (expiryDate && !isNaN(expiryDate.getTime())) {
+    await prisma.appAuthUser.updateMany({
+      where: { tenantId: workspace.id },
+      data: { packageExpiresAt: expiryDate },
+    }).catch(() => undefined);
+  }
+
+  // 3. If owner email or phone changed, sync to owner AppAuthUser if exists
+  if ((body.ownerEmail || body.ownerPhone) && workspace.ownerUserId) {
+    await prisma.appAuthUser.update({
+      where: { id: workspace.ownerUserId },
+      data: {
+        email: body.ownerEmail ? body.ownerEmail.toLowerCase() : undefined,
+        phone: body.ownerPhone ?? undefined,
+      },
+    }).catch(() => undefined);
+  }
+
+  // 4. Record audit log
+  await prisma.salesActivityLog.create({
+    data: {
+      tenantId: workspace.id,
+      actorUserId: req.user?.userId,
+      action: 'WORKSPACE_UPDATED',
+      note: 'Workspace details updated by Super Admin',
+      metadata: { updates: body },
+    },
+  }).catch(() => undefined);
+
+  const finalSettings = (updated.settings as Record<string, any>) || {};
+  const formattedData = {
+    id: updated.id,
+    name: updated.name,
+    slug: updated.slug,
+    status: updated.status,
+    planTier: updated.planTier,
+    maxSeats: updated.maxSeats,
+    ownerEmail: updated.ownerEmail || null,
+    ownerPhone: updated.ownerPhone || null,
+    ownerUserId: updated.ownerUserId || null,
+    expiresAt: (finalSettings.subscriptionExpiresAt || finalSettings.expiresAt || null) as string | null,
+    monthlyAmount: Number(finalSettings.monthlyAmount ?? ((updated.maxSeats || 5) * 1999)),
+    paymentStatus: (finalSettings.paymentStatus || 'PAID') as 'PAID' | 'PENDING',
+    settings: updated.settings,
+    stats: {
+      usersCount: updated._count.users,
+      leadsCount: updated._count.leads,
+      callsCount: updated._count.mobileCalls,
+    },
+    createdAt: updated.createdAt,
+    updatedAt: updated.updatedAt,
+  };
+
+  res.json({
+    success: true,
+    message: 'Workspace updated successfully',
+    data: formattedData,
+    tenant: formattedData,
+    error: null,
+  });
+});
+
+// DELETE /tenants/:id - Safe Cascade Deletion of Workspace
+superAdminRouter.delete('/tenants/:id', async (req: Request, res: Response) => {
+  const workspaceId = String(req.params.id);
+
+  const workspace = await prisma.aicloserWorkspace.findUnique({
+    where: { id: workspaceId },
+  });
+
+  if (!workspace) {
+    res.status(404).json({ success: false, error: 'NotFound', message: 'Workspace not found' });
+    return;
+  }
+
+  try {
+    // Cascade delete all dependent records in topological order
+    await prisma.appClientSession.deleteMany({
+      where: {
+        OR: [
+          { tenantId: workspaceId },
+          { AppAuthUser: { tenantId: workspaceId } },
+        ],
+      },
+    }).catch(() => null);
+    await prisma.appClientSlot.deleteMany({ where: { tenantId: workspaceId } }).catch(() => null);
+    await prisma.appAgencyApiToken.deleteMany({ where: { tenantId: workspaceId } }).catch(() => null);
+    await prisma.salesLeadTimelineEntry.deleteMany({ where: { tenantId: workspaceId } }).catch(() => null);
+    await prisma.callRecordingUpload.deleteMany({ where: { tenantId: workspaceId } }).catch(() => null);
+    await prisma.salesMobileCall.deleteMany({ where: { tenantId: workspaceId } }).catch(() => null);
+    await prisma.salesMobileDevice.deleteMany({ where: { tenantId: workspaceId } }).catch(() => null);
+    await prisma.salesLeadPoolItem.deleteMany({ where: { tenantId: workspaceId } }).catch(() => null);
+    await prisma.salesEarning.deleteMany({ where: { tenantId: workspaceId } }).catch(() => null);
+    await prisma.salesPayout.deleteMany({ where: { tenantId: workspaceId } }).catch(() => null);
+    await prisma.salesDeal.deleteMany({ where: { tenantId: workspaceId } }).catch(() => null);
+    await prisma.salesCommissionRule.deleteMany({ where: { tenantId: workspaceId } }).catch(() => null);
+    await prisma.salesReferralCode.deleteMany({ where: { tenantId: workspaceId } }).catch(() => null);
+    await prisma.salesLeadAssignment.deleteMany({ where: { tenantId: workspaceId } }).catch(() => null);
+    await prisma.salesAgentProfile.deleteMany({ where: { tenantId: workspaceId } }).catch(() => null);
+    await prisma.marketingContact.deleteMany({ where: { tenantId: workspaceId } }).catch(() => null);
+    await prisma.whatsAppCampaignMessage.deleteMany({ where: { campaign: { tenantId: workspaceId } } }).catch(() => null);
+    await prisma.whatsAppCampaignRecipient.deleteMany({ where: { campaign: { tenantId: workspaceId } } }).catch(() => null);
+    await prisma.whatsAppCampaign.deleteMany({ where: { tenantId: workspaceId } }).catch(() => null);
+    await prisma.whatsAppTemplateVersion.deleteMany({ where: { template: { tenantId: workspaceId } } }).catch(() => null);
+    await prisma.whatsAppTemplate.deleteMany({ where: { tenantId: workspaceId } }).catch(() => null);
+    await prisma.whatsAppChannel.deleteMany({ where: { tenantId: workspaceId } }).catch(() => null);
+    await prisma.upiPaymentEvent.deleteMany({ where: { paymentLink: { tenantId: workspaceId } } }).catch(() => null);
+    await prisma.upiPaymentLink.deleteMany({ where: { tenantId: workspaceId } }).catch(() => null);
+    await prisma.appConversation.deleteMany({ where: { tenantId: workspaceId } }).catch(() => null);
+    await prisma.salesActivityLog.deleteMany({ where: { tenantId: workspaceId } }).catch(() => null);
+    await prisma.appAuthUser.deleteMany({ where: { tenantId: workspaceId } }).catch(() => null);
+    await prisma.aicloserWorkspace.delete({ where: { id: workspaceId } });
+
+    logger.info('Workspace deleted permanently by Super Admin', {
+      actorId: req.user?.userId,
+      workspaceId,
+      workspaceName: workspace.name,
+    });
+
+    res.json({
+      success: true,
+      message: `Workspace ${workspace.name} (${workspace.slug || workspaceId}) permanently deleted`,
+      data: { id: workspace.id, name: workspace.name, slug: workspace.slug },
+      error: null,
+    });
+  } catch (error) {
+    logger.error('Failed to cascade delete workspace', { error: String(error), workspaceId });
+    res.status(500).json({
+      success: false,
+      error: 'DeleteWorkspaceFailed',
+      message: error instanceof Error ? error.message : 'Could not delete workspace',
+    });
+  }
+});
+
 // GET /tenants/:id/plan - Workspace plan info
 superAdminRouter.get('/tenants/:id/plan', async (req: Request, res: Response) => {
   const { id } = req.params;
@@ -479,7 +692,12 @@ superAdminRouter.patch('/tenants/:id/amount', validateBody(updateAmountSchema), 
     },
   }).catch(() => undefined);
 
-  res.json({ success: true, message: `Monthly subscription amount set to ₹${monthlyAmount}`, data: { ...updated, monthlyAmount } });
+  res.json({
+    success: true,
+    message: `Monthly subscription amount set to ₹${monthlyAmount}`,
+    data: { ...updated, monthlyAmount },
+    tenant: { ...updated, monthlyAmount },
+  });
 });
 
 // PATCH /tenants/:id/payment-status - Update tenant payment status (PAID | PENDING)
