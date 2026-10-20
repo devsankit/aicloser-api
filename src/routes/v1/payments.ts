@@ -36,6 +36,81 @@ function resolveProofFilePath(relativePath: string): string | null {
   return null;
 }
 
+// ==========================================
+// 1. PUBLIC ENDPOINTS (No Authentication Required)
+// ==========================================
+
+// GET /public/:tokenOrId - Public endpoint for customer payment view (/pay/[token])
+paymentsRouter.get('/public/:tokenOrId', async (req: Request, res: Response) => {
+  const tokenOrId = String(req.params.tokenOrId).trim();
+
+  const payment = await prisma.upiPaymentLink.findFirst({
+    where: {
+      OR: [
+        { publicToken: tokenOrId },
+        { id: tokenOrId },
+      ],
+    },
+    include: {
+      createdBy: {
+        select: { displayName: true, email: true },
+      },
+    },
+  });
+
+  if (!payment) {
+    res.status(404).json({ success: false, error: 'NotFound', message: 'Payment request not found or expired' });
+    return;
+  }
+
+  const settings = await prisma.upiPaymentSetting.findUnique({
+    where: { tenantId: payment.tenantId },
+  });
+
+  const upiId = payment.upiIdSnapshot || settings?.upiId || 'aicloser@upi';
+  const payeeName = payment.payeeNameSnapshot || settings?.payeeName || 'AI Closer CRM';
+  const amount = Number(payment.totalAmount);
+  const note = payment.productName || 'Payment';
+  const upiUri = `upi://pay?pa=${encodeURIComponent(upiId)}&pn=${encodeURIComponent(payeeName)}&am=${amount.toFixed(2)}&cu=INR&tn=${encodeURIComponent(note)}`;
+
+  const paymentMeta = {
+    id: payment.id,
+    publicToken: payment.publicToken,
+    status: payment.status,
+    amount,
+    totalAmount: amount,
+    currency: payment.currency || 'INR',
+    customerName: payment.customerName,
+    customerPhone: payment.customerPhone,
+    customerEmail: payment.customerEmail,
+    productName: payment.productName,
+    description: payment.productName,
+    customerNote: payment.customerNote,
+    upiId,
+    payeeName,
+    upiUri,
+    payUrl: `https://app.aicloser.in/pay/${payment.publicToken}`,
+    paymentUrl: `https://app.aicloser.in/pay/${payment.publicToken}`,
+    hasProof: Boolean(payment.proofStoragePath),
+    utrReference: payment.utrReference,
+    paidAt: payment.paidAt,
+    createdAt: payment.createdAt,
+    tenantId: payment.tenantId,
+    creatorName: payment.createdBy?.displayName || 'Sales Agent',
+  };
+
+  res.json({
+    success: true,
+    payment: paymentMeta,
+    data: paymentMeta,
+  });
+});
+
+// ==========================================
+// AUTHENTICATED & TENANT-ISOLATED PIPELINE
+// ==========================================
+paymentsRouter.use(authenticate, enforceTenantIsolation);
+
 async function getPaymentScope(req: Request): Promise<WorkspaceScope> {
   return getWorkspaceScope(req.tenantId!, req.user!);
 }
@@ -44,24 +119,45 @@ function canAccessPayment(scope: WorkspaceScope, createdByUserId: string) {
   return scope.all || scope.userIds.includes(createdByUserId);
 }
 
-paymentsRouter.use(authenticate, enforceTenantIsolation);
-
 const listPaymentsQuerySchema = z.object({
   page: z.string().optional().transform((v) => (v ? Math.max(1, Number(v)) : 1)),
   limit: z.string().optional().transform((v) => (v ? Math.min(100, Math.max(1, Number(v))) : 25)),
-  status: z.nativeEnum(UpiPaymentLinkStatus).optional(),
+  status: z.string().optional(),
   search: z.string().optional(),
+  leadId: z.string().optional(),
 });
 
 const createPaymentSchema = z.object({
   leadId: z.string().optional(),
-  customerName: z.string().min(1, 'Customer name is required'),
-  customerPhone: z.string().min(5, 'Customer phone is required'),
+  customerName: z.string().optional(),
+  customerPhone: z.string().optional(),
   customerEmail: z.string().email().optional(),
   amount: z.number().positive('Amount must be positive'),
-  productName: z.string().optional().default('CRM License / Consultation'),
+  currency: z.string().optional().default('INR'),
+  description: z.string().optional(),
+  productName: z.string().optional(),
+  notes: z.string().optional(),
   customerNote: z.string().optional(),
   upiId: z.string().optional(),
+});
+
+const updatePaymentSchema = z.object({
+  amount: z.number().positive('Amount must be positive').optional(),
+  description: z.string().optional(),
+  productName: z.string().optional(),
+  notes: z.string().optional(),
+  customerNote: z.string().optional(),
+  customerName: z.string().optional(),
+  customerPhone: z.string().optional(),
+  customerEmail: z.string().email().optional(),
+});
+
+const settlePaymentSchema = z.object({
+  utrNumber: z.string().optional(),
+  utrReference: z.string().optional(),
+  method: z.string().optional().default('UPI'),
+  notes: z.string().optional(),
+  note: z.string().optional(),
 });
 
 const paymentSettingsSchema = z.object({
@@ -74,6 +170,7 @@ const paymentSettingsSchema = z.object({
   qrLogoDataUrl: z.string().max(280_000).regex(/^data:image\/(png|jpeg|jpg|webp);base64,/i, 'QR logo must be a PNG, JPG, or WebP image.').nullable().optional(),
 });
 
+// GET /settings - Merchant UPI settings
 paymentsRouter.get('/settings', requireRoles('ADMIN', 'SUPER_ADMIN'), async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const settings = await prisma.upiPaymentSetting.upsert({
@@ -85,6 +182,7 @@ paymentsRouter.get('/settings', requireRoles('ADMIN', 'SUPER_ADMIN'), async (req
   res.json({ success: true, data: settings, error: null });
 });
 
+// PUT /settings - Update merchant UPI settings
 paymentsRouter.put('/settings', requireRoles('ADMIN', 'SUPER_ADMIN'), validateBody(paymentSettingsSchema), async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const body = req.body as z.infer<typeof paymentSettingsSchema>;
@@ -127,30 +225,49 @@ paymentsRouter.put('/settings', requireRoles('ADMIN', 'SUPER_ADMIN'), validateBo
   res.json({ success: true, data: settings, error: null });
 });
 
+// GET / - List tenant payments with pagination, filters, and search
 paymentsRouter.get('/', validateQuery(listPaymentsQuerySchema), async (req: Request, res: Response) => {
-  const { page, limit, status, search } = req.query as unknown as {
+  const { page, limit, status, search, leadId } = req.query as unknown as {
     page: number;
     limit: number;
-    status?: UpiPaymentLinkStatus;
+    status?: string;
     search?: string;
+    leadId?: string;
   };
 
   const tenantId = req.tenantId!;
   const scope = await getPaymentScope(req);
   const where: Record<string, unknown> = { tenantId };
 
-  // Admins see the tenant; managers see their reporting team; closers see
-  // their own links. Keep the same scope for rows and summary aggregates.
   if (!scope.all) {
     where.createdByUserId = { in: scope.userIds.length ? scope.userIds : ['__NO_ACCESS__'] };
   }
 
-  if (status) where.status = status;
+  // Handle status mapping (COMPLETED -> PAID)
+  if (status) {
+    const normalizedStatus = status.toUpperCase();
+    if (normalizedStatus === 'COMPLETED') {
+      where.status = UpiPaymentLinkStatus.PAID;
+    } else if (Object.values(UpiPaymentLinkStatus).includes(normalizedStatus as any)) {
+      where.status = normalizedStatus as UpiPaymentLinkStatus;
+    }
+  }
+
+  // Filter by leadId in customFields
+  if (leadId) {
+    where.customFields = {
+      path: ['leadId'],
+      equals: leadId,
+    };
+  }
+
   if (search) {
+    const trimmed = search.trim();
     where.OR = [
-      { customerName: { contains: search, mode: 'insensitive' } },
-      { customerPhone: { contains: search } },
-      { utrReference: { contains: search } },
+      { customerName: { contains: trimmed, mode: 'insensitive' } },
+      { customerPhone: { contains: trimmed } },
+      { customerEmail: { contains: trimmed, mode: 'insensitive' } },
+      { utrReference: { contains: trimmed } },
     ];
   }
 
@@ -160,7 +277,12 @@ paymentsRouter.get('/', validateQuery(listPaymentsQuerySchema), async (req: Requ
       where,
       skip: (page - 1) * limit,
       take: limit,
-      orderBy: { id: 'desc' },
+      orderBy: { createdAt: 'desc' },
+      include: {
+        createdBy: {
+          select: { displayName: true, email: true },
+        },
+      },
     }),
     prisma.upiPaymentLink.aggregate({
       where,
@@ -181,9 +303,20 @@ paymentsRouter.get('/', validateQuery(listPaymentsQuerySchema), async (req: Requ
     ]),
   );
 
+  const formattedPayments = payments.map((p) => {
+    const payUrl = `https://app.aicloser.in/pay/${p.publicToken}`;
+    return {
+      ...p,
+      payUrl,
+      paymentUrl: payUrl,
+      isPaid: p.status === 'PAID',
+    };
+  });
+
   res.json({
     success: true,
-    data: payments,
+    data: formattedPayments,
+    payments: formattedPayments,
     summary: {
       totalLinks: total,
       totalAmount: Number(amountSummary._sum.totalAmount || 0),
@@ -201,6 +334,7 @@ paymentsRouter.get('/', validateQuery(listPaymentsQuerySchema), async (req: Requ
   });
 });
 
+// POST / - Generate real payment request linked to lead
 paymentsRouter.post('/', validateBody(createPaymentSchema), async (req: Request, res: Response) => {
   try {
     const tenantId = req.tenantId!;
@@ -209,6 +343,20 @@ paymentsRouter.post('/', validateBody(createPaymentSchema), async (req: Request,
     const paymentSettings = await prisma.upiPaymentSetting.findUnique({ where: { tenantId } });
     const upiId = body.upiId || paymentSettings?.upiId || 'aicloser@upi';
     const payeeName = paymentSettings?.payeeName || 'AI Closer CRM';
+
+    // If leadId is passed, find lead details to auto-populate if missing
+    let lead = null;
+    if (body.leadId) {
+      lead = await prisma.salesLeadAssignment.findFirst({
+        where: { id: body.leadId, tenantId },
+      });
+    }
+
+    const customerName = (body.customerName || lead?.customerName || 'Valued Customer').trim();
+    const customerPhone = (body.customerPhone || lead?.customerPhone || '').trim();
+    const customerEmail = body.customerEmail || lead?.customerEmail || null;
+    const productName = (body.description || body.productName || lead?.serviceInterest || 'CRM License / Consultation').trim();
+    const customerNote = body.notes || body.customerNote || lead?.notes || null;
 
     let userId = req.user?.userId;
     if (userId) {
@@ -238,14 +386,14 @@ paymentsRouter.post('/', validateBody(createPaymentSchema), async (req: Request,
         duration: 1,
         durationUnit: UpiPaymentDurationUnit.DAY,
         durationMultiplier: 1,
-        currency: 'INR',
+        currency: body.currency || 'INR',
         upiIdSnapshot: upiId,
         payeeNameSnapshot: payeeName,
-        customerName: body.customerName,
-        customerPhone: body.customerPhone,
-        customerEmail: body.customerEmail,
-        productName: body.productName,
-        customerNote: body.customerNote,
+        customerName,
+        customerPhone,
+        customerEmail,
+        productName,
+        customerNote,
         customFields: body.leadId ? { leadId: body.leadId } : undefined,
         status: UpiPaymentLinkStatus.PENDING,
       },
@@ -264,21 +412,127 @@ paymentsRouter.post('/', validateBody(createPaymentSchema), async (req: Request,
       actorUserId: req.user?.userId,
     }).catch(() => undefined);
 
-    const paymentUrl = 'https://app.aicloser.in/pay/' + payment.publicToken;
+    const payUrl = `https://app.aicloser.in/pay/${payment.publicToken}`;
+    const paymentData = {
+      ...payment,
+      payUrl,
+      paymentUrl: payUrl,
+    };
 
     res.status(201).json({
       success: true,
-      data: {
-        ...payment,
-        paymentUrl,
-      },
+      payment: paymentData,
+      data: paymentData,
     });
   } catch (error) {
     res.status(500).json({ success: false, error: 'PaymentCreateFailed', message: error instanceof Error ? error.message : 'Could not create payment link' });
   }
 });
 
-paymentsRouter.post('/:id/approve', async (req: Request, res: Response) => {
+// GET /:id - Get payment details
+paymentsRouter.get('/:id', async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const id = String(req.params.id);
+
+  const payment = await prisma.upiPaymentLink.findFirst({
+    where: { id, tenantId },
+    include: {
+      createdBy: { select: { displayName: true, email: true } },
+    },
+  });
+
+  if (!payment) {
+    res.status(404).json({ success: false, error: 'NotFound', message: 'Payment link not found' });
+    return;
+  }
+
+  const scope = await getPaymentScope(req);
+  if (!canAccessPayment(scope, payment.createdByUserId)) {
+    res.status(403).json({ success: false, error: 'Forbidden', message: 'You can only view your own payment links' });
+    return;
+  }
+
+  const payUrl = `https://app.aicloser.in/pay/${payment.publicToken}`;
+  const responseData = {
+    ...payment,
+    hasProof: Boolean(payment.proofStoragePath),
+    payUrl,
+    paymentUrl: payUrl,
+  };
+
+  res.json({
+    success: true,
+    payment: responseData,
+    data: responseData,
+    error: null,
+  });
+});
+
+// PATCH /:id - Edit amount/notes on PENDING items only
+paymentsRouter.patch('/:id', validateBody(updatePaymentSchema), async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const id = String(req.params.id);
+  const body = req.body as z.infer<typeof updatePaymentSchema>;
+
+  const payment = await prisma.upiPaymentLink.findFirst({
+    where: { id, tenantId },
+  });
+
+  if (!payment) {
+    res.status(404).json({ success: false, error: 'NotFound', message: 'Payment link not found' });
+    return;
+  }
+
+  const scope = await getPaymentScope(req);
+  if (!canAccessPayment(scope, payment.createdByUserId)) {
+    res.status(403).json({ success: false, error: 'Forbidden', message: 'You do not have permission to edit this payment link' });
+    return;
+  }
+
+  if (payment.status === UpiPaymentLinkStatus.PAID || payment.status === UpiPaymentLinkStatus.CANCELLED || payment.status === UpiPaymentLinkStatus.REJECTED) {
+    res.status(400).json({
+      success: false,
+      error: 'CannotEditNonPendingPayment',
+      message: `Cannot edit payment in status ${payment.status}. Only PENDING payments can be modified.`,
+    });
+    return;
+  }
+
+  const updated = await prisma.upiPaymentLink.update({
+    where: { id: payment.id },
+    data: {
+      ...(body.amount !== undefined ? { baseAmount: body.amount, totalAmount: body.amount } : {}),
+      ...(body.productName || body.description ? { productName: body.productName || body.description } : {}),
+      ...(body.customerNote || body.notes ? { customerNote: body.customerNote || body.notes } : {}),
+      ...(body.customerName !== undefined ? { customerName: body.customerName } : {}),
+      ...(body.customerPhone !== undefined ? { customerPhone: body.customerPhone } : {}),
+      ...(body.customerEmail !== undefined ? { customerEmail: body.customerEmail } : {}),
+    },
+  });
+
+  await prisma.salesActivityLog.create({
+    data: {
+      tenantId,
+      actorUserId: req.user?.userId,
+      action: 'PAYMENT_UPDATED',
+      note: `Payment ${payment.id} updated by ${req.user?.displayName || req.user?.email}`,
+      metadata: { paymentId: payment.id, changes: body },
+    },
+  }).catch(() => undefined);
+
+  const payUrl = `https://app.aicloser.in/pay/${updated.publicToken}`;
+  const responseData = { ...updated, payUrl, paymentUrl: payUrl };
+
+  res.json({
+    success: true,
+    payment: responseData,
+    data: responseData,
+    message: 'Payment updated successfully',
+  });
+});
+
+// POST /:id/cancel and DELETE /:id - Cancel a payment
+const handlePaymentCancel = async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const id = String(req.params.id);
 
@@ -293,34 +547,206 @@ paymentsRouter.post('/:id/approve', async (req: Request, res: Response) => {
 
   const scope = await getPaymentScope(req);
   if (!canAccessPayment(scope, payment.createdByUserId)) {
-    res.status(403).json({ success: false, error: 'Forbidden', message: 'You do not have access to this payment link' });
+    res.status(403).json({ success: false, error: 'Forbidden', message: 'You do not have permission to cancel this payment' });
+    return;
+  }
+
+  if (payment.status === UpiPaymentLinkStatus.PAID) {
+    res.status(400).json({ success: false, error: 'CannotCancelCompletedPayment', message: 'Cannot cancel a completed/settled payment' });
     return;
   }
 
   const updated = await prisma.upiPaymentLink.update({
     where: { id: payment.id },
     data: {
-      status: UpiPaymentLinkStatus.PAID,
-      approvedAt: new Date(),
-      approvedByUserId: req.user?.userId,
+      status: UpiPaymentLinkStatus.CANCELLED,
+      rejectedAt: new Date(),
+      rejectedByUserId: req.user?.userId,
     },
+  });
+
+  await prisma.salesActivityLog.create({
+    data: {
+      tenantId,
+      actorUserId: req.user?.userId,
+      action: 'PAYMENT_CANCELLED',
+      note: `Payment ${payment.id} (₹${payment.totalAmount}) cancelled`,
+      metadata: { paymentId: payment.id, previousStatus: payment.status },
+    },
+  }).catch(() => undefined);
+
+  const payUrl = `https://app.aicloser.in/pay/${updated.publicToken}`;
+  const responseData = { ...updated, payUrl, paymentUrl: payUrl };
+
+  res.json({
+    success: true,
+    message: 'Payment cancelled successfully',
+    payment: responseData,
+    data: responseData,
+  });
+};
+
+paymentsRouter.post('/:id/cancel', handlePaymentCancel);
+paymentsRouter.delete('/:id', handlePaymentCancel);
+
+// POST /:id/settle & POST /:id/confirm - Settle payment, record immutable ledger, and auto-advance lead to CLOSED_WON
+const handlePaymentSettle = async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const id = String(req.params.id);
+  const body = req.body as z.infer<typeof settlePaymentSchema>;
+
+  const payment = await prisma.upiPaymentLink.findFirst({
+    where: { id, tenantId },
+  });
+
+  if (!payment) {
+    res.status(404).json({ success: false, error: 'NotFound', message: 'Payment link not found' });
+    return;
+  }
+
+  const scope = await getPaymentScope(req);
+  if (!canAccessPayment(scope, payment.createdByUserId)) {
+    res.status(403).json({ success: false, error: 'Forbidden', message: 'You do not have permission to settle this payment' });
+    return;
+  }
+
+  if (payment.status === UpiPaymentLinkStatus.PAID) {
+    const payUrl = `https://app.aicloser.in/pay/${payment.publicToken}`;
+    const paymentData = { ...payment, payUrl, paymentUrl: payUrl, isPaid: true };
+    res.json({ success: true, message: 'Payment was already settled', payment: paymentData, data: paymentData });
+    return;
+  }
+
+  const utr = (body.utrNumber || body.utrReference || payment.utrReference || `UTR-${randomUUID().slice(0, 8).toUpperCase()}`).trim();
+  const note = (body.note || body.notes || payment.confirmationNote || 'Payment settled').trim();
+  const now = new Date();
+
+  const result = await prisma.$transaction(async (tx) => {
+    // 1. Update UpiPaymentLink status to PAID
+    const updatedPayment = await tx.upiPaymentLink.update({
+      where: { id: payment.id },
+      data: {
+        status: UpiPaymentLinkStatus.PAID,
+        paidAt: now,
+        confirmedAt: payment.confirmedAt || now,
+        confirmedByUserId: payment.confirmedByUserId || req.user?.userId,
+        approvedAt: now,
+        approvedByUserId: req.user?.userId,
+        utrReference: utr,
+        confirmationNote: note,
+      },
+    });
+
+    // 2. Write immutable audit entry in SalesActivityLog
+    await tx.salesActivityLog.create({
+      data: {
+        tenantId,
+        actorUserId: req.user?.userId,
+        action: 'PAYMENT_SETTLED',
+        note: `Payment of ₹${updatedPayment.totalAmount} settled for ${updatedPayment.customerName || 'customer'} (UTR: ${utr})`,
+        metadata: {
+          paymentId: updatedPayment.id,
+          amount: Number(updatedPayment.totalAmount),
+          currency: updatedPayment.currency,
+          utrNumber: utr,
+          method: body.method || 'UPI',
+          settledAt: now.toISOString(),
+        },
+      },
+    });
+
+    // 3. Auto-advance associated lead deal stage to CLOSED_WON in Prisma!
+    const leadId = (payment.customFields as any)?.leadId;
+    let updatedLead = null;
+    if (leadId) {
+      const existingLead = await tx.salesLeadAssignment.findFirst({
+        where: { id: leadId, tenantId },
+      });
+
+      if (existingLead) {
+        updatedLead = await tx.salesLeadAssignment.update({
+          where: { id: existingLead.id },
+          data: {
+            stage: 'CLOSED_WON',
+            stageChangedAt: now,
+          },
+        });
+
+        // Add lead audit log
+        await tx.salesActivityLog.create({
+          data: {
+            tenantId,
+            assignmentId: existingLead.id,
+            actorUserId: req.user?.userId,
+            action: 'LEAD_STAGE_CHANGED',
+            note: `Lead stage auto-advanced to CLOSED_WON upon payment settlement of ₹${updatedPayment.totalAmount}`,
+            metadata: {
+              previousStage: existingLead.stage,
+              newStage: 'CLOSED_WON',
+              paymentId: updatedPayment.id,
+              amount: Number(updatedPayment.totalAmount),
+            },
+          },
+        });
+
+        // Create or update SalesDeal record
+        await tx.salesDeal.create({
+          data: {
+            tenantId,
+            assignmentId: existingLead.id,
+            agentId: existingLead.assignedAgentId,
+            title: updatedPayment.productName || 'Payment Settlement Deal',
+            agreedAmount: updatedPayment.totalAmount,
+            paidAmount: updatedPayment.totalAmount,
+            status: 'PAID',
+            paymentReference: utr,
+            closedAt: now,
+            handoffNotes: `Auto-created upon UPI payment settlement ${updatedPayment.id}`,
+          },
+        }).catch(() => undefined);
+      }
+    }
+
+    return { payment: updatedPayment, lead: updatedLead };
   });
 
   await persistApiRealtimeEvent({
     tenantId,
-    eventType: 'payment.confirmed',
+    eventType: 'payment.settled',
     payload: {
-      paymentId: updated.id,
-      amount: updated.totalAmount,
-      customerName: updated.customerName,
-      customerPhone: updated.customerPhone,
+      paymentId: result.payment.id,
+      amount: result.payment.totalAmount,
+      customerName: result.payment.customerName,
+      leadId: (payment.customFields as any)?.leadId,
+      status: 'PAID',
     },
     actorUserId: req.user?.userId,
   }).catch(() => undefined);
 
-  res.json({ success: true, data: updated, message: 'Payment verified and approved successfully', error: null });
-});
+  const payUrl = `https://app.aicloser.in/pay/${result.payment.publicToken}`;
+  const paymentResponse = {
+    ...result.payment,
+    payUrl,
+    paymentUrl: payUrl,
+    isPaid: true,
+  };
 
+  res.json({
+    success: true,
+    payment: paymentResponse,
+    data: paymentResponse,
+    lead: result.lead,
+    message: result.lead
+      ? 'Payment settled and lead auto-advanced to CLOSED_WON'
+      : 'Payment settled successfully',
+  });
+};
+
+paymentsRouter.post('/:id/settle', validateBody(settlePaymentSchema), handlePaymentSettle);
+paymentsRouter.post('/:id/confirm', validateBody(settlePaymentSchema), handlePaymentSettle);
+paymentsRouter.post('/:id/approve', handlePaymentSettle);
+
+// POST /:id/reject - Reject payment link
 paymentsRouter.post('/:id/reject', async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const id = String(req.params.id);
@@ -349,39 +775,10 @@ paymentsRouter.post('/:id/reject', async (req: Request, res: Response) => {
     },
   });
 
-  res.json({ success: true, data: updated, message: 'Payment link rejected/cancelled' });
+  res.json({ success: true, data: updated, payment: updated, message: 'Payment link rejected/cancelled' });
 });
 
-paymentsRouter.get('/:id', async (req: Request, res: Response) => {
-  const tenantId = req.tenantId!;
-  const id = String(req.params.id);
-
-  const payment = await prisma.upiPaymentLink.findFirst({
-    where: { id, tenantId },
-  });
-
-  if (!payment) {
-    res.status(404).json({ success: false, error: 'NotFound', message: 'Payment link not found' });
-    return;
-  }
-
-  const scope = await getPaymentScope(req);
-  if (!canAccessPayment(scope, payment.createdByUserId)) {
-    res.status(403).json({ success: false, error: 'Forbidden', message: 'You can only view your own payment links' });
-    return;
-  }
-
-  res.json({
-    success: true,
-    data: {
-      ...payment,
-      hasProof: Boolean(payment.proofStoragePath),
-      paymentUrl: 'https://app.aicloser.in/pay/' + payment.publicToken,
-    },
-    error: null,
-  });
-});
-
+// POST /:id/proof - Attach payment screenshot proof
 paymentsRouter.post('/:id/proof', upload.any(), async (req: Request, res: Response) => {
   try {
     const tenantId = req.tenantId!;
@@ -396,7 +793,6 @@ paymentsRouter.post('/:id/proof', upload.any(), async (req: Request, res: Respon
       return;
     }
 
-    // Sales agent can only attach proof to their own payment links
     const scope = await getPaymentScope(req);
     if (!canAccessPayment(scope, payment.createdByUserId)) {
       res.status(403).json({ success: false, error: 'Forbidden', message: 'You can only attach proof to your own payment links' });
@@ -496,6 +892,7 @@ paymentsRouter.post('/:id/proof', upload.any(), async (req: Request, res: Respon
   }
 });
 
+// GET /:id/proof - Download / view payment screenshot
 paymentsRouter.get('/:id/proof', async (req: Request, res: Response) => {
   try {
     const tenantId = req.tenantId!;
@@ -510,7 +907,6 @@ paymentsRouter.get('/:id/proof', async (req: Request, res: Response) => {
       return;
     }
 
-    // Sales agent can only view proof of their own links
     const scope = await getPaymentScope(req);
     if (!canAccessPayment(scope, payment.createdByUserId)) {
       res.status(403).json({ success: false, error: 'Forbidden', message: 'You can only view payment proof for your own links' });
