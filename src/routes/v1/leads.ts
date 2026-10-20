@@ -1770,7 +1770,15 @@ async function handlePoolClaim(req: Request, res: Response) {
         : null;
 
       if (existingLead && existingLead.assignedAgentId !== profile.id) {
-        throw new PoolClaimError(409, 'LeadAlreadyAssigned', 'This customer already belongs to another closer in this workspace');
+        if (user.role === 'ADMIN' || user.role === 'SUPER_ADMIN' || user.role === 'MANAGER') {
+          await tx.salesLeadAssignment.update({
+            where: { id: existingLead.id },
+            data: { assignedAgentId: profile.id },
+          });
+          existingLead.assignedAgentId = profile.id;
+        } else {
+          throw new PoolClaimError(409, 'LeadAlreadyAssigned', 'This customer already belongs to another closer in this workspace');
+        }
       }
 
       const reserved = await tx.salesLeadPoolItem.updateMany({
