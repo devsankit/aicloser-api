@@ -1018,38 +1018,235 @@ aiRouter.patch('/providers', requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN'), va
   });
 });
 
-// POST /test-provider - Test connectivity to a specific provider
-const testProviderSchema = z.object({
-  providerId: z.enum(['groq', 'gemini', 'openai', 'deepseek', 'grok', 'fallback']),
-  apiKey: z.string().optional(),
-  model: z.string().optional(),
-  prompt: z.string().optional(),
+// ==========================================
+// 9. AI Closer System Prompt Management
+// ==========================================
+
+const systemPromptSchema = z.object({
+  systemPrompt: z.string().min(1, 'System prompt cannot be empty').optional(),
+  prompt: z.string().min(1, 'System prompt cannot be empty').optional(),
 });
 
-aiRouter.post('/test-provider', requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN'), validateBody(testProviderSchema), async (req: Request, res: Response) => {
-  const { providerId, apiKey, model, prompt } = req.body;
+// GET /system-prompt - Retrieve saved closer AI system prompt
+aiRouter.get('/system-prompt', async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
 
-  const result = await testAiProvider({
-    providerId,
-    apiKey,
-    model,
-    prompt,
+  const workspace = await prisma.aicloserWorkspace.findUnique({
+    where: { id: tenantId },
+    select: { settings: true, name: true },
   });
 
-  if (!result.success) {
-    res.status(502).json({
+  const settings = (workspace?.settings as Record<string, any>) || {};
+  const defaultPrompt = 'You are an elite B2B consultative sales closer for AI Closer CRM. Your tone is professional, consultative, and focused on qualifying high-value leads and booking high-converting 10-minute discovery calls. Respond concisely, address client objections directly, and never make unverified promises.';
+  const systemPrompt = settings.aiSystemPrompt || settings.aiBotConfig?.systemPrompt || settings.aiBotConfig?.personaPrompt || defaultPrompt;
+
+  res.json({
+    success: true,
+    data: {
+      systemPrompt,
+      updatedAt: settings.aiSystemPromptUpdatedAt || null,
+      updatedBy: settings.aiSystemPromptUpdatedBy || null,
+    },
+    systemPrompt,
+    error: null,
+  });
+});
+
+const saveSystemPromptHandler = async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const body = req.body || {};
+  const promptText = (body.systemPrompt || body.prompt || '').trim();
+
+  if (!promptText) {
+    res.status(400).json({ success: false, error: 'EmptyPrompt', message: 'System prompt cannot be empty' });
+    return;
+  }
+
+  const workspace = await prisma.aicloserWorkspace.findUnique({
+    where: { id: tenantId },
+    select: { settings: true },
+  });
+
+  const settings = (workspace?.settings as Record<string, any>) || {};
+  const botConfig = settings.aiBotConfig || {};
+
+  const now = new Date().toISOString();
+  const updatedSettings = {
+    ...settings,
+    aiSystemPrompt: promptText,
+    aiSystemPromptUpdatedAt: now,
+    aiSystemPromptUpdatedBy: req.user?.userId || null,
+    aiBotConfig: {
+      ...botConfig,
+      personaPrompt: promptText,
+      systemPrompt: promptText,
+      updatedAt: now,
+    },
+  };
+
+  await prisma.aicloserWorkspace.update({
+    where: { id: tenantId },
+    data: {
+      settings: updatedSettings,
+    },
+  });
+
+  res.json({
+    success: true,
+    message: 'AI closer system prompt saved successfully',
+    data: {
+      systemPrompt: promptText,
+      updatedAt: now,
+      updatedBy: req.user?.userId || null,
+    },
+    systemPrompt: promptText,
+    error: null,
+  });
+};
+
+// PUT & POST /system-prompt - Save custom closer AI system prompt
+aiRouter.put('/system-prompt', requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN'), validateBody(systemPromptSchema), saveSystemPromptHandler);
+aiRouter.post('/system-prompt', requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN'), validateBody(systemPromptSchema), saveSystemPromptHandler);
+
+// ==========================================
+// 10. Real BYOK AI Provider Latency Test
+// ==========================================
+
+// POST /test-provider - Real BYOK validation with roundtrip latency measurement
+aiRouter.post('/test-provider', requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN'), async (req: Request, res: Response) => {
+  const body = req.body || {};
+  const rawProvider = String(body.provider || body.providerId || '').trim();
+  const apiKey = String(body.apiKey || '').trim();
+  const model = body.model ? String(body.model).trim() : undefined;
+
+  if (!rawProvider) {
+    res.status(400).json({
       success: false,
-      error: 'ProviderError',
-      message: `Test to AI provider "${providerId}" failed: ${result.error}`,
-      data: result,
+      error: 'MissingProvider',
+      message: 'Provider is required. Supported: OPENAI, ANTHROPIC, GROQ, DEEPSEEK, GEMINI, GROK',
     });
     return;
   }
 
-  res.json({
-    success: true,
-    message: `AI provider "${providerId}" responded in ${result.latencyMs}ms`,
-    data: result,
-    error: null,
-  });
+  const provider = rawProvider.toUpperCase();
+  const validProviders = ['OPENAI', 'ANTHROPIC', 'GROQ', 'DEEPSEEK', 'GEMINI', 'GROK', 'FALLBACK'];
+  if (!validProviders.includes(provider)) {
+    res.status(400).json({
+      success: false,
+      error: 'UnsupportedProvider',
+      message: `Provider "${rawProvider}" is not supported. Supported: ${validProviders.join(', ')}`,
+    });
+    return;
+  }
+
+  if (provider === 'FALLBACK') {
+    res.json({
+      success: true,
+      latencyMs: 1,
+      provider: 'FALLBACK',
+      model: 'aicloser-consultative-v1',
+      message: 'Deterministic fallback engine verified',
+      data: { success: true, latencyMs: 1, provider: 'FALLBACK', model: 'aicloser-consultative-v1' },
+      error: null,
+    });
+    return;
+  }
+
+  if (!apiKey) {
+    res.status(400).json({
+      success: false,
+      error: 'MissingApiKey',
+      message: `API key is required to test ${provider}`,
+      provider,
+    });
+    return;
+  }
+
+  const start = Date.now();
+  let defaultModel = '';
+  let pingUrl = '';
+  let headers: Record<string, string> = { 'Content-Type': 'application/json' };
+
+  if (provider === 'OPENAI') {
+    defaultModel = 'gpt-4o-mini';
+    pingUrl = 'https://api.openai.com/v1/models';
+    headers['Authorization'] = `Bearer ${apiKey}`;
+  } else if (provider === 'ANTHROPIC') {
+    defaultModel = 'claude-3-5-haiku-20241022';
+    pingUrl = 'https://api.anthropic.com/v1/models';
+    headers['x-api-key'] = apiKey;
+    headers['anthropic-version'] = '2023-06-01';
+  } else if (provider === 'GROQ') {
+    defaultModel = 'llama-3.3-70b-versatile';
+    pingUrl = 'https://api.groq.com/openai/v1/models';
+    headers['Authorization'] = `Bearer ${apiKey}`;
+  } else if (provider === 'DEEPSEEK') {
+    defaultModel = 'deepseek-chat';
+    pingUrl = 'https://api.deepseek.com/models';
+    headers['Authorization'] = `Bearer ${apiKey}`;
+  } else if (provider === 'GEMINI') {
+    defaultModel = 'gemini-1.5-flash';
+    pingUrl = `https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`;
+  } else if (provider === 'GROK') {
+    defaultModel = 'grok-2-latest';
+    pingUrl = 'https://api.x.ai/v1/models';
+    headers['Authorization'] = `Bearer ${apiKey}`;
+  }
+
+  const chosenModel = model || defaultModel;
+
+  try {
+    const response = await fetch(pingUrl, {
+      method: 'GET',
+      headers,
+      signal: AbortSignal.timeout(10000),
+    });
+
+    const latencyMs = Date.now() - start;
+
+    if (response.ok) {
+      res.json({
+        success: true,
+        latencyMs,
+        provider,
+        model: chosenModel,
+        message: `AI provider "${provider}" validated successfully in ${latencyMs}ms`,
+        data: {
+          success: true,
+          latencyMs,
+          provider,
+          model: chosenModel,
+        },
+        error: null,
+      });
+      return;
+    }
+
+    const errorPayload = (await response.json().catch(() => ({}))) as Record<string, any>;
+    const errorMessage =
+      errorPayload?.error?.message ||
+      errorPayload?.error?.error_user_msg ||
+      errorPayload?.message ||
+      `HTTP ${response.status} returned from ${provider}`;
+
+    res.status(400).json({
+      success: false,
+      error: 'InvalidApiKey',
+      message: `Provider validation failed for ${provider}: ${errorMessage}`,
+      latencyMs,
+      provider,
+      model: chosenModel,
+      details: errorPayload,
+    });
+  } catch (err: any) {
+    const latencyMs = Date.now() - start;
+    res.status(502).json({
+      success: false,
+      error: 'ConnectionFailed',
+      message: `Failed to connect to ${provider}: ${err.message || String(err)}`,
+      latencyMs,
+      provider,
+      model: chosenModel,
+    });
+  }
 });

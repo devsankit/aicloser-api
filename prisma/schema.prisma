@@ -2733,6 +2733,7 @@ model WhatsAppCampaign {
   status           WhatsAppCampaignStatus      @default(DRAFT)
   scheduledAt      DateTime?
   startedAt        DateTime?
+  dispatchedAt     DateTime?
   completedAt      DateTime?
   totalRecipients  Int                         @default(0)
   sentCount        Int                         @default(0)
@@ -3568,6 +3569,7 @@ enum WhatsAppCampaignStatus {
   DRAFT
   SCHEDULED
   RUNNING
+  SENDING
   PAUSED
   COMPLETED
   CANCELLED
