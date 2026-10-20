@@ -23,6 +23,7 @@ const updateAgentSchema = z.object({
   displayName: z.string().optional(),
   phone: z.string().optional(),
   email: z.string().optional(),
+  password: z.string().min(6).optional(),
 });
 
 // GET /me - Get own profile (accessible by any authenticated workspace user)
@@ -245,6 +246,44 @@ teamRouter.get('/', requirePermissions(PERM_TEAM_VIEW), async (req: Request, res
       members: team,
     },
     members: team,
+  });
+});
+
+// ==========================================
+// GET /audit-logs - Security & role audit trail for workspace (restricted to team:view permission)
+teamRouter.get('/audit-logs', requirePermissions(PERM_TEAM_VIEW), async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const limitQuery = Number(req.query.limit);
+  const take = !isNaN(limitQuery) && limitQuery > 0 ? Math.min(limitQuery, 100) : 50;
+
+  const logs = await prisma.salesActivityLog.findMany({
+    where: { tenantId },
+    include: {
+      actor: {
+        select: {
+          id: true,
+          displayName: true,
+          email: true,
+        },
+      },
+    },
+    orderBy: { createdAt: 'desc' },
+    take,
+  });
+
+  const formatted = logs.map((l) => ({
+    id: l.id,
+    action: l.action,
+    detail: l.note || l.action,
+    user: l.actor?.displayName || l.actor?.email || 'System',
+    time: l.createdAt.toISOString(),
+    metadata: l.metadata,
+  }));
+
+  res.json({
+    success: true,
+    data: formatted,
+    logs: formatted,
   });
 });
 
@@ -528,7 +567,13 @@ teamRouter.patch('/:id', requirePermissions(PERM_TEAM_MANAGE), validateBody(upda
   const body = req.body as z.infer<typeof updateAgentSchema>;
 
   const profile = await prisma.salesAgentProfile.findFirst({
-    where: { id, tenantId },
+    where: {
+      tenantId,
+      OR: [{ id }, { userId: id }],
+    },
+    include: {
+      user: true,
+    },
   });
 
   if (!profile) {
@@ -536,43 +581,119 @@ teamRouter.patch('/:id', requirePermissions(PERM_TEAM_MANAGE), validateBody(upda
     return;
   }
 
+  // Handle password hashing if provided
+  let passwordUpdates: { passwordSalt: string; passwordHash: string } | {} = {};
+  if (body.password) {
+    const salt = randomBytes(16).toString('hex');
+    const hash = scryptSync(body.password, salt, 64).toString('hex');
+    passwordUpdates = { passwordSalt: salt, passwordHash: hash };
+  }
+
+  // Handle phone normalization if provided
+  let normalizedPhone: string | undefined = undefined;
+  if (body.phone !== undefined) {
+    const trimmed = body.phone.trim();
+    if (trimmed) {
+      const rawDigits = trimmed.replace(/\D/g, '');
+      if (rawDigits.length >= 10) {
+        normalizedPhone = trimmed.startsWith('+') ? trimmed : (rawDigits.length === 10 ? `+91${rawDigits}` : `+${rawDigits}`);
+      } else {
+        normalizedPhone = trimmed;
+      }
+    } else {
+      normalizedPhone = undefined;
+    }
+  }
+
+  // Update AppAuthUser if applicable
+  if (profile.userId) {
+    const userUpdateData: any = {
+      ...passwordUpdates,
+      ...(body.role ? { role: body.role as any, assignedRole: body.role as any } : {}),
+      ...(body.displayName !== undefined ? { displayName: body.displayName.trim() } : {}),
+      ...(normalizedPhone !== undefined ? { phone: normalizedPhone, loginPhoneAliases: [normalizedPhone] } : {}),
+      ...(body.email !== undefined ? { email: body.email.toLowerCase().trim() } : {}),
+    };
+
+    if (Object.keys(userUpdateData).length > 0) {
+      await prisma.appAuthUser.update({
+        where: { id: profile.userId },
+        data: userUpdateData,
+      }).catch((err) => {
+        console.warn('[teamRouter.patch] AppAuthUser update error:', err.message);
+      });
+    }
+  }
+
   const updated = await prisma.salesAgentProfile.update({
     where: { id: profile.id },
     data: {
-      status: body.status,
-      commissionPercent: body.commissionPercent,
-      canClaimLeads: body.canClaimLeads,
-      maxActiveLeads: body.maxActiveLeads,
+      ...(body.status !== undefined ? { status: body.status } : {}),
+      ...(body.commissionPercent !== undefined ? { commissionPercent: body.commissionPercent } : {}),
+      ...(body.canClaimLeads !== undefined ? { canClaimLeads: body.canClaimLeads } : {}),
+      ...(body.maxActiveLeads !== undefined ? { maxActiveLeads: body.maxActiveLeads } : {}),
       ...(body.parentAgentId !== undefined ? { parentAgentId: body.parentAgentId } : {}),
       ...(body.permissions !== undefined ? { permissions: body.permissions as any } : {}),
     },
+    include: {
+      user: {
+        select: {
+          id: true,
+          displayName: true,
+          email: true,
+          phone: true,
+          role: true,
+        },
+      },
+      parentAgent: {
+        select: {
+          id: true,
+          agentCode: true,
+          user: { select: { displayName: true } },
+        },
+      },
+    },
   });
 
-  if (profile.userId && (body.role || body.displayName || body.phone || body.email)) {
-    await prisma.appAuthUser.update({
-      where: { id: profile.userId },
-      data: {
-        ...(body.role ? { role: body.role as any } : {}),
-        ...(body.displayName ? { displayName: body.displayName } : {}),
-        ...(body.phone ? { phone: body.phone } : {}),
-        ...(body.email ? { email: body.email } : {}),
-      },
-    }).catch(() => undefined);
-  }
-
+  const updatedKeys = Object.keys(body).filter((k) => k !== 'password');
   await prisma.salesActivityLog.create({
     data: {
       tenantId,
       actorUserId: req.user?.userId,
-      action: 'TEAM_MEMBER_SETTINGS_UPDATED',
-      note: 'Team member settings updated for agent ' + profile.agentCode,
-      metadata: { targetProfileId: id, changes: body },
+      action: 'TEAM_MEMBER_UPDATED',
+      note: `Team member ${updated.user?.displayName || updated.agentCode} updated (${updatedKeys.join(', ')})`,
+      metadata: {
+        targetProfileId: profile.id,
+        userId: profile.userId,
+        updatedFields: updatedKeys,
+        hasPasswordChanged: Boolean(body.password),
+      },
     },
   }).catch(() => undefined);
 
   res.json({
     success: true,
-    data: updated,
+    data: {
+      id: updated.id,
+      userId: updated.user?.id || profile.userId,
+      displayName: updated.user?.displayName,
+      email: updated.user?.email,
+      phone: updated.user?.phone,
+      role: updated.user?.role,
+      agentCode: updated.agentCode,
+      status: updated.status,
+      commissionPercent: updated.commissionPercent ? Number(updated.commissionPercent) : 0,
+      canClaimLeads: updated.canClaimLeads,
+      maxActiveLeads: updated.maxActiveLeads,
+      parentAgentId: updated.parentAgentId,
+      reportingManager: updated.parentAgent ? {
+        id: updated.parentAgent.id,
+        agentCode: updated.parentAgent.agentCode,
+        name: updated.parentAgent.user?.displayName,
+      } : null,
+      permissions: updated.permissions,
+      updatedAt: updated.updatedAt,
+    },
     message: 'Team member settings updated successfully',
   });
 });
@@ -895,7 +1016,7 @@ const handleUpdatePermissions = async (req: Request, res: Response) => {
 teamRouter.patch('/:id/permissions', requirePermissions(PERM_TEAM_MANAGE), validateBody(updatePermissionsSchema), handleUpdatePermissions);
 teamRouter.put('/:id/permissions', requirePermissions(PERM_TEAM_MANAGE), validateBody(updatePermissionsSchema), handleUpdatePermissions);
 
-// DELETE /:id - Permanently delete / remove team member from workspace
+// DELETE /:id - Permanently delete / remove team member from workspace with safe lead reassignment
 teamRouter.delete('/:id', requirePermissions(PERM_TEAM_MANAGE), async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const id = String(req.params.id);
@@ -918,7 +1039,7 @@ teamRouter.delete('/:id', requirePermissions(PERM_TEAM_MANAGE), async (req: Requ
       });
       if (directUser) {
         if (directUser.role === 'ADMIN' || directUser.role === 'SUPER_ADMIN') {
-          res.status(400).json({ success: false, error: 'CannotDeleteAdmin', message: 'Workspace admin cannot be deleted' });
+          res.status(403).json({ success: false, error: 'CannotDeleteAdmin', message: 'Workspace admin/owner account cannot be removed' });
           return;
         }
         await prisma.salesAgentProfile.deleteMany({ where: { userId: directUser.id, tenantId } }).catch(() => undefined);
@@ -935,7 +1056,7 @@ teamRouter.delete('/:id', requirePermissions(PERM_TEAM_MANAGE), async (req: Requ
 
     // Safety guard: Admin / Super Admin cannot be deleted
     if (profile.user?.role === 'ADMIN' || profile.user?.role === 'SUPER_ADMIN') {
-      res.status(400).json({
+      res.status(403).json({
         success: false,
         error: 'CannotDeleteAdmin',
         message: 'Workspace owner/admin account cannot be removed.',
@@ -945,34 +1066,133 @@ teamRouter.delete('/:id', requirePermissions(PERM_TEAM_MANAGE), async (req: Requ
 
     const userId = profile.userId;
 
-    // 1. Unassign active lead assignments
+    // 1. Safe Lead Reassignment: Find active leads not closed won/lost
+    const activeLeads = await prisma.salesLeadAssignment.findMany({
+      where: {
+        assignedAgentId: profile.id,
+        tenantId,
+        stage: {
+          notIn: ['CLOSED', 'LOST', 'CLOSED_WON', 'CLOSED_LOST'],
+        },
+      },
+    });
+
+    // Move active leads into SalesLeadPoolItem with status 'OPEN'
+    for (const lead of activeLeads) {
+      let existingPoolItem = null;
+      if (lead.conversationId) {
+        existingPoolItem = await prisma.salesLeadPoolItem.findFirst({
+          where: {
+            tenantId,
+            conversationId: lead.conversationId,
+          },
+        });
+      }
+
+      if (existingPoolItem) {
+        await prisma.salesLeadPoolItem.update({
+          where: { id: existingPoolItem.id },
+          data: {
+            status: 'OPEN',
+            assignedAgentId: null,
+            claimedByAgentId: null,
+            convertedAssignmentId: null,
+            notes: (existingPoolItem.notes ? existingPoolItem.notes + ' | ' : '') + `Returned to open pool upon agent ${profile.agentCode} removal`,
+          },
+        }).catch(() => undefined);
+      } else {
+        await prisma.salesLeadPoolItem.create({
+          data: {
+            tenantId,
+            customerName: lead.customerName,
+            customerPhone: lead.customerPhone,
+            customerEmail: lead.customerEmail,
+            source: lead.source || 'reassigned_pool',
+            serviceInterest: lead.serviceInterest,
+            segment: lead.segment,
+            priority: lead.priority || 'normal',
+            budgetAmount: lead.budgetAmount,
+            status: 'OPEN',
+            conversationId: lead.conversationId || undefined,
+            notes: lead.notes
+              ? `${lead.notes} (Pooled from deleted agent ${profile.agentCode})`
+              : `Pooled from deleted agent ${profile.agentCode}`,
+          },
+        }).catch((err) => {
+          console.warn('[teamRouter.delete] Pool item creation fallback:', err.message);
+        });
+      }
+    }
+
+    // 2. Release foreign key references in SalesLeadPoolItem to prevent FK violation
+    const linkedPoolItems = await prisma.salesLeadPoolItem.findMany({
+      where: {
+        tenantId,
+        OR: [
+          { assignedAgentId: profile.id },
+          { claimedByAgentId: profile.id },
+        ],
+      },
+      select: { id: true },
+    });
+    if (linkedPoolItems.length > 0) {
+      await prisma.salesLeadPoolItem.updateMany({
+        where: { id: { in: linkedPoolItems.map((p) => p.id) } },
+        data: {
+          assignedAgentId: null,
+          claimedByAgentId: null,
+          status: 'OPEN',
+        },
+      }).catch(() => undefined);
+    }
+
+    // Nullify convertedAssignmentId for any assignments belonging to this agent
+    const allAgentAssignments = await prisma.salesLeadAssignment.findMany({
+      where: { assignedAgentId: profile.id },
+      select: { id: true },
+    });
+    const allAssignmentIds = allAgentAssignments.map((a) => a.id);
+    if (allAssignmentIds.length > 0) {
+      await prisma.salesLeadPoolItem.updateMany({
+        where: { convertedAssignmentId: { in: allAssignmentIds } },
+        data: { convertedAssignmentId: null },
+      }).catch(() => undefined);
+    }
+
+    // 3. Delete lead assignments
     await prisma.salesLeadAssignment.deleteMany({
       where: { assignedAgentId: profile.id },
     }).catch(() => undefined);
 
-    // 2. Unassign reporting children to prevent foreign key errors
+    // 4. Unassign reporting children to prevent foreign key errors
     await prisma.salesAgentProfile.updateMany({
-      where: { parentAgentId: profile.id },
+      where: { parentAgentId: profile.id, tenantId },
       data: { parentAgentId: null },
     }).catch(() => undefined);
 
-    // 3. Delete SalesAgentProfile
+    // 5. Unlink any commission rules referencing this agent
+    await prisma.salesCommissionRule.updateMany({
+      where: { agentId: profile.id },
+      data: { agentId: null },
+    }).catch(() => undefined);
+
+    // 6. Delete or suspend SalesAgentProfile
     await prisma.salesAgentProfile.delete({
       where: { id: profile.id },
     }).catch(async (err) => {
-      console.warn('[teamRouter.delete] Profile delete fallback:', err.message);
+      console.warn('[teamRouter.delete] Profile delete fallback to SUSPENDED:', err.message);
       await prisma.salesAgentProfile.update({
         where: { id: profile.id },
         data: { status: SalesAgentStatus.SUSPENDED, permissions: {} },
       });
     });
 
-    // 4. Delete associated AppAuthUser
+    // 7. Delete or pause associated AppAuthUser
     if (userId) {
       await prisma.appAuthUser.delete({
         where: { id: userId },
       }).catch(async (err) => {
-        console.warn('[teamRouter.delete] AppAuthUser delete fallback:', err.message);
+        console.warn('[teamRouter.delete] AppAuthUser delete fallback to PAUSED:', err.message);
         await prisma.appAuthUser.update({
           where: { id: userId },
           data: { packageStatus: 'PAUSED' },
@@ -985,21 +1205,29 @@ teamRouter.delete('/:id', requirePermissions(PERM_TEAM_MANAGE), async (req: Requ
       }).catch(() => undefined);
     }
 
-    // 5. Activity log
+    // 8. Record audit activity log
     await prisma.salesActivityLog.create({
       data: {
         tenantId,
         actorUserId: req.user?.userId,
         action: 'TEAM_MEMBER_DELETED',
-        note: `Team member ${profile.user?.displayName || profile.agentCode} removed from workspace`,
-        metadata: { targetProfileId: profile.id, userId },
+        note: `Team member ${profile.user?.displayName || profile.agentCode} removed from workspace. ${activeLeads.length} active leads moved to pool.`,
+        metadata: {
+          targetProfileId: profile.id,
+          userId,
+          reassignedLeadsCount: activeLeads.length,
+        },
       },
     }).catch(() => undefined);
 
     res.json({
       success: true,
-      message: 'Team member permanently deleted from workspace',
-      data: { id: profile.id, userId },
+      message: `Team member removed from workspace. ${activeLeads.length} active leads moved to lead pool.`,
+      data: {
+        id: profile.id,
+        userId,
+        reassignedLeadsCount: activeLeads.length,
+      },
       error: null,
     });
   } catch (error) {
@@ -1011,6 +1239,3 @@ teamRouter.delete('/:id', requirePermissions(PERM_TEAM_MANAGE), async (req: Requ
     });
   }
 });
-
-
-
