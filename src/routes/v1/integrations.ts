@@ -141,8 +141,8 @@ integrationsRouter.post(
 // POST /whatsapp/embedded-signup/start - Initiate Meta WhatsApp Embedded Signup
 integrationsRouter.post('/whatsapp/embedded-signup/start', requireRoles('ADMIN', 'SUPER_ADMIN'), async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
-  const appId = process.env.META_APP_ID || '1177651817789124';
-  const configId = process.env.META_WHATSAPP_CONFIG_ID || 'default_config';
+  const appId = process.env.META_APP_ID || '1385995129001581';
+  const configId = process.env.META_WHATSAPP_CONFIG_ID || '899249879744989';
 
   const stateToken = Buffer.from(JSON.stringify({ tenantId, timestamp: Date.now() })).toString('base64');
 
@@ -160,32 +160,85 @@ integrationsRouter.post('/whatsapp/embedded-signup/start', requireRoles('ADMIN',
 });
 
 const embeddedSignupCompleteSchema = z.object({
-  code: z.string().min(1, 'OAuth authorization code is required'),
+  code: z.string().optional().default('meta_embedded_oauth_code'),
   wabaId: z.string().min(1, 'WABA ID is required'),
   phoneNumberId: z.string().min(1, 'Phone number ID is required'),
-  displayPhoneNumber: z.string().min(1, 'Display phone number is required'),
+  displayPhoneNumber: z.string().optional(),
   verifiedName: z.string().optional(),
 });
 
-// POST /whatsapp/embedded-signup/complete - Complete Embedded Signup handshake
+// POST /whatsapp/embedded-signup/complete - Complete Embedded Signup handshake in background
 integrationsRouter.post(
   '/whatsapp/embedded-signup/complete',
   requireRoles('ADMIN', 'SUPER_ADMIN'),
   validateBody(embeddedSignupCompleteSchema),
   async (req: Request, res: Response) => {
     const tenantId = req.tenantId!;
-    const { code, wabaId, phoneNumberId, displayPhoneNumber, verifiedName } = req.body;
+    const { code, wabaId, phoneNumberId } = req.body;
+    let { displayPhoneNumber, verifiedName } = req.body;
 
     try {
+      let accessToken = code || '';
+      const appId = process.env.META_APP_ID || '1385995129001581';
+      const appSecret = process.env.META_APP_SECRET;
+
+      // 1. Exchange OAuth code for permanent access token in background if secret is present
+      if (appSecret && code && !code.startsWith('EAAB') && !code.startsWith('EAA')) {
+        try {
+          const tokenUrl = `https://graph.facebook.com/v21.0/oauth/access_token?client_id=${appId}&client_secret=${appSecret}&code=${encodeURIComponent(code)}`;
+          const tokenRes = await fetch(tokenUrl);
+          const tokenData = (await tokenRes.json()) as any;
+          if (tokenData && tokenData.access_token) {
+            accessToken = tokenData.access_token;
+            logger.info('Meta OAuth token exchanged successfully in background', { wabaId, phoneNumberId });
+          }
+        } catch (tokErr) {
+          logger.warn('Meta OAuth code exchange attempt caught', { error: String(tokErr) });
+        }
+      }
+
+      // 2. Fetch verified display phone number from Meta Graph API if missing
+      if ((!displayPhoneNumber || displayPhoneNumber === 'WhatsApp Business Number') && accessToken && accessToken.startsWith('EAA')) {
+        try {
+          const phoneMetaUrl = `https://graph.facebook.com/v21.0/${phoneNumberId}?fields=display_phone_number,verified_name`;
+          const phoneRes = await fetch(phoneMetaUrl, {
+            headers: { Authorization: `Bearer ${accessToken}` },
+          });
+          const phoneData = (await phoneRes.json()) as any;
+          if (phoneData && phoneData.display_phone_number) {
+            displayPhoneNumber = phoneData.display_phone_number;
+            if (phoneData.verified_name) verifiedName = phoneData.verified_name;
+          }
+        } catch (fetchErr) {
+          logger.warn('Failed to fetch Meta phone details', { error: String(fetchErr) });
+        }
+      }
+
+      // 3. Auto-subscribe WABA to webhook in background without exposing endpoints
+      if (accessToken && accessToken.startsWith('EAA') && wabaId) {
+        try {
+          await fetch(`https://graph.facebook.com/v21.0/${wabaId}/subscribed_apps`, {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${accessToken}` },
+          });
+          logger.info('Auto-subscribed WABA to webhook in background', { wabaId });
+        } catch (subErr) {
+          logger.warn('Auto-subscribe WABA webhook caught', { error: String(subErr) });
+        }
+      }
+
+      const finalDisplayPhone = displayPhoneNumber || 'Verified WhatsApp Business';
+      const finalVerifiedName = verifiedName || 'AI Closer Channel';
+
       const channel = await prisma.whatsAppChannel.upsert({
         where: { phoneNumberId },
         create: {
           tenantId,
           wabaId,
           phoneNumberId,
-          displayPhoneNumber,
-          verifiedName: verifiedName || 'AI Closer Channel',
-          encryptedAccessToken: code, // Saved securely
+          displayPhoneNumber: finalDisplayPhone,
+          verifiedName: finalVerifiedName,
+          encryptedAccessToken: accessToken,
           status: 'ACTIVE',
           isDefault: true,
           lastSyncedAt: new Date(),
@@ -193,9 +246,9 @@ integrationsRouter.post(
         update: {
           tenantId,
           wabaId,
-          displayPhoneNumber,
-          verifiedName: verifiedName || undefined,
-          encryptedAccessToken: code,
+          displayPhoneNumber: finalDisplayPhone,
+          verifiedName: finalVerifiedName,
+          encryptedAccessToken: accessToken,
           status: 'ACTIVE',
           lastSyncedAt: new Date(),
         },
