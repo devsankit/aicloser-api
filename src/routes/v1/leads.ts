@@ -13,6 +13,7 @@ import { hasPermission, requirePermissions, PERM_LEADS_CLAIM, PERM_LEADS_REASSIG
 import { persistApiRealtimeEvent } from '../../lib/realtime.js';
 import { syncMarketingContactForLead, normalizeLeadPhone, deleteContactsAndLinkedLeadsTransactional } from '../../lib/lead-contact-sync.js';
 import { getWorkspaceScope } from '../../lib/workspace-scope.js';
+import { getWorkspaceStages } from './stages.js';
 
 export const leadsRouter = Router();
 
@@ -294,6 +295,221 @@ leadsRouter.post('/', validateBody(createLeadSchema), async (req: Request, res: 
   }).catch(() => undefined);
 
   res.status(201).json({ success: true, data: lead, error: null });
+});
+
+// GET /pipeline-bootstrap - Consolidated Single-Shot Board & Pipeline Aggregate
+leadsRouter.get('/pipeline-bootstrap', async (req: Request, res: Response) => {
+  const startTime = Date.now();
+  const tenantId = req.tenantId!;
+  const user = req.user!;
+
+  // 1. Compute access scope
+  const where: any = { tenantId };
+  let scopeProfileIds: string[] | null = null;
+  if (user.role === 'SALES_AGENT' || user.role === 'MANAGER') {
+    const scope = await getWorkspaceScope(tenantId, user);
+    scopeProfileIds = scope.profileIds;
+    where.assignedAgentId = { in: scope.profileIds.length ? scope.profileIds : ['__NO_ACCESS__'] };
+  } else if (req.query.assignedAgentId) {
+    where.assignedAgentId = String(req.query.assignedAgentId);
+  }
+
+  if (req.query.stage) {
+    where.stage = String(req.query.stage);
+  }
+
+  const limitParam = req.query.limit ? Number(req.query.limit) : 250;
+  const leadLimit = Math.min(500, Math.max(1, isNaN(limitParam) ? 250 : limitParam));
+  const maxVisibleToCloser = req.query.maxVisibleToCloser
+    ? Math.min(20, Math.max(1, Number(req.query.maxVisibleToCloser)))
+    : 5;
+
+  // 2. Run all sub-queries concurrently in parallel
+  const [
+    rawLeads,
+    stageAggregates,
+    workspaceStages,
+    workspaceAgents,
+    activeLeadCounts,
+    totalAvailablePool,
+    topPoolItems,
+    workspaceInfo,
+  ] = await Promise.all([
+    // A. Leads
+    prisma.salesLeadAssignment.findMany({
+      where,
+      take: leadLimit,
+      orderBy: [{ kanbanPosition: 'asc' }, { createdAt: 'desc' }],
+      include: {
+        assignedAgent: {
+          select: {
+            id: true,
+            agentCode: true,
+            user: { select: { displayName: true, email: true, phone: true } },
+          },
+        },
+      },
+    }),
+
+    // B. Stages aggregation (Count & Total Value)
+    prisma.salesLeadAssignment.groupBy({
+      by: ['stage'],
+      where: { tenantId, ...(scopeProfileIds ? { assignedAgentId: { in: scopeProfileIds.length ? scopeProfileIds : ['__NO_ACCESS__'] } } : {}) },
+      _count: { id: true },
+      _sum: { budgetAmount: true },
+    }),
+
+    // C. Workspace Stages configuration
+    getWorkspaceStages(tenantId),
+
+    // D. Workspace Closers / Sales Agents
+    prisma.salesAgentProfile.findMany({
+      where: { tenantId, status: 'ACTIVE' },
+      include: {
+        user: { select: { displayName: true, email: true, phone: true, role: true } },
+      },
+      orderBy: { createdAt: 'asc' },
+    }),
+
+    // E. Active leads count per closer (excluding closed deals)
+    prisma.salesLeadAssignment.groupBy({
+      by: ['assignedAgentId'],
+      where: {
+        tenantId,
+        stage: { notIn: ['CLOSED_WON', 'CLOSED_LOST'] },
+      },
+      _count: { id: true },
+    }),
+
+    // F. Total available pool count
+    prisma.salesLeadPoolItem.count({
+      where: { tenantId, status: 'OPEN' },
+    }),
+
+    // G. Top unassigned pool items clamped to maxVisibleToCloser
+    prisma.salesLeadPoolItem.findMany({
+      where: { tenantId, status: 'OPEN' },
+      take: maxVisibleToCloser,
+      orderBy: { createdAt: 'desc' },
+    }),
+
+    // H. Workspace phone masking setting
+    prisma.aicloserWorkspace.findUnique({
+      where: { id: tenantId },
+      select: { settings: true },
+    }),
+  ]);
+
+  // 3. Format Leads (with optional phone masking)
+  const shouldMask = isPhoneMaskingRequired(user, workspaceInfo?.settings as Record<string, any>);
+  const leads = rawLeads.map((l) => {
+    const customFields = (l.customFields && typeof l.customFields === 'object' && !Array.isArray(l.customFields))
+      ? (l.customFields as Record<string, any>)
+      : {};
+    const company = customFields.company || customFields.organization || customFields.businessName || '';
+    const code = customFields.code || l.leadId || `LD-${l.id.slice(-6).toUpperCase()}`;
+
+    return {
+      id: l.id,
+      code,
+      customerName: l.customerName,
+      customerPhone: shouldMask ? maskPhoneNumber(l.customerPhone, true) : (l.customerPhone || ''),
+      customerEmail: l.customerEmail || '',
+      company,
+      stage: l.stage,
+      priority: l.priority || 'MEDIUM',
+      budgetAmount: Number(l.budgetAmount || 0),
+      source: l.source || 'MANUAL',
+      tags: l.tags || [],
+      followUpAt: l.followUpAt ? l.followUpAt.toISOString() : null,
+      aiScore: l.aiScore ?? 50,
+      aiSentiment: l.aiSentiment || null,
+      aiSummary: l.aiSummary || null,
+      owner: l.assignedAgent?.user?.displayName || l.assignedAgent?.agentCode || 'Unassigned',
+      ownerId: l.assignedAgentId || null,
+      kanbanPosition: l.kanbanPosition ?? 0,
+      conversationId: l.conversationId || null,
+      totalCallsCount: l.totalCallsCount ?? 0,
+      lastContactedAt: l.lastContactedAt ? l.lastContactedAt.toISOString() : null,
+      createdAt: l.createdAt.toISOString(),
+      updatedAt: l.updatedAt.toISOString(),
+    };
+  });
+
+  // 4. Format Stages with Aggregated Counts and Values
+  const stageStatsMap = new Map<string, { count: number; totalValue: number }>();
+  for (const agg of stageAggregates) {
+    stageStatsMap.set(agg.stage, {
+      count: agg._count?.id ?? 0,
+      totalValue: Number(agg._sum?.budgetAmount ?? 0),
+    });
+  }
+
+  const stages = workspaceStages.map((s) => {
+    const stats = stageStatsMap.get(s.key) || stageStatsMap.get(s.id) || { count: 0, totalValue: 0 };
+    return {
+      id: s.id,
+      key: s.key,
+      label: s.label,
+      color: s.color,
+      probability: s.probability,
+      position: s.position,
+      count: stats.count,
+      totalValue: stats.totalValue,
+      weightedValue: Math.round(stats.totalValue * s.probability),
+    };
+  });
+
+  // 5. Format Closers with active workload
+  const countByCloser = new Map(
+    activeLeadCounts.map((c) => [c.assignedAgentId, typeof c._count === 'object' && c._count ? (c._count.id ?? 0) : 0])
+  );
+  const closers = workspaceAgents.map((agent) => ({
+    id: agent.id,
+    name: agent.user?.displayName || agent.agentCode || 'Closer',
+    email: agent.user?.email || null,
+    phone: agent.user?.phone || null,
+    role: agent.user?.role || 'SALES_AGENT',
+    activeLeads: countByCloser.get(agent.id) ?? 0,
+    maxCapacity: agent.maxActiveLeads ?? 15,
+    canClaimLeads: agent.canClaimLeads ?? true,
+    status: agent.status,
+  }));
+
+  // 6. Format Pool
+  const pool = {
+    totalCount: totalAvailablePool,
+    maxVisibleToCloser,
+    items: topPoolItems.map((p) => ({
+      id: p.id,
+      customerName: p.customerName,
+      customerPhone: shouldMask ? maskPhoneNumber(p.customerPhone, true) : (p.customerPhone || ''),
+      customerEmail: p.customerEmail || '',
+      source: p.source || 'MANUAL',
+      budgetAmount: Number(p.budgetAmount || 0),
+      priority: p.priority || 'MEDIUM',
+      notes: p.notes || '',
+      status: p.status,
+      createdAt: p.createdAt.toISOString(),
+    })),
+  };
+
+  const elapsedMs = Date.now() - startTime;
+  res.json({
+    success: true,
+    data: {
+      leads,
+      stages,
+      closers,
+      pool,
+      meta: {
+        totalLeads: leads.length,
+        leadLimit,
+        elapsedMs,
+      },
+    },
+    error: null,
+  });
 });
 
 leadsRouter.get('/pipeline-aggregates', async (req: Request, res: Response) => {
@@ -606,6 +822,7 @@ async function verifyLeadAccess(leadId: string, req: Request) {
 
 // GET /:id/360 - Unified Lead 360 view
 export async function getLead360(req: Request, res: Response) {
+  const startTime = Date.now();
   const tenantId = req.tenantId!;
   const id = String(req.params.id);
 
@@ -616,8 +833,12 @@ export async function getLead360(req: Request, res: Response) {
   }
   const lead = check.lead;
 
-  // 2. Fetch all child resources strictly isolated to this verified lead
-  const [timeline, tasks, calls, customFieldsDef, activityLogs] = await Promise.all([
+  const rawPhone = lead.customerPhone || '';
+  const phoneDigits = rawPhone.replace(/\D/g, '');
+  const last10 = phoneDigits.slice(-10);
+
+  // 1. Fetch all child resources strictly isolated to this verified lead
+  const [timeline, tasks, calls, customFieldsDef, activityLogs, deals, campaignRecipients] = await Promise.all([
     prisma.salesLeadTimelineEntry.findMany({
       where: { leadId: lead.id, tenantId },
       orderBy: { createdAt: 'desc' },
@@ -629,7 +850,7 @@ export async function getLead360(req: Request, res: Response) {
     prisma.salesMobileCall.findMany({
       where: { assignmentId: lead.id, tenantId },
       orderBy: { startedAt: 'desc' },
-      take: 20,
+      take: 50,
     }),
     prisma.customFieldDefinition.findMany({
       where: { tenantId },
@@ -643,8 +864,31 @@ export async function getLead360(req: Request, res: Response) {
         actor: { select: { displayName: true, email: true } },
       },
     }),
+    prisma.salesDeal.findMany({
+      where: { assignmentId: lead.id, tenantId },
+      orderBy: { createdAt: 'desc' },
+      take: 10,
+    }),
+    last10
+      ? prisma.whatsAppCampaignRecipient.findMany({
+          where: {
+            campaign: { tenantId },
+            OR: [
+              { e164Phone: rawPhone },
+              ...(phoneDigits ? [{ e164Phone: `+${phoneDigits}` }, { e164Phone: phoneDigits }] : []),
+              { e164Phone: { contains: last10 } },
+            ],
+          },
+          include: {
+            campaign: { select: { id: true, name: true, status: true } },
+          },
+          orderBy: { createdAt: 'desc' },
+          take: 20,
+        })
+      : Promise.resolve([]),
   ]);
 
+  // 2. Fetch recording uploads for call audio URLs
   const recordingUploads = calls.length
     ? await prisma.callRecordingUpload.findMany({
         where: { tenantId, callId: { in: calls.map((call) => call.id) }, status: 'UPLOADED' },
@@ -656,13 +900,23 @@ export async function getLead360(req: Request, res: Response) {
   for (const upload of recordingUploads) {
     if (!recordingByCallId.has(upload.callId)) recordingByCallId.set(upload.callId, upload.id);
   }
-  const enrichedCalls = calls.map((call) => ({
-    ...call,
-    recordingUploadId: recordingByCallId.get(call.id) ?? null,
-    hasRecording: Boolean(recordingByCallId.get(call.id)),
-  }));
 
-  // 3. Direct conversation relation prioritized, fallback to phone
+  const enrichedCalls = calls.map((call) => {
+    const uploadId = recordingByCallId.get(call.id) ?? null;
+    const audioUrl = uploadId
+      ? `/api/v1/recordings/${uploadId}/playback`
+      : (call.recordingPath ? `/api/v1/recordings/${call.id}/playback` : null);
+
+    return {
+      ...call,
+      recordingUploadId: uploadId,
+      hasRecording: Boolean(uploadId || call.recordingStatus === 'UPLOADED' || call.recordingPath),
+      audioUrl,
+      recordingAudioUrl: audioUrl,
+    };
+  });
+
+  // 3. Conversation & message history
   let conversation = null;
   if (lead.conversationId) {
     conversation = await prisma.appConversation.findFirst({
@@ -683,7 +937,7 @@ export async function getLead360(req: Request, res: Response) {
     }
   }
 
-  // 4. Payments directly linked to lead in customFields, fallback to customerPhone
+  // 4. Payments directly linked or by phone
   const payments = await prisma.upiPaymentLink.findMany({
     where: {
       tenantId,
@@ -700,6 +954,59 @@ export async function getLead360(req: Request, res: Response) {
     ? (conversation!.payload as any).messages
     : [];
   const lastMessage = rawMessages.length > 0 ? rawMessages[rawMessages.length - 1] : null;
+
+  // 5. WhatsApp Campaign Delivery Receipts & Inbound Replies
+  const mappedCampaignDeliveries = campaignRecipients.map((r: any) => {
+    const sentTime = r.sentAt ? new Date(r.sentAt).getTime() : 0;
+    const inboundReplies = rawMessages.filter((m: any) => {
+      const isCustomer = m.fromCustomer || m.direction === 'inbound' || m.sender === 'customer' || m.isIncoming;
+      const msgTime = new Date(m.timestamp || m.createdAt || 0).getTime();
+      return isCustomer && sentTime > 0 && msgTime >= sentTime;
+    }).map((m: any) => ({
+      id: m.id || m.messageId,
+      body: m.body || m.text || m.content || '',
+      receivedAt: m.timestamp || m.createdAt,
+    }));
+
+    return {
+      id: r.id,
+      campaignId: r.campaignId,
+      campaignName: r.campaign?.name || 'WhatsApp Broadcast',
+      campaignStatus: r.campaign?.status || 'COMPLETED',
+      phone: r.e164Phone,
+      status: r.status,
+      sentAt: r.sentAt ? r.sentAt.toISOString() : null,
+      deliveredAt: r.deliveredAt ? r.deliveredAt.toISOString() : null,
+      readAt: r.readAt ? r.readAt.toISOString() : null, // Blue ticks!
+      failedAt: r.failedAt ? r.failedAt.toISOString() : null,
+      errorMessage: r.errorMessage || null,
+      inboundReplies,
+      hasInboundReply: inboundReplies.length > 0,
+      lastReplyAt: inboundReplies.length > 0 ? inboundReplies[inboundReplies.length - 1].receivedAt : null,
+    };
+  });
+
+  // 6. Notes with author attribution
+  const authorUserIds = timeline.map((e) => e.userId).filter(Boolean) as string[];
+  const authorUsers = authorUserIds.length
+    ? await prisma.appAuthUser.findMany({
+        where: { id: { in: authorUserIds } },
+        select: { id: true, displayName: true, email: true },
+      })
+    : [];
+  const authorMap = new Map(authorUsers.map((u) => [u.id, u.displayName || u.email]));
+
+  const formattedNotes = timeline
+    .filter((entry) => entry.type === 'NOTE')
+    .map((entry) => ({
+      id: entry.id,
+      body: entry.body,
+      createdAt: entry.createdAt.toISOString(),
+      author: authorMap.get(entry.userId || '') || (entry.metadata as any)?.author || lead.assignedAgent?.user?.displayName || 'Team Member',
+      authorId: entry.userId || entry.agentId || null,
+      metadata: entry.metadata,
+    }));
+
   const humanizeHistoryAction = (value: string) => value
     .replace(/^LEAD_/, '')
     .replace(/^CALL_/, 'Call ')
@@ -707,6 +1014,7 @@ export async function getLead360(req: Request, res: Response) {
     .replace(/_/g, ' ')
     .toLowerCase()
     .replace(/\b\w/g, (character) => character.toUpperCase());
+
   const history: Array<Record<string, unknown>> = [
     ...timeline.map((entry) => ({
       id: `timeline:${entry.id}`,
@@ -714,6 +1022,7 @@ export async function getLead360(req: Request, res: Response) {
       title: entry.type === 'NOTE' ? 'Note added' : humanizeHistoryAction(entry.type),
       body: entry.body,
       createdAt: entry.createdAt.toISOString(),
+      author: authorMap.get(entry.userId || '') || null,
     })),
     ...activityLogs.map((entry) => ({
       id: `activity:${entry.id}`,
@@ -730,7 +1039,7 @@ export async function getLead360(req: Request, res: Response) {
       title: task.title || 'Follow-up scheduled',
       body: task.description || 'Follow-up task created for this lead.',
       createdAt: task.createdAt.toISOString(),
-      dueAt: task.dueAt.toISOString(),
+      dueAt: task.dueAt ? task.dueAt.toISOString() : null,
       status: task.status,
     })),
     ...enrichedCalls.map((call) => ({
@@ -743,6 +1052,7 @@ export async function getLead360(req: Request, res: Response) {
         call.durationSeconds != null ? `${call.durationSeconds}s` : null,
       ].filter(Boolean).join(' · ') || 'Call activity recorded.',
       createdAt: call.startedAt.toISOString(),
+      audioUrl: call.audioUrl,
     })),
     ...payments.map((payment) => ({
       id: `payment:${payment.id}`,
@@ -751,10 +1061,24 @@ export async function getLead360(req: Request, res: Response) {
       body: `${payment.status}${payment.totalAmount != null ? ` · ${payment.currency} ${payment.totalAmount}` : ''}`,
       createdAt: payment.createdAt.toISOString(),
     })),
+    ...mappedCampaignDeliveries.map((delivery) => ({
+      id: `campaign:${delivery.id}`,
+      kind: 'WHATSAPP_CAMPAIGN',
+      title: `WhatsApp Campaign: ${delivery.campaignName}`,
+      body: `Status: ${delivery.status}${delivery.readAt ? ' (Read ✓✓)' : delivery.deliveredAt ? ' (Delivered)' : ''}`,
+      createdAt: delivery.sentAt || delivery.deliveredAt || new Date().toISOString(),
+      metadata: delivery,
+    })),
   ].sort((left, right) => String(right.createdAt).localeCompare(String(left.createdAt)));
 
   const raw360Data = {
-    lead,
+    lead: {
+      ...lead,
+      aiScore: lead.aiScore ?? 50,
+      aiSentiment: lead.aiSentiment || 'NEUTRAL',
+      aiSummary: lead.aiSummary || null,
+      customFields: lead.customFields || {},
+    },
     assignedAgent: lead.assignedAgent ? {
       id: lead.assignedAgent.id,
       agentCode: lead.assignedAgent.agentCode,
@@ -762,8 +1086,8 @@ export async function getLead360(req: Request, res: Response) {
       email: lead.assignedAgent.user?.email,
       phone: lead.assignedAgent.user?.phone,
     } : null,
-    notes: timeline.filter((entry) => entry.type === 'NOTE'),
-    timelineNotes: timeline.filter((entry) => entry.type === 'NOTE'),
+    notes: formattedNotes,
+    timelineNotes: formattedNotes,
     timeline,
     activityLogs,
     history,
@@ -771,6 +1095,9 @@ export async function getLead360(req: Request, res: Response) {
     callbacks: tasks,
     callLogs: enrichedCalls,
     calls: enrichedCalls,
+    deals,
+    whatsappReceipts: mappedCampaignDeliveries,
+    campaignDeliveries: mappedCampaignDeliveries,
     activeConversation: conversation ? {
       id: conversation.id,
       status: conversation.status,
@@ -786,6 +1113,9 @@ export async function getLead360(req: Request, res: Response) {
     payments,
     customFieldDefinitions: customFieldsDef,
     customFieldsDefinition: customFieldsDef,
+    meta: {
+      elapsedMs: Date.now() - startTime,
+    },
   };
 
   const wsFor360 = await prisma.aicloserWorkspace.findUnique({

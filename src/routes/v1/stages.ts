@@ -32,7 +32,7 @@ export const DEFAULT_PIPELINE_STAGES: PipelineStageConfig[] = [
   { id: 'CLOSED_LOST', key: 'CLOSED_LOST', label: 'Closed Lost', color: '#EF4444', probability: 0.0, position: 8 },
 ];
 
-async function getWorkspaceStages(tenantId: string): Promise<PipelineStageConfig[]> {
+export async function getWorkspaceStages(tenantId: string): Promise<PipelineStageConfig[]> {
   const workspace = await prisma.aicloserWorkspace.findUnique({
     where: { id: tenantId },
     select: { settings: true },
