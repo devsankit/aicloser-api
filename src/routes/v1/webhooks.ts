@@ -5,6 +5,7 @@ import { verifyWebhookSignature } from '../../middlewares/webhook-signature.js';
 import { logger } from '../../lib/logger.js';
 import { prisma } from '../../lib/prisma.js';
 import { persistApiRealtimeEvent } from '../../lib/realtime.js';
+import { env } from '../../config/env.js';
 
 export const webhooksRouter = Router();
 
@@ -13,22 +14,45 @@ export const webhooksRouter = Router();
 // ==========================================
 
 // Meta verification handshake GET endpoint
-webhooksRouter.get(['/meta', '/whatsapp'], (req: Request, res: Response) => {
+webhooksRouter.get(['/meta', '/whatsapp', '/whatsapp-marketing'], async (req: Request, res: Response) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
   const challenge = req.query['hub.challenge'];
 
-  if (mode === 'subscribe' && (token === process.env.META_VERIFY_TOKEN || token === 'aicloser_webhook_secret_2026')) {
-    logger.info('Meta webhook handshake verified');
+  const allowedTokens = [
+    env.META_VERIFY_TOKEN,
+    process.env.META_VERIFY_TOKEN,
+    'aicloser_webhook_secret_2026',
+    'gigxomi_whatsapp_marketing_token',
+    'b21af41afc075d5ee39e7785765bcb27',
+  ].filter(Boolean);
+
+  let verified = mode === 'subscribe' && typeof token === 'string' && allowedTokens.includes(token);
+
+  if (!verified && mode === 'subscribe' && typeof token === 'string') {
+    try {
+      const channel = await prisma.whatsAppChannel.findFirst({
+        where: { webhookVerifyToken: token },
+        select: { id: true },
+      });
+      if (channel) verified = true;
+    } catch {
+      // ignore
+    }
+  }
+
+  if (verified) {
+    logger.info('Meta webhook handshake verified successfully', { mode, tokenPrefix: typeof token === 'string' ? token.slice(0, 4) + '***' : '' });
     res.status(200).send(challenge);
     return;
   }
 
+  logger.warn('Meta webhook verification token mismatch', { mode, receivedToken: token });
   res.status(403).send('Verification token mismatch');
 });
 
 // Meta incoming event POST endpoint with signature verification
-webhooksRouter.post(['/meta', '/whatsapp'], verifyWebhookSignature, async (req: Request, res: Response) => {
+webhooksRouter.post(['/meta', '/whatsapp', '/whatsapp-marketing'], verifyWebhookSignature, async (req: Request, res: Response) => {
   const body = req.body;
 
   // Acknowledge Meta immediately with 200 OK within 3 seconds

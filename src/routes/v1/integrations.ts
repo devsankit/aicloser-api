@@ -7,6 +7,7 @@ import { enforceTenantIsolation } from '../../middlewares/tenant-isolation.js';
 import { requireRoles } from '../../middlewares/rbac.js';
 import { validateBody } from '../../middlewares/validate.js';
 import { logger } from '../../lib/logger.js';
+import { env } from '../../config/env.js';
 
 export const integrationsRouter = Router();
 
@@ -161,6 +162,7 @@ integrationsRouter.post('/whatsapp/embedded-signup/start', requireRoles('ADMIN',
 
 const embeddedSignupCompleteSchema = z.object({
   code: z.string().optional().default('meta_embedded_oauth_code'),
+  accessToken: z.string().optional(),
   wabaId: z.string().min(1, 'WABA ID is required'),
   phoneNumberId: z.string().min(1, 'Phone number ID is required'),
   displayPhoneNumber: z.string().optional(),
@@ -174,33 +176,64 @@ integrationsRouter.post(
   validateBody(embeddedSignupCompleteSchema),
   async (req: Request, res: Response) => {
     const tenantId = req.tenantId!;
-    const { code, wabaId, phoneNumberId } = req.body;
+    const { code, wabaId, phoneNumberId, accessToken: providedToken } = req.body;
     let { displayPhoneNumber, verifiedName } = req.body;
 
     try {
-      let accessToken = code || '';
-      const appId = process.env.META_APP_ID || '1385995129001581';
-      const appSecret = process.env.META_APP_SECRET;
+      let accessToken = providedToken || code || '';
+      const appId = env.META_APP_ID || process.env.META_APP_ID || '1385995129001581';
+      const appSecret = env.META_APP_SECRET || process.env.META_APP_SECRET || 'b21af41afc075d5ee39e7785765bcb27';
 
-      // 1. Exchange OAuth code for permanent access token in background if secret is present
-      if (appSecret && code && !code.startsWith('EAAB') && !code.startsWith('EAA')) {
+      // 1. Exchange OAuth code for permanent access token if code is provided and not already a bearer token
+      if (appSecret && code && !code.startsWith('EAAB') && !code.startsWith('EAA') && code !== 'meta_embedded_oauth_code' && code !== 'manual_verified_waba') {
         try {
-          const tokenUrl = `https://graph.facebook.com/v21.0/oauth/access_token?client_id=${appId}&client_secret=${appSecret}&code=${encodeURIComponent(code)}`;
+          const tokenUrl = `https://graph.facebook.com/v22.0/oauth/access_token?client_id=${appId}&client_secret=${appSecret}&code=${encodeURIComponent(code)}`;
           const tokenRes = await fetch(tokenUrl);
           const tokenData = (await tokenRes.json()) as any;
           if (tokenData && tokenData.access_token) {
             accessToken = tokenData.access_token;
-            logger.info('Meta OAuth token exchanged successfully in background', { wabaId, phoneNumberId });
+            logger.info('Meta OAuth token exchanged successfully via GET', { wabaId, phoneNumberId });
+          } else {
+            // Fallback: POST request
+            const postRes = await fetch('https://graph.facebook.com/v22.0/oauth/access_token', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                client_id: appId,
+                client_secret: appSecret,
+                code,
+                grant_type: 'authorization_code',
+              }),
+            });
+            const postData = (await postRes.json()) as any;
+            if (postData && postData.access_token) {
+              accessToken = postData.access_token;
+              logger.info('Meta OAuth token exchanged successfully via POST', { wabaId, phoneNumberId });
+            }
           }
         } catch (tokErr) {
           logger.warn('Meta OAuth code exchange attempt caught', { error: String(tokErr) });
         }
       }
 
+      // If no valid user token was obtained, generate an App Access Token as reliable baseline
+      if (!accessToken || (!accessToken.startsWith('EAA') && accessToken.includes('meta_embedded_oauth_code'))) {
+        try {
+          const appTokRes = await fetch(`https://graph.facebook.com/v22.0/oauth/access_token?client_id=${appId}&client_secret=${appSecret}&grant_type=client_credentials`);
+          const appTokData = (await appTokRes.json()) as any;
+          if (appTokData && appTokData.access_token) {
+            accessToken = appTokData.access_token;
+            logger.info('Generated App Access Token for WhatsApp channel', { wabaId });
+          }
+        } catch (appTokErr) {
+          logger.warn('Failed to obtain app credentials token', { error: String(appTokErr) });
+        }
+      }
+
       // 2. Fetch verified display phone number from Meta Graph API if missing
       if ((!displayPhoneNumber || displayPhoneNumber === 'WhatsApp Business Number') && accessToken && accessToken.startsWith('EAA')) {
         try {
-          const phoneMetaUrl = `https://graph.facebook.com/v21.0/${phoneNumberId}?fields=display_phone_number,verified_name`;
+          const phoneMetaUrl = `https://graph.facebook.com/v22.0/${phoneNumberId}?fields=display_phone_number,verified_name`;
           const phoneRes = await fetch(phoneMetaUrl, {
             headers: { Authorization: `Bearer ${accessToken}` },
           });
@@ -214,10 +247,10 @@ integrationsRouter.post(
         }
       }
 
-      // 3. Auto-subscribe WABA to webhook in background without exposing endpoints
-      if (accessToken && accessToken.startsWith('EAA') && wabaId) {
+      // 3. Auto-subscribe WABA to webhook in background
+      if (accessToken && wabaId) {
         try {
-          await fetch(`https://graph.facebook.com/v21.0/${wabaId}/subscribed_apps`, {
+          await fetch(`https://graph.facebook.com/v22.0/${wabaId}/subscribed_apps`, {
             method: 'POST',
             headers: { Authorization: `Bearer ${accessToken}` },
           });
@@ -234,6 +267,7 @@ integrationsRouter.post(
         where: { phoneNumberId },
         create: {
           tenantId,
+          businessId: env.META_BUSINESS_ID || '100910602174128',
           wabaId,
           phoneNumberId,
           displayPhoneNumber: finalDisplayPhone,
@@ -245,10 +279,11 @@ integrationsRouter.post(
         },
         update: {
           tenantId,
+          businessId: env.META_BUSINESS_ID || '100910602174128',
           wabaId,
           displayPhoneNumber: finalDisplayPhone,
           verifiedName: finalVerifiedName,
-          encryptedAccessToken: accessToken,
+          encryptedAccessToken: accessToken || undefined,
           status: 'ACTIVE',
           lastSyncedAt: new Date(),
         },
