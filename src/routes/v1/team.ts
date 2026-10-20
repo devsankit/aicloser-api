@@ -19,7 +19,9 @@ const updateAgentSchema = z.object({
   maxActiveLeads: z.number().optional(),
   parentAgentId: z.string().nullable().optional(),
   permissions: z.record(z.any()).optional(),
-  role: z.enum(['ADMIN', 'MANAGER', 'SALES_AGENT', 'SUPER_ADMIN']).optional(),
+  role: z.enum(['ADMIN', 'MANAGER', 'SALES_AGENT', 'CLOSER', 'SUPER_ADMIN']).optional(),
+  name: z.string().optional(),
+  maxCapacity: z.number().optional(),
   displayName: z.string().optional(),
   phone: z.string().optional(),
   email: z.string().optional(),
@@ -564,7 +566,15 @@ teamRouter.post('/', requirePermissions(PERM_TEAM_MANAGE), validateBody(inviteMe
 teamRouter.patch('/:id', requirePermissions(PERM_TEAM_MANAGE), validateBody(updateAgentSchema), async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const id = String(req.params.id);
-  const body = req.body as z.infer<typeof updateAgentSchema>;
+  const rawBody = req.body as z.infer<typeof updateAgentSchema>;
+  const body = {
+    ...rawBody,
+    role: rawBody.role === 'CLOSER' ? ('SALES_AGENT' as const) : rawBody.role,
+    displayName: rawBody.displayName || rawBody.name,
+    maxActiveLeads: rawBody.maxActiveLeads ?? rawBody.maxCapacity,
+  };
+  delete (body as any).name;
+  delete (body as any).maxCapacity;
 
   const profile = await prisma.salesAgentProfile.findFirst({
     where: {
