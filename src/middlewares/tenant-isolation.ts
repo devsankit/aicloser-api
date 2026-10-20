@@ -127,5 +127,35 @@ export async function enforceTenantIsolation(req: Request, res: Response, next: 
     req.body.tenantId = user.tenantId;
   }
 
+  // Verify workspace status & subscription validity
+  const workspace = await prisma.aicloserWorkspace.findUnique({
+    where: { id: user.tenantId },
+    select: { id: true, name: true, status: true, settings: true },
+  });
+
+  if (!workspace) {
+    res.status(404).json({
+      success: false,
+      error: 'WorkspaceNotFound',
+      message: 'Assigned workspace not found in canonical registry',
+    });
+    return;
+  }
+
+  const workspaceSettings = (workspace.settings as Record<string, any>) || {};
+  const isSuspended = workspace.status === 'SUSPENDED' || workspace.status === 'INACTIVE' || workspace.status === 'PAUSED';
+  
+  const expiryRaw = workspaceSettings.subscriptionExpiresAt || workspaceSettings.expiresAt;
+  const isExpired = expiryRaw ? new Date(expiryRaw).getTime() < Date.now() : false;
+
+  if (isSuspended || isExpired) {
+    res.status(403).json({
+      success: false,
+      error: 'WorkspaceLocked',
+      message: 'Workspace is inactive or unpaid. Please contact support to activate.',
+    });
+    return;
+  }
+
   next();
 }

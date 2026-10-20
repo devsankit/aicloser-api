@@ -489,15 +489,15 @@ leadsRouter.get('/duplicates', async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
 
   // Find phones that occur more than once
-  const duplicates = await prisma.$queryRawUnsafe<Array<{ customerPhone: string; count: number }>>(`
+  const duplicates = await prisma.$queryRaw<Array<{ customerPhone: string; count: number }>>`
     SELECT "customerPhone", COUNT(*)::int as count
     FROM "SalesLeadAssignment"
-    WHERE "tenantId" = '${tenantId}'
+    WHERE "tenantId" = ${tenantId}
     GROUP BY "customerPhone"
     HAVING COUNT(*) > 1
     ORDER BY count DESC
     LIMIT 20;
-  `);
+  `;
 
   const results = await Promise.all(
     duplicates.map(async (d) => {

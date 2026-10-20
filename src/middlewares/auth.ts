@@ -112,39 +112,47 @@ export async function authenticate(req: Request, res: Response, next: NextFuncti
         where: { id: authenticatedUser.userId },
         select: {
           packageStatus: true,
+          packageExpiresAt: true,
           role: true,
           tenantId: true,
-          AicloserWorkspace: { select: { status: true } },
+          AicloserWorkspace: { select: { status: true, settings: true } },
           salesAgentProfile: { select: { status: true } },
         },
       });
 
       if (dbUser) {
-        const isSuspended =
-          dbUser.packageStatus === 'PAUSED' ||
-          dbUser.packageStatus === 'EXPIRED' ||
-          (dbUser.packageStatus as string) === 'SUSPENDED' ||
-          (dbUser.packageStatus as string) === 'INACTIVE' ||
-          dbUser.salesAgentProfile?.status === 'SUSPENDED';
+        if (dbUser.role !== 'SUPER_ADMIN') {
+          const ws = dbUser.AicloserWorkspace;
+          const wsSettings = (ws?.settings as Record<string, any>) || {};
+          const expiryRaw = wsSettings.subscriptionExpiresAt || wsSettings.expiresAt || dbUser.packageExpiresAt;
+          const isWsExpired = expiryRaw ? new Date(expiryRaw).getTime() < Date.now() : false;
+          const isWsSuspended = ws && (ws.status === 'SUSPENDED' || ws.status === 'LOCKED' || ws.status === 'INACTIVE' || ws.status === 'PAUSED');
 
-        if (isSuspended) {
-          res.status(403).json({
-            success: false,
-            data: null,
-            error: 'AccountSuspended',
-            message: 'Your user account or sales profile is suspended or inactive. Contact your administrator.',
-          });
-          return;
-        }
+          if (isWsSuspended || isWsExpired || dbUser.packageStatus === 'EXPIRED') {
+            res.status(403).json({
+              success: false,
+              data: null,
+              error: 'WorkspaceLocked',
+              message: 'Workspace is inactive or unpaid. Please contact support to activate.',
+            });
+            return;
+          }
 
-        if (dbUser.AicloserWorkspace && (dbUser.AicloserWorkspace.status === 'SUSPENDED' || dbUser.AicloserWorkspace.status === 'LOCKED')) {
-          res.status(403).json({
-            success: false,
-            data: null,
-            error: 'WorkspaceLocked',
-            message: `Workspace is ${dbUser.AicloserWorkspace.status.toLowerCase()}. Access is restricted.`,
-          });
-          return;
+          const isUserSuspended =
+            dbUser.packageStatus === 'PAUSED' ||
+            (dbUser.packageStatus as string) === 'SUSPENDED' ||
+            (dbUser.packageStatus as string) === 'INACTIVE' ||
+            dbUser.salesAgentProfile?.status === 'SUSPENDED';
+
+          if (isUserSuspended) {
+            res.status(403).json({
+              success: false,
+              data: null,
+              error: 'AccountSuspended',
+              message: 'Your user account or sales profile is suspended or inactive. Contact your administrator.',
+            });
+            return;
+          }
         }
 
         // Canonical server authority takes precedence over client token claims

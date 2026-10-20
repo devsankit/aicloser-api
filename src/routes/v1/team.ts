@@ -1,4 +1,5 @@
 import { Router, Request, Response } from 'express';
+import { scryptSync, randomBytes, randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { prisma } from '../../lib/prisma.js';
 import { authenticate } from '../../middlewares/auth.js';
@@ -246,6 +247,279 @@ teamRouter.get('/', requirePermissions(PERM_TEAM_VIEW), async (req: Request, res
     members: team,
   });
 });
+
+// ==========================================
+// Team Member Invitation & Provisioning
+// ==========================================
+
+const inviteMemberSchema = z.object({
+  email: z.string().email('Valid email address required'),
+  displayName: z.string().optional(),
+  name: z.string().optional(),
+  phone: z.string().optional(),
+  role: z.enum(['CLOSER', 'SALES_AGENT', 'MANAGER', 'ADMIN', 'SUPER_ADMIN']).optional().default('SALES_AGENT'),
+  password: z.string().min(6).optional(),
+  maxCapacity: z.number().int().min(1).max(200).optional(),
+  maxActiveLeads: z.number().int().min(1).max(200).optional(),
+  canClaimLeads: z.boolean().optional(),
+  commissionPercent: z.number().min(0).max(100).optional(),
+  parentAgentId: z.string().nullable().optional(),
+  reportingManagerId: z.string().nullable().optional(),
+  permissions: z.record(z.any()).optional(),
+});
+
+const handleInvite = async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const body = req.body as z.infer<typeof inviteMemberSchema>;
+
+  const normalizedEmail = body.email.toLowerCase().trim();
+  const rawRole = (body.role || 'SALES_AGENT').toUpperCase();
+  const normalizedRole = rawRole === 'CLOSER' ? 'SALES_AGENT' : rawRole;
+
+  // Phone normalization
+  let normalizedPhone: string | null = null;
+  if (body.phone && body.phone.trim()) {
+    const rawDigits = body.phone.replace(/\D/g, '');
+    if (rawDigits.length >= 10) {
+      normalizedPhone = body.phone.startsWith('+') ? body.phone.trim() : (rawDigits.length === 10 ? `+91${rawDigits}` : `+${rawDigits}`);
+    } else {
+      normalizedPhone = body.phone.trim();
+    }
+  }
+
+  // Deduplication check
+  const existingUser = await prisma.appAuthUser.findFirst({
+    where: {
+      OR: [
+        { email: normalizedEmail },
+        ...(normalizedPhone ? [{ phone: normalizedPhone }, { loginPhoneAliases: { has: normalizedPhone } }] : []),
+      ],
+    },
+  });
+
+  const parentId = body.parentAgentId || body.reportingManagerId || null;
+  if (parentId) {
+    const manager = await prisma.salesAgentProfile.findFirst({
+      where: { id: parentId, tenantId },
+    });
+    if (!manager) {
+      res.status(400).json({
+        success: false,
+        error: 'InvalidReportingManager',
+        message: 'The selected reporting manager does not exist in this workspace',
+      });
+      return;
+    }
+  }
+
+  const displayName = (body.displayName || body.name || normalizedEmail.split('@')[0] || 'Sales Agent').trim();
+
+  // Role permissions defaults
+  const roleDefaults: Record<string, Record<string, boolean>> = {
+    ADMIN: {
+      'leads:view': true,
+      'contacts:view': true,
+      'leads:create': true,
+      'leads:claim': true,
+      'leads:reassign': true,
+      'calls:view': true,
+      'calls:playback': true,
+      'chat:view': true,
+      'chat:send': true,
+      'payouts:view': true,
+      'payouts:approve': true,
+      'team:view': true,
+      'team:manage': true,
+      'customer:unmask_phone': true,
+    },
+    MANAGER: {
+      'leads:view': true,
+      'contacts:view': true,
+      'leads:create': true,
+      'leads:claim': true,
+      'leads:reassign': true,
+      'calls:view': true,
+      'calls:playback': true,
+      'chat:view': true,
+      'chat:send': true,
+      'payouts:view': true,
+      'payouts:approve': true,
+      'team:view': true,
+      'team:manage': true,
+      'customer:unmask_phone': true,
+    },
+    SALES_AGENT: {
+      'leads:view': true,
+      'contacts:view': true,
+      'leads:create': true,
+      'leads:claim': true,
+      'leads:reassign': false,
+      'calls:view': true,
+      'calls:playback': true,
+      'chat:view': true,
+      'chat:send': true,
+      'payouts:view': true,
+      'payouts:approve': false,
+      'team:view': false,
+      'team:manage': false,
+      'customer:unmask_phone': false,
+    },
+  };
+
+  const defaultPerms = roleDefaults[normalizedRole] || roleDefaults.SALES_AGENT;
+  const finalPermissions = {
+    ...defaultPerms,
+    ...(body.permissions || {}),
+  };
+
+  const rawPassword = body.password || (normalizedRole === 'MANAGER' ? 'Manager@123' : normalizedRole === 'ADMIN' ? 'Admin@123' : 'Closer@123');
+  const salt = randomBytes(16).toString('hex');
+  const passwordHash = scryptSync(rawPassword, salt, 64).toString('hex');
+
+  const prefix = normalizedRole === 'MANAGER' ? 'MGR' : normalizedRole === 'ADMIN' ? 'ADM' : 'AG';
+  const agentCode = `${prefix}-${randomUUID().slice(0, 6).toUpperCase()}`;
+
+  if (existingUser) {
+    if (existingUser.tenantId === tenantId) {
+      const existingProfile = await prisma.salesAgentProfile.findFirst({
+        where: { userId: existingUser.id, tenantId },
+      });
+
+      if (existingProfile) {
+        res.status(409).json({
+          success: false,
+          error: 'Conflict',
+          message: `Team member with email "${normalizedEmail}" already exists in this workspace`,
+          data: {
+            id: existingProfile.id,
+            userId: existingUser.id,
+            displayName: existingUser.displayName,
+            email: existingUser.email,
+            role: existingUser.role,
+          },
+        });
+        return;
+      }
+
+      // If user existed without profile, create profile
+      const profile = await prisma.salesAgentProfile.create({
+        data: {
+          userId: existingUser.id,
+          tenantId,
+          agentCode,
+          status: SalesAgentStatus.ACTIVE,
+          canClaimLeads: body.canClaimLeads !== undefined ? body.canClaimLeads : true,
+          maxActiveLeads: body.maxCapacity || body.maxActiveLeads || 15,
+          commissionPercent: body.commissionPercent ?? (normalizedRole === 'SALES_AGENT' ? 20 : 0),
+          parentAgentId: parentId,
+          permissions: finalPermissions,
+        },
+      });
+
+      res.status(201).json({
+        success: true,
+        message: 'Team member profile created for existing workspace user',
+        data: {
+          id: profile.id,
+          userId: existingUser.id,
+          displayName: existingUser.displayName,
+          email: existingUser.email,
+          phone: existingUser.phone,
+          role: existingUser.role,
+          agentCode: profile.agentCode,
+          status: profile.status,
+          maxCapacity: profile.maxActiveLeads,
+          parentAgentId: profile.parentAgentId,
+          permissions: profile.permissions,
+          createdAt: profile.createdAt,
+        },
+      });
+      return;
+    } else {
+      res.status(400).json({
+        success: false,
+        error: 'UserAlreadyExists',
+        message: `A user with email "${normalizedEmail}" already belongs to another workspace`,
+      });
+      return;
+    }
+  }
+
+  // Atomic creation of user and profile
+  const userId = `usr-${randomUUID().slice(0, 12)}`;
+  const appPermissions = Object.keys(finalPermissions).filter((k) => finalPermissions[k]);
+
+  const result = await prisma.$transaction(async (tx) => {
+    const newUser = await tx.appAuthUser.create({
+      data: {
+        id: userId,
+        tenantId,
+        displayName,
+        email: normalizedEmail,
+        phone: normalizedPhone,
+        loginPhoneAliases: normalizedPhone ? [normalizedPhone] : [],
+        role: normalizedRole as any,
+        assignedRole: normalizedRole as any,
+        passwordSalt: salt,
+        passwordHash: passwordHash,
+        otpCode: '000000',
+        packageStatus: 'ACTIVE',
+        permissions: appPermissions,
+      },
+    });
+
+    const newProfile = await tx.salesAgentProfile.create({
+      data: {
+        userId: newUser.id,
+        tenantId,
+        agentCode,
+        status: SalesAgentStatus.ACTIVE,
+        canClaimLeads: body.canClaimLeads !== undefined ? body.canClaimLeads : true,
+        maxActiveLeads: body.maxCapacity || body.maxActiveLeads || 15,
+        commissionPercent: body.commissionPercent ?? (normalizedRole === 'SALES_AGENT' ? 20 : 0),
+        parentAgentId: parentId,
+        permissions: finalPermissions,
+      },
+    });
+
+    await tx.salesActivityLog.create({
+      data: {
+        tenantId,
+        actorUserId: req.user?.userId,
+        action: 'TEAM_MEMBER_INVITED',
+        note: `Team member ${displayName} (${normalizedRole}) invited to workspace with code ${agentCode}`,
+        metadata: { userId: newUser.id, profileId: newProfile.id, role: normalizedRole },
+      },
+    }).catch(() => undefined);
+
+    return { user: newUser, profile: newProfile };
+  });
+
+  res.status(201).json({
+    success: true,
+    message: 'Team member added successfully',
+    data: {
+      id: result.profile.id,
+      userId: result.user.id,
+      displayName: result.user.displayName,
+      email: result.user.email,
+      phone: result.user.phone,
+      role: result.user.role,
+      agentCode: result.profile.agentCode,
+      status: result.profile.status,
+      commissionPercent: result.profile.commissionPercent ? Number(result.profile.commissionPercent) : 0,
+      canClaimLeads: result.profile.canClaimLeads,
+      maxCapacity: result.profile.maxActiveLeads,
+      parentAgentId: result.profile.parentAgentId,
+      permissions: result.profile.permissions,
+      createdAt: result.profile.createdAt,
+    },
+  });
+};
+
+// POST /invite - Invite team member to workspace
+teamRouter.post('/invite', requirePermissions(PERM_TEAM_MANAGE), validateBody(inviteMemberSchema), handleInvite);
+teamRouter.post('/', requirePermissions(PERM_TEAM_MANAGE), validateBody(inviteMemberSchema), handleInvite);
 
 // PATCH /:id - Update team member settings (Strictly restricted to team:manage permission)
 teamRouter.patch('/:id', requirePermissions(PERM_TEAM_MANAGE), validateBody(updateAgentSchema), async (req: Request, res: Response) => {
@@ -737,3 +1011,6 @@ teamRouter.delete('/:id', requirePermissions(PERM_TEAM_MANAGE), async (req: Requ
     });
   }
 });
+
+
+

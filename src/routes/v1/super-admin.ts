@@ -80,8 +80,14 @@ superAdminRouter.get('/tenants', validateQuery(listTenantsQuerySchema), async (r
       status: w.status,
       planTier: w.planTier,
       maxSeats: w.maxSeats,
-      settings: w.settings,
-      stats: {
+      ownerEmail: w.ownerEmail || null,
+        ownerPhone: w.ownerPhone || null,
+        ownerUserId: w.ownerUserId || null,
+        expiresAt: ((w.settings as any)?.subscriptionExpiresAt || (w.settings as any)?.expiresAt || null) as string | null,
+        monthlyAmount: Number((w.settings as any)?.monthlyAmount ?? ((w.maxSeats || 5) * 1999)),
+        paymentStatus: ((w.settings as any)?.paymentStatus || 'PAID') as 'PAID' | 'PENDING',
+        settings: w.settings,
+        stats: {
         usersCount: w._count.users,
         leadsCount: w._count.leads,
         callsCount: w._count.mobileCalls,
@@ -104,29 +110,126 @@ const createTenantSchema = z.object({
   slug: z.string().min(2).optional(),
   ownerEmail: z.string().email().optional(),
   ownerPhone: z.string().optional(),
+  ownerPassword: z.string().min(6).optional().default('Admin@123'),
   maxSeats: z.coerce.number().int().min(1).default(5),
+  expiresAt: z.string().optional(),
+  planTier: z.enum(['FREE', 'STARTER', 'GROWTH', 'PRO', 'AGENCY', 'ENTERPRISE']).optional().default('PRO'),
+  monthlyAmount: z.coerce.number().min(0).optional(),
 });
 
-// POST /tenants - Provision new tenant workspace
+// POST /tenants - Provision new tenant workspace with owner user and live expiry
 superAdminRouter.post('/tenants', validateBody(createTenantSchema), async (req: Request, res: Response) => {
-  const { name, slug, ownerEmail, ownerPhone, maxSeats } = req.body as z.infer<typeof createTenantSchema>;
-  const workspaceId = 'ws-' + randomUUID().slice(0, 10);
-  const baseSlug = (slug || name).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'workspace';
-  const workspaceSlug = `${baseSlug}-${Math.random().toString(36).slice(2, 6)}`;
+  try {
+    const { name, slug, ownerEmail, ownerPhone, ownerPassword, maxSeats, expiresAt, planTier, monthlyAmount } = req.body as z.infer<typeof createTenantSchema>;
+    const workspaceId = 'ws-' + randomUUID().slice(0, 10);
+    const baseSlug = (slug || name).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'workspace';
+    const workspaceSlug = `${baseSlug}-${Math.random().toString(36).slice(2, 6)}`;
+    const expiryDate = expiresAt ? new Date(expiresAt) : new Date(Date.now() + 365 * 86400000);
 
-  const workspace = await prisma.aicloserWorkspace.create({
-    data: {
-      id: workspaceId,
-      name,
-      slug: workspaceSlug,
-      ownerEmail: ownerEmail || null,
-      ownerPhone: ownerPhone || null,
-      status: 'ACTIVE',
-      maxSeats,
-    },
-  });
+    // 1. Create Workspace first to satisfy foreign key constraints
+    const workspace = await prisma.aicloserWorkspace.create({
+      data: {
+        id: workspaceId,
+        name,
+        slug: workspaceSlug,
+        ownerEmail: ownerEmail || null,
+        ownerPhone: ownerPhone || null,
+        status: 'ACTIVE',
+        planTier: planTier || 'PRO',
+        maxSeats,
+        settings: {
+          subscriptionExpiresAt: expiryDate.toISOString(),
+          expiresAt: expiryDate.toISOString(),
+          ...(monthlyAmount !== undefined ? { monthlyAmount } : {}),
+        },
+      },
+    });
 
-  res.status(201).json({ success: true, data: workspace });
+    // 2. Create or link Owner AppAuthUser
+    let ownerUserId: string | null = null;
+    if (ownerEmail) {
+      const existing = await prisma.appAuthUser.findFirst({
+        where: {
+          OR: [
+            { email: ownerEmail.toLowerCase() },
+            ...(ownerPhone ? [{ phone: ownerPhone }] : []),
+          ],
+        },
+      });
+
+      if (existing) {
+        ownerUserId = existing.id;
+        await prisma.appAuthUser.update({
+          where: { id: existing.id },
+          data: {
+            tenantId: workspace.id,
+            role: 'ADMIN',
+            assignedRole: 'ADMIN',
+            packageExpiresAt: expiryDate,
+          },
+        });
+      } else {
+        const salt = randomBytes(16).toString('hex');
+        const hash = scryptSync(ownerPassword || 'Admin@123', salt, 64).toString('hex');
+        const newUserId = `usr-${randomBytes(6).toString('hex')}`;
+        const createdOwner = await prisma.appAuthUser.create({
+          data: {
+            id: newUserId,
+            role: 'ADMIN',
+            assignedRole: 'ADMIN',
+            tenantId: workspace.id,
+            displayName: `${name} Admin`,
+            email: ownerEmail.toLowerCase(),
+            phone: ownerPhone || null,
+            passwordSalt: salt,
+            passwordHash: hash,
+            otpCode: '123456',
+            permissions: ['admin'],
+            packageExpiresAt: expiryDate,
+            isSeeded: false,
+          },
+        });
+        ownerUserId = createdOwner.id;
+      }
+
+      await prisma.aicloserWorkspace.update({
+        where: { id: workspace.id },
+        data: { ownerUserId },
+      });
+    }
+
+    res.status(201).json({
+      success: true,
+      data: {
+        id: workspace.id,
+        name: workspace.name,
+        slug: workspace.slug,
+        status: workspace.status,
+        planTier: workspace.planTier,
+        maxSeats: workspace.maxSeats,
+        monthlyAmount: Number(monthlyAmount ?? (workspace.settings as any)?.monthlyAmount ?? ((maxSeats || 5) * 1999)),
+        ownerEmail: workspace.ownerEmail,
+        ownerPhone: workspace.ownerPhone,
+        ownerUserId: workspace.ownerUserId,
+        expiresAt: expiryDate.toISOString(),
+        settings: workspace.settings,
+        stats: {
+          usersCount: ownerUserId ? 1 : 0,
+          leadsCount: 0,
+          callsCount: 0,
+        },
+        createdAt: workspace.createdAt,
+        updatedAt: workspace.updatedAt,
+      },
+    });
+  } catch (error) {
+    console.error('[superAdminRouter.postTenants] Error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'CreateTenantFailed',
+      message: error instanceof Error ? error.message : 'Could not provision workspace',
+    });
+  }
 });
 
 // GET /tenants/:id - Workspace detail
@@ -335,6 +438,97 @@ superAdminRouter.patch('/tenants/:id/seats', validateBody(updateSeatsSchema), as
   }).catch(() => undefined);
 
   res.json({ success: true, message: `Seat quota set to ${maxSeats}`, data: updated });
+});
+
+const updateAmountSchema = z.object({
+  monthlyAmount: z.coerce.number().min(0, 'Monthly amount cannot be negative'),
+});
+
+// PATCH /tenants/:id/amount - Set custom monthly subscription amount
+superAdminRouter.patch('/tenants/:id/amount', validateBody(updateAmountSchema), async (req: Request, res: Response) => {
+  const { id } = req.params;
+  const { monthlyAmount } = req.body as z.infer<typeof updateAmountSchema>;
+
+  const workspace = await prisma.aicloserWorkspace.findUnique({
+    where: { id: String(id) },
+  });
+
+  if (!workspace) {
+    res.status(404).json({ success: false, error: 'NotFound', message: 'Workspace not found' });
+    return;
+  }
+
+  const existingSettings = (workspace.settings as Record<string, any>) || {};
+  const updatedSettings = {
+    ...existingSettings,
+    monthlyAmount,
+  };
+
+  const updated = await prisma.aicloserWorkspace.update({
+    where: { id: workspace.id },
+    data: { settings: updatedSettings, updatedAt: new Date() },
+  });
+
+  await prisma.salesActivityLog.create({
+    data: {
+      tenantId: workspace.id,
+      actorUserId: req.user?.userId,
+      action: 'MONTHLY_AMOUNT_UPDATED',
+      note: `Monthly subscription amount updated to ₹${monthlyAmount} by Super Admin`,
+      metadata: { monthlyAmount, previousAmount: existingSettings.monthlyAmount },
+    },
+  }).catch(() => undefined);
+
+  res.json({ success: true, message: `Monthly subscription amount set to ₹${monthlyAmount}`, data: { ...updated, monthlyAmount } });
+});
+
+// PATCH /tenants/:id/payment-status - Update tenant payment status (PAID | PENDING)
+const updatePaymentStatusSchema = z.object({
+  paymentStatus: z.enum(['PAID', 'PENDING']),
+});
+
+superAdminRouter.patch('/tenants/:id/payment-status', validateBody(updatePaymentStatusSchema), async (req: Request, res: Response) => {
+  const { id } = req.params;
+  const { paymentStatus } = req.body as z.infer<typeof updatePaymentStatusSchema>;
+
+  const workspace = await prisma.aicloserWorkspace.findUnique({
+    where: { id: String(id) },
+  });
+
+  if (!workspace) {
+    res.status(404).json({ success: false, error: 'NotFound', message: 'Workspace not found' });
+    return;
+  }
+
+  const existingSettings = (workspace.settings as Record<string, any>) || {};
+  const updatedSettings = {
+    ...existingSettings,
+    paymentStatus,
+  };
+
+  const updated = await prisma.aicloserWorkspace.update({
+    where: { id: workspace.id },
+    data: { settings: updatedSettings, updatedAt: new Date() },
+  });
+
+  await prisma.salesActivityLog.create({
+    data: {
+      tenantId: workspace.id,
+      actorUserId: req.user?.userId,
+      action: 'PAYMENT_STATUS_UPDATED',
+      note: `Payment status marked as ${paymentStatus} by Super Admin`,
+      metadata: { paymentStatus, previousStatus: existingSettings.paymentStatus || 'PAID' },
+    },
+  }).catch(() => undefined);
+
+  res.json({
+    success: true,
+    message: 'Payment status marked as ' + paymentStatus,
+    data: {
+      ...updated,
+      paymentStatus,
+    },
+  });
 });
 
 // PATCH /tenants/:tenantId/expiry - Extend / set plan expiry date (Real Database Update)
