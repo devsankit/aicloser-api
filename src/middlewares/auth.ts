@@ -1,7 +1,7 @@
 import { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
 import { env } from '../config/env.js';
-import { AuthenticatedUser } from '../types/auth.js';
+import { AuthenticatedUser, UserRole } from '../types/auth.js';
 import { getActiveClientSession } from '../lib/client-sessions.js';
 import { prisma } from '../lib/prisma.js';
 
@@ -77,10 +77,20 @@ export async function authenticate(req: Request, res: Response, next: NextFuncti
       return;
     }
 
-    // Role mapping for legacy roles
-    let role = decoded.role;
-    if (role === 'AGENCY') role = 'ADMIN';
-    if (role === 'FREELANCER') role = 'SALES_AGENT';
+    // Strict AppRole validation (SUPER_ADMIN, ADMIN, MANAGER, CLOSER, SALES_AGENT)
+    let role = decoded.role as UserRole;
+    if ((role as string) === 'CLOSER') role = 'SALES_AGENT';
+
+    const validRoles: UserRole[] = ['SUPER_ADMIN', 'ADMIN', 'MANAGER', 'SALES_AGENT', 'CLOSER'];
+    if (!role || !validRoles.includes(role)) {
+      res.status(401).json({
+        success: false,
+        data: null,
+        error: 'Unauthorized',
+        message: 'Invalid or deprecated user role',
+      });
+      return;
+    }
 
     const authenticatedUser: AuthenticatedUser = {
       userId: decoded.userId,

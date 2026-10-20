@@ -25,7 +25,6 @@ model User {
   fcm_token_updated_at DateTime?                 @db.Timestamptz(6)
   assignmentsHandled   Assignment[]              @relation("AssignmentHandledBy")
   managedConversations ConversationParticipant[]
-  editorProfile        EditorProfile?
   leadsCreated         Lead[]                    @relation("LeadCreatedBy")
   notifications        Notification[]
   teamInvitesSent      TeamMembership[]          @relation("TeamMembershipInvitedBy")
@@ -128,53 +127,53 @@ model SalesAgentProfile {
 }
 
 model SalesLeadAssignment {
-  id                String             @id @default(cuid())
-  leadId            String?
-  assignedAgentId   String
-  createdById       String?
-  customerName      String
-  customerPhone     String?
-  customerEmail     String?
-  source            String             @default("manual")
-  serviceInterest   String?
-  budgetAmount      Decimal?           @db.Decimal(10, 2)
-  stage             SalesLeadStage     @default(NEW)
-  followUpAt        DateTime?
-  notes             String?
-  kanbanPosition      Float              @default(65536.0)
-  stageChangedAt      DateTime           @default(now())
-  customFields        Json               @default("{}")
-  lostReason          String?
-  lostReasonNotes     String?
-  isDndActive         Boolean            @default(false)
+  id                  String             @id @default(cuid())
+  leadId              String?
+  assignedAgentId     String
+  createdById         String?
+  customerName        String
+  customerPhone       String?
+  customerEmail       String?
+  source              String             @default("manual")
+  serviceInterest     String?
+  budgetAmount        Decimal?           @db.Decimal(10, 2)
+  stage               SalesLeadStage     @default(NEW)
+  followUpAt          DateTime?
+  notes               String?
+  createdAt           DateTime           @default(now())
+  updatedAt           DateTime           @updatedAt
+  segment             String?
+  priority            String             @default("normal")
+  tags                String[]           @default([])
+  conversationId      String?
+  lastContactedAt     DateTime?
+  tenantId            String
   aiScore             Int                @default(50)
   aiSentiment         String?
-  aiSummary           String?            @db.Text
-  latestRecordingUrl  String?
-  lastCallDurationSec Int                @default(0)
+  aiSummary           String?
+  customFields        Json               @default("{}")
+  isDndActive         Boolean            @default(false)
+  kanbanPosition      Float              @default(65536.0)
   lastCallDisposition String?
+  lastCallDurationSec Int                @default(0)
+  latestRecordingUrl  String?
+  lostReason          String?
+  lostReasonNotes     String?
+  stageChangedAt      DateTime           @default(now())
   totalCallsCount     Int                @default(0)
-  createdAt         DateTime           @default(now())
-  updatedAt         DateTime           @updatedAt
-  segment           String?
-  priority          String             @default("normal")
-  tags              String[]           @default([])
-  conversationId    String?
-  lastContactedAt   DateTime?
-  tenantId          String
-  activityLogs      SalesActivityLog[]
-  deals             SalesDeal[]
-  assignedAgent     SalesAgentProfile  @relation(fields: [assignedAgentId], references: [id], onDelete: Cascade)
-  createdBy         AppAuthUser?       @relation("SalesLeadCreatedBy", fields: [createdById], references: [id])
-  lead              Lead?              @relation(fields: [leadId], references: [id])
-  AicloserWorkspace AicloserWorkspace  @relation(fields: [tenantId], references: [id])
-  claimedPoolItem   SalesLeadPoolItem? @relation("SalesPoolConvertedAssignment")
-  mobileCalls       SalesMobileCall[]
+  activityLogs        SalesActivityLog[]
+  deals               SalesDeal[]
+  assignedAgent       SalesAgentProfile  @relation(fields: [assignedAgentId], references: [id], onDelete: Cascade)
+  createdBy           AppAuthUser?       @relation("SalesLeadCreatedBy", fields: [createdById], references: [id])
+  lead                Lead?              @relation(fields: [leadId], references: [id])
+  AicloserWorkspace   AicloserWorkspace  @relation(fields: [tenantId], references: [id])
+  claimedPoolItem     SalesLeadPoolItem? @relation("SalesPoolConvertedAssignment")
+  mobileCalls         SalesMobileCall[]
 
+  @@unique([tenantId, customerPhone], map: "idx_salesleadassignment_tenant_phone")
   @@index([tenantId, createdAt])
   @@index([tenantId, stage])
   @@index([tenantId, stage, kanbanPosition])
-  @@unique([tenantId, customerPhone], map: "idx_salesleadassignment_tenant_phone")
   @@index([tenantId, conversationId])
   @@index([assignedAgentId, stage])
   @@index([leadId])
@@ -183,8 +182,8 @@ model SalesLeadAssignment {
   @@index([customerName(ops: raw("gin_trgm_ops"))], map: "SalesLeadAssignment_customerName_trgm_idx", type: Gin)
   @@index([customerPhone(ops: raw("gin_trgm_ops"))], map: "SalesLeadAssignment_customerPhone_trgm_idx", type: Gin)
   @@index([tenantId, assignedAgentId])
+  @@index([tenantId, customerPhone])
 }
-
 
 model CustomFieldDefinition {
   id           String   @id @default(cuid())
@@ -211,8 +210,8 @@ model LeadAuditLog {
   userId    String?
   action    String
   field     String?
-  oldValue  String?  @db.Text
-  newValue  String?  @db.Text
+  oldValue  String?
+  newValue  String?
   metadata  Json?
   ipAddress String?
   createdAt DateTime @default(now())
@@ -301,9 +300,7 @@ model SalesDeal {
   assignment           SalesLeadAssignment  @relation(fields: [assignmentId], references: [id], onDelete: Cascade)
   package              Package?             @relation(fields: [packageId], references: [id])
   paymentTransaction   PaymentTransaction?  @relation(fields: [paymentTransactionId], references: [id])
-  quote                Quote?               @relation(fields: [quoteId], references: [id])
   referralCode         SalesReferralCode?   @relation(fields: [referralCodeId], references: [id])
-  service              Service?             @relation(fields: [serviceId], references: [id])
   earnings             SalesEarning[]
   referralEvents       SalesReferralEvent[]
 
@@ -339,7 +336,6 @@ model SalesCommissionRule {
   agent                   SalesAgentProfile?       @relation(fields: [agentId], references: [id])
   group                   SalesAgentGroup?         @relation(fields: [groupId], references: [id])
   package                 Package?                 @relation(fields: [packageId], references: [id])
-  service                 Service?                 @relation(fields: [serviceId], references: [id])
 
   @@index([tenantId])
   @@index([scope, isActive, priority])
@@ -958,38 +954,6 @@ model SalesLearningPostReaction {
   @@index([userId])
 }
 
-model SalesWebinar {
-  id               String               @id @default(cuid())
-  title            String
-  description      String?
-  hostId           String?
-  startsAt         DateTime
-  registrationLink String?
-  isActive         Boolean              @default(true)
-  createdAt        DateTime             @default(now())
-  updatedAt        DateTime             @updatedAt
-  invites          SalesWebinarInvite[]
-
-  @@index([isActive, startsAt])
-  @@index([hostId])
-}
-
-model SalesWebinarInvite {
-  id         String       @id @default(cuid())
-  webinarId  String
-  leadId     String
-  agentId    String
-  status     String       @default("INVITED")
-  invitedAt  DateTime     @default(now())
-  attendedAt DateTime?
-  notes      String?
-  webinar    SalesWebinar @relation(fields: [webinarId], references: [id], onDelete: Cascade)
-
-  @@unique([webinarId, leadId])
-  @@index([agentId, status])
-  @@index([leadId])
-}
-
 model SalesLeadTimelineEntry {
   id                String            @id @default(cuid())
   leadId            String
@@ -1025,39 +989,6 @@ model SalesRoundRobinRule {
   @@index([isActive, teamId])
 }
 
-model EditorProfile {
-  id                    String                 @id @default(cuid())
-  userId                String                 @unique
-  wordpressServiceId    Int?
-  title                 String?
-  bio                   String?
-  category              String?
-  deliveryTime          String?
-  startingPrice         Decimal?               @db.Decimal(10, 2)
-  whatsappEnabled       Boolean                @default(true)
-  avatarUrl             String?
-  youtubeChannelUrl     String?
-  verificationStatus    VerificationStatus     @default(DRAFT)
-  paymentSetupComplete  Boolean                @default(false)
-  monetizationPlan      MonetizationPlan       @default(STANDARD_COMMISSION)
-  commissionRate        Decimal                @default(30) @db.Decimal(5, 2)
-  directQuoteEnabled    Boolean                @default(false)
-  responseScore         Int                    @default(0)
-  deliveryScore         Int                    @default(0)
-  clientRatingScore     Decimal?               @db.Decimal(3, 2)
-  karmaScore            Int                    @default(0)
-  createdAt             DateTime               @default(now())
-  updatedAt             DateTime               @updatedAt
-  assignments           Assignment[]
-  user                  User                   @relation(fields: [userId], references: [id], onDelete: Cascade)
-  payoutRequests        PayoutRequest[]
-  quotes                Quote[]
-  services              Service[]
-  teamMemberships       TeamMembership[]
-  verificationDocuments VerificationDocument[]
-  walletEntries         WalletLedgerEntry[]
-}
-
 model Tenant {
   id                     String                  @id @default(cuid())
   name                   String
@@ -1075,11 +1006,9 @@ model Tenant {
   updatedAt              DateTime                @updatedAt
   assignments            Assignment[]
   conversations          Conversation[]
-  deliveries             DeliveryAsset[]
   leads                  Lead[]
   notifications          Notification[]
   paymentSecurityRecords PaymentSecurityRecord[]
-  quotes                 Quote[]
   teamMemberships        TeamMembership[]
   owner                  User                    @relation("TenantOwner", fields: [ownerUserId], references: [id])
   staff                  User[]                  @relation("TenantStaff")
@@ -1094,39 +1023,10 @@ model TeamMembership {
   assignmentEligible Boolean              @default(false)
   createdAt          DateTime             @default(now())
   updatedAt          DateTime             @updatedAt
-  editorProfile      EditorProfile        @relation(fields: [editorProfileId], references: [id], onDelete: Cascade)
   invitedBy          User?                @relation("TeamMembershipInvitedBy", fields: [invitedById], references: [id])
   tenant             Tenant               @relation(fields: [tenantId], references: [id], onDelete: Cascade)
 
   @@unique([tenantId, editorProfileId])
-}
-
-model Service {
-  id                   String                @id @default(cuid())
-  editorProfileId      String
-  wordpressServiceId   Int?                  @unique
-  title                String
-  slug                 String                @unique
-  description          String?
-  category             String?
-  priceType            String?
-  price                Decimal?              @db.Decimal(10, 2)
-  deliveryTime         String?
-  sourceUrl            String?
-  sourceSystem         String                @default("wordpress")
-  isActive             Boolean               @default(true)
-  status               ServiceStatus         @default(DRAFT)
-  seoTitle             String?
-  seoDescription       String?
-  seoSummary           String?
-  createdAt            DateTime              @default(now())
-  updatedAt            DateTime              @updatedAt
-  matchResults         MatchResult[]
-  mediaAssets          MediaAsset[]
-  quotes               Quote[]
-  salesCommissionRules SalesCommissionRule[]
-  salesDeals           SalesDeal[]
-  editorProfile        EditorProfile         @relation(fields: [editorProfileId], references: [id], onDelete: Cascade)
 }
 
 model MediaAsset {
@@ -1144,7 +1044,6 @@ model MediaAsset {
   deliveryUrl  String?
   createdAt    DateTime     @default(now())
   updatedAt    DateTime     @updatedAt
-  service      Service      @relation(fields: [serviceId], references: [id], onDelete: Cascade)
 }
 
 model Lead {
@@ -1166,35 +1065,22 @@ model Lead {
   deal              Deal?
   createdBy         User?                 @relation("LeadCreatedBy", fields: [createdById], references: [id])
   tenant            Tenant?               @relation(fields: [tenantId], references: [id])
-  matchResults      MatchResult[]
   salesAssignments  SalesLeadAssignment[]
 }
 
-model MatchResult {
-  id        String   @id @default(cuid())
-  leadId    String
-  serviceId String
-  score     Float
-  rationale Json?
-  createdAt DateTime @default(now())
-  lead      Lead     @relation(fields: [leadId], references: [id], onDelete: Cascade)
-  service   Service  @relation(fields: [serviceId], references: [id], onDelete: Cascade)
-}
-
 model Assignment {
-  id              String        @id @default(cuid())
+  id              String     @id @default(cuid())
   tenantId        String?
   leadId          String
   editorProfileId String
   assignedById    String?
-  status          LeadStatus    @default(ASSIGNED)
+  status          LeadStatus @default(ASSIGNED)
   notes           String?
-  createdAt       DateTime      @default(now())
-  updatedAt       DateTime      @updatedAt
-  assignedBy      User?         @relation("AssignmentHandledBy", fields: [assignedById], references: [id])
-  editorProfile   EditorProfile @relation(fields: [editorProfileId], references: [id], onDelete: Cascade)
-  lead            Lead          @relation(fields: [leadId], references: [id], onDelete: Cascade)
-  tenant          Tenant?       @relation(fields: [tenantId], references: [id])
+  createdAt       DateTime   @default(now())
+  updatedAt       DateTime   @updatedAt
+  assignedBy      User?      @relation("AssignmentHandledBy", fields: [assignedById], references: [id])
+  lead            Lead       @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  tenant          Tenant?    @relation(fields: [tenantId], references: [id])
 }
 
 model Deal {
@@ -1209,7 +1095,6 @@ model Deal {
   updatedAt        DateTime   @updatedAt
   quoteId          String?    @unique
   lead             Lead       @relation(fields: [leadId], references: [id], onDelete: Cascade)
-  quote            Quote?     @relation(fields: [quoteId], references: [id])
   payout           Payout?
 }
 
@@ -1234,24 +1119,6 @@ model VerificationDocument {
   reviewedAt      DateTime?
   createdAt       DateTime           @default(now())
   updatedAt       DateTime           @updatedAt
-  editorProfile   EditorProfile      @relation(fields: [editorProfileId], references: [id], onDelete: Cascade)
-}
-
-model WalletLedgerEntry {
-  id               String        @id @default(cuid())
-  editorProfileId  String
-  dealId           String?
-  quoteId          String?
-  type             String
-  grossAmount      Decimal?      @db.Decimal(10, 2)
-  commissionAmount Decimal?      @db.Decimal(10, 2)
-  netAmount        Decimal       @db.Decimal(10, 2)
-  status           String
-  note             String?
-  createdAt        DateTime      @default(now())
-  updatedAt        DateTime      @updatedAt
-  editorProfile    EditorProfile @relation(fields: [editorProfileId], references: [id], onDelete: Cascade)
-  quote            Quote?        @relation(fields: [quoteId], references: [id])
 }
 
 model PayoutRequest {
@@ -1262,7 +1129,6 @@ model PayoutRequest {
   note            String?
   createdAt       DateTime            @default(now())
   updatedAt       DateTime            @updatedAt
-  editorProfile   EditorProfile       @relation(fields: [editorProfileId], references: [id], onDelete: Cascade)
 }
 
 model Conversation {
@@ -1276,11 +1142,8 @@ model Conversation {
   updatedAt              DateTime                  @updatedAt
   tenant                 Tenant?                   @relation(fields: [tenantId], references: [id])
   participants           ConversationParticipant[]
-  deliveries             DeliveryAsset[]
   messages               MessageEvent[]
   paymentSecurityRecords PaymentSecurityRecord[]
-  quotes                 Quote[]
-  showcasePermissions    ShowcasePermission[]
 }
 
 model ConversationParticipant {
@@ -1302,72 +1165,6 @@ model MessageEvent {
   deliveredExternally Boolean             @default(false)
   createdAt           DateTime            @default(now())
   conversation        Conversation        @relation(fields: [conversationId], references: [id], onDelete: Cascade)
-}
-
-model Quote {
-  id                     String                  @id @default(cuid())
-  tenantId               String?
-  conversationId         String
-  editorProfileId        String
-  serviceId              String?
-  status                 QuoteStatus             @default(DRAFT)
-  baseAmount             Decimal                 @db.Decimal(10, 2)
-  addonAmount            Decimal                 @default(0) @db.Decimal(10, 2)
-  discountAmount         Decimal                 @default(0) @db.Decimal(10, 2)
-  finalAmount            Decimal                 @db.Decimal(10, 2)
-  directPayAllowed       Boolean                 @default(false)
-  managerApprovedAt      DateTime?
-  sentToClientAt         DateTime?
-  paidAt                 DateTime?
-  createdAt              DateTime                @default(now())
-  updatedAt              DateTime                @updatedAt
-  deal                   Deal?
-  deliveries             DeliveryAsset[]
-  paymentSecurityRecords PaymentSecurityRecord[]
-  conversation           Conversation            @relation(fields: [conversationId], references: [id], onDelete: Cascade)
-  editorProfile          EditorProfile           @relation(fields: [editorProfileId], references: [id], onDelete: Cascade)
-  service                Service?                @relation(fields: [serviceId], references: [id])
-  tenant                 Tenant?                 @relation(fields: [tenantId], references: [id])
-  lineItems              QuoteLineItem[]
-  salesDeals             SalesDeal[]
-  ledgerEntries          WalletLedgerEntry[]
-}
-
-model QuoteLineItem {
-  id        String   @id @default(cuid())
-  quoteId   String
-  label     String
-  kind      String
-  amount    Decimal  @db.Decimal(10, 2)
-  createdAt DateTime @default(now())
-  quote     Quote    @relation(fields: [quoteId], references: [id], onDelete: Cascade)
-}
-
-model DeliveryAsset {
-  id             String         @id @default(cuid())
-  tenantId       String?
-  conversationId String
-  quoteId        String?
-  driveFileId    String?
-  publicUrl      String?
-  expiresAt      DateTime
-  status         DeliveryStatus @default(DRAFT)
-  createdAt      DateTime       @default(now())
-  updatedAt      DateTime       @updatedAt
-  conversation   Conversation   @relation(fields: [conversationId], references: [id], onDelete: Cascade)
-  quote          Quote?         @relation(fields: [quoteId], references: [id])
-  tenant         Tenant?        @relation(fields: [tenantId], references: [id])
-}
-
-model ShowcasePermission {
-  id             String                   @id @default(cuid())
-  conversationId String
-  serviceId      String?
-  status         ShowcasePermissionStatus @default(PENDING)
-  approvedAt     DateTime?
-  createdAt      DateTime                 @default(now())
-  updatedAt      DateTime                 @updatedAt
-  conversation   Conversation             @relation(fields: [conversationId], references: [id], onDelete: Cascade)
 }
 
 model Notification {
@@ -1394,7 +1191,6 @@ model PaymentSecurityRecord {
   createdAt      DateTime              @default(now())
   updatedAt      DateTime              @updatedAt
   conversation   Conversation?         @relation(fields: [conversationId], references: [id])
-  quote          Quote?                @relation(fields: [quoteId], references: [id])
   tenant         Tenant                @relation(fields: [tenantId], references: [id], onDelete: Cascade)
 }
 
@@ -1644,110 +1440,6 @@ model PaymentLog {
   @@map("payment_logs")
 }
 
-model GappWebinar {
-  id                   String                    @id @default(cuid())
-  slug                 String                    @unique
-  title                String
-  scheduledAt          DateTime
-  description          String
-  thumbnailUrl         String?
-  thumbnailStoragePath String?
-  meetingLink          String?
-  priceMode            GappWebinarPriceMode      @default(FREE)
-  priceAmount          Decimal                   @default(0) @db.Decimal(12, 2)
-  currency             String                    @default("INR")
-  phonePeEnabled       Boolean                   @default(false)
-  registrationEnabled  Boolean                   @default(true)
-  countdownEnabled     Boolean                   @default(true)
-  capacity             Int?
-  createdAt            DateTime                  @default(now())
-  updatedAt            DateTime                  @updatedAt
-  registrations        GappWebinarRegistration[]
-
-  @@index([registrationEnabled, scheduledAt])
-  @@map("gapp_webinars")
-}
-
-model GappWebinarRegistration {
-  id                     String                        @id @default(cuid())
-  webinarId              String
-  fullName               String
-  whatsappNumber         String
-  email                  String
-  participantType        String
-  currentMonthlyProjects String
-  status                 GappWebinarRegistrationStatus @default(REGISTERED)
-  sourcePath             String?
-  userAgent              String?
-  createdAt              DateTime                      @default(now())
-  updatedAt              DateTime                      @updatedAt
-  sourceUrl              String?
-  attribution            Json?
-  consentContext         Json?
-  payments               GappWebinarPayment[]
-  webinar                GappWebinar                   @relation(fields: [webinarId], references: [id], onDelete: Cascade)
-
-  @@index([webinarId, createdAt])
-  @@index([status])
-  @@index([whatsappNumber])
-  @@index([email])
-  @@map("gapp_webinar_registrations")
-}
-
-model GxJourneyEvent {
-  id                    String    @id @default(cuid())
-  externalEventId       String    @unique
-  eventKey              String    @unique
-  eventType             String
-  eventVersion          Int       @default(1)
-  source                String
-  subjectType           String
-  subjectId             String
-  appUserId             String?
-  salesLeadId           String?
-  salesPoolItemId       String?
-  webinarRegistrationId String?
-  occurredAt            DateTime
-  sourceReceivedAt      DateTime?
-  receivedAt            DateTime  @default(now())
-  metadata              Json?
-  consentContext        Json?
-
-  @@index([subjectType, subjectId, occurredAt])
-  @@index([appUserId, occurredAt])
-  @@index([salesLeadId, occurredAt])
-  @@index([salesPoolItemId, occurredAt])
-  @@index([eventType, occurredAt])
-  @@map("gx_journey_events")
-}
-
-model GxJourneySnapshot {
-  id              String    @id @default(cuid())
-  subjectType     String
-  subjectId       String
-  appUserId       String?
-  salesLeadId     String?
-  salesPoolItemId String?
-  lifecycleStage  String    @default("UNKNOWN")
-  commercialState String    @default("UNKNOWN")
-  engagementState String    @default("UNKNOWN")
-  identityStatus  String    @default("UNRESOLVED")
-  firstTouch      Json?
-  lastTouch       Json?
-  lastEventType   String?
-  lastEventAt     DateTime?
-  createdAt       DateTime  @default(now())
-  updatedAt       DateTime  @updatedAt
-
-  @@unique([subjectType, subjectId])
-  @@index([appUserId])
-  @@index([salesLeadId])
-  @@index([salesPoolItemId])
-  @@index([lifecycleStage, updatedAt])
-  @@index([commercialState, updatedAt])
-  @@map("gx_journey_snapshots")
-}
-
 model GxLeadIdentityLink {
   id             String    @id @default(cuid())
   salesLeadId    String
@@ -1766,48 +1458,6 @@ model GxLeadIdentityLink {
   @@index([appUserId, isActive])
   @@index([conflictStatus])
   @@map("gx_lead_identity_links")
-}
-
-model GxLeadTask {
-  id           String    @id @default(cuid())
-  salesLeadId  String
-  ownerAgentId String?
-  createdById  String?
-  title        String
-  description  String?
-  priority     String    @default("NORMAL")
-  status       String    @default("OPEN")
-  dueAt        DateTime
-  completedAt  DateTime?
-  createdAt    DateTime  @default(now())
-  updatedAt    DateTime  @updatedAt
-
-  @@index([salesLeadId, status, dueAt])
-  @@index([ownerAgentId, status, dueAt])
-  @@index([createdById, createdAt])
-  @@map("gx_lead_tasks")
-}
-
-model GappWebinarPayment {
-  id                    String                   @id @default(cuid())
-  registrationId        String
-  provider              String                   @default("PHONEPE")
-  merchantTransactionId String                   @unique
-  merchantOrderId       String                   @unique
-  amount                Decimal                  @db.Decimal(12, 2)
-  currency              String                   @default("INR")
-  status                GappWebinarPaymentStatus @default(PENDING)
-  redirectUrl           String?
-  rawRequest            Json?
-  rawResponse           Json?
-  paidAt                DateTime?
-  createdAt             DateTime                 @default(now())
-  updatedAt             DateTime                 @updatedAt
-  registration          GappWebinarRegistration  @relation(fields: [registrationId], references: [id], onDelete: Cascade)
-
-  @@index([registrationId])
-  @@index([status])
-  @@map("gapp_webinar_payments")
 }
 
 model PackageChangeHistory {
@@ -2018,69 +1668,57 @@ model PlatformYouTubePublishJob {
 }
 
 model AppAuthUser {
-  id                         String                         @id
-  role                       AppRole
-  assignedRole               AppRole
-  tenantId                   String?
-  displayName                String
-  email                      String?                        @unique
-  phone                      String?                        @unique
-  loginPhoneAliases          String[]
-  packageId                  String?
-  packageName                String?
-  packageAudience            AppPackageAudience?
-  packageStatus              AppPackageStatus?
-  packageExpiresAt           DateTime?
-  workspaceMode              AppWorkspaceMode?
-  passwordSalt               String
-  passwordHash               String
-  otpCode                    String
-  permissions                String[]
-  isSeeded                   Boolean                        @default(false)
-  themePreference            String?                        @default("light")
-  createdAt                  DateTime                       @default(now())
-  createdByUserId            String?
-  lastLoginAt                DateTime?
-  lastOtpSentAt              DateTime?
-  fcm_token                  String?
-  fcm_token_updated_at       DateTime?                      @db.Timestamptz(6)
-  fcm_token_invalid_at       DateTime?                      @db.Timestamptz(6)
-  challenges                 AppAuthChallenge[]
-  AicloserWorkspace          AicloserWorkspace?             @relation(fields: [tenantId], references: [id], onDelete: Restrict)
-  channelSetupIntents        AppChannelSetupIntent[]
-  AppClientSession           AppClientSession[]
-  clientSlots            AppClientSlot[]
-  dripDeliveries             AppDripDelivery[]
-  freelancerAssessment       AppFreelancerAssessment?
-  freelancerIdentity         AppFreelancerIdentity?
-  freelancerOnboarding       AppFreelancerOnboarding?
-  freelancerPortfolioReviews AppFreelancerPortfolioReview[] @relation("FreelancerPortfolioReviews")
-  reviewedPortfolioReviews   AppFreelancerPortfolioReview[] @relation("PortfolioReviewer")
-  agencyRatingsGiven         AppFreelancerRating[]          @relation("AgencyRatingsGiven")
-  freelancerRatings          AppFreelancerRating[]          @relation("FreelancerRatingsReceived")
-  freelancerTrustDisputes    AppFreelancerTrustDispute[]
-  freelancerTrustEvents      AppFreelancerTrustEvent[]
-  freelancerTrustSnapshot    AppFreelancerTrustSnapshot?
-  freelancerWorkspace        AppFreelancerWorkspace?
-  googleIdentities           AppGoogleIdentity[]
-  resetTokens                AppPasswordResetToken[]
-  socialConnections          AppSocialConnection[]
-  connectedOnboarding        ConnectedOnboardingState?
-  connectedSignupIntents     ConnectedSignupIntent[]
-  couponRedemptions          CouponRedemption[]
-  devicePushTokens           DevicePushToken[]
-  salesActivityLogs          SalesActivityLog[]
-  salesAgentProfile          SalesAgentProfile?
-  salesLeadsCreated          SalesLeadAssignment[]          @relation("SalesLeadCreatedBy")
-  salesReferralEvents        SalesReferralEvent[]
-  paymentTransactions        PaymentTransaction[]
-  upiPaymentEvents           UpiPaymentEvent[]              @relation("UpiPaymentEventActor")
-  upiPaymentLinksApproved    UpiPaymentLink[]               @relation("UpiPaymentLinkApprover")
-  upiPaymentLinksConfirmed   UpiPaymentLink[]               @relation("UpiPaymentLinkConfirmer")
-  upiPaymentLinksCreated     UpiPaymentLink[]               @relation("UpiPaymentLinkCreator")
-  upiPaymentLinksCustomer    UpiPaymentLink[]               @relation("UpiPaymentLinkCustomer")
-  upiPaymentLinksRejected    UpiPaymentLink[]               @relation("UpiPaymentLinkRejector")
-  subscriptions              UserSubscription[]
+  id                       String                    @id
+  role                     AppRole
+  assignedRole             AppRole
+  tenantId                 String?
+  displayName              String
+  email                    String?                   @unique
+  phone                    String?                   @unique
+  loginPhoneAliases        String[]
+  packageId                String?
+  packageName              String?
+  packageAudience          AppPackageAudience?
+  packageStatus            AppPackageStatus?
+  packageExpiresAt         DateTime?
+  workspaceMode            AppWorkspaceMode?
+  passwordSalt             String
+  passwordHash             String
+  otpCode                  String
+  permissions              String[]
+  isSeeded                 Boolean                   @default(false)
+  createdAt                DateTime                  @default(now())
+  createdByUserId          String?
+  lastLoginAt              DateTime?
+  lastOtpSentAt            DateTime?
+  fcm_token                String?
+  fcm_token_updated_at     DateTime?                 @db.Timestamptz(6)
+  fcm_token_invalid_at     DateTime?                 @db.Timestamptz(6)
+  themePreference          String?                   @default("light")
+  challenges               AppAuthChallenge[]
+  AicloserWorkspace        AicloserWorkspace?        @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  channelSetupIntents      AppChannelSetupIntent[]
+  AppClientSession         AppClientSession[]
+  clientSlots              AppClientSlot[]
+  googleIdentities         AppGoogleIdentity[]
+  resetTokens              AppPasswordResetToken[]
+  socialConnections        AppSocialConnection[]
+  connectedOnboarding      ConnectedOnboardingState?
+  connectedSignupIntents   ConnectedSignupIntent[]
+  couponRedemptions        CouponRedemption[]
+  devicePushTokens         DevicePushToken[]
+  salesActivityLogs        SalesActivityLog[]
+  salesAgentProfile        SalesAgentProfile?
+  salesLeadsCreated        SalesLeadAssignment[]     @relation("SalesLeadCreatedBy")
+  salesReferralEvents      SalesReferralEvent[]
+  paymentTransactions      PaymentTransaction[]
+  upiPaymentEvents         UpiPaymentEvent[]         @relation("UpiPaymentEventActor")
+  upiPaymentLinksApproved  UpiPaymentLink[]          @relation("UpiPaymentLinkApprover")
+  upiPaymentLinksConfirmed UpiPaymentLink[]          @relation("UpiPaymentLinkConfirmer")
+  upiPaymentLinksCreated   UpiPaymentLink[]          @relation("UpiPaymentLinkCreator")
+  upiPaymentLinksCustomer  UpiPaymentLink[]          @relation("UpiPaymentLinkCustomer")
+  upiPaymentLinksRejected  UpiPaymentLink[]          @relation("UpiPaymentLinkRejector")
+  subscriptions            UserSubscription[]
 
   @@index([tenantId])
   @@index([role])
@@ -2103,26 +1741,26 @@ model AppGoogleIdentity {
 }
 
 model AppClientSlot {
-  id                                                               String              @id @default(cuid())
-  tenantId                                                         String?
-  userId                                                           String
-  channel                                                          AppClientChannel
-  status                                                           AppClientSlotStatus @default(AVAILABLE)
-  activeSessionId                                                  String?             @unique
-  installationId                                                   String?
-  deviceId                                                         String?
-  deviceName                                                       String?
-  platform                                                         String?
-  appVersion                                                       String?
-  lastLoginAt                                                      DateTime?
-  lastActiveAt                                                     DateTime?
-  lastLogoutAt                                                     DateTime?
-  createdAt                                                        DateTime            @default(now())
-  updatedAt                                                        DateTime            @updatedAt
-  sessions                                                         AppClientSession[]  @relation("AppClientSession_slotIdToAppClientSlot")
-  activeSession                                                    AppClientSession?   @relation("AppClientSlot_activeSessionIdToAppClientSession", fields: [activeSessionId], references: [id])
-  AicloserWorkspace                                                AicloserWorkspace?  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  AppAuthUser                                                      AppAuthUser         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  id                String              @id @default(cuid())
+  tenantId          String?
+  userId            String
+  channel           AppClientChannel
+  status            AppClientSlotStatus @default(AVAILABLE)
+  activeSessionId   String?             @unique
+  installationId    String?
+  deviceId          String?
+  deviceName        String?
+  platform          String?
+  appVersion        String?
+  lastLoginAt       DateTime?
+  lastActiveAt      DateTime?
+  lastLogoutAt      DateTime?
+  createdAt         DateTime            @default(now())
+  updatedAt         DateTime            @updatedAt
+  sessions          AppClientSession[]  @relation("AppClientSession_slotIdToAppClientSlot")
+  activeSession     AppClientSession?   @relation("AppClientSlot_activeSessionIdToAppClientSession", fields: [activeSessionId], references: [id])
+  AicloserWorkspace AicloserWorkspace?  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  AppAuthUser       AppAuthUser         @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@unique([userId, channel])
   @@index([tenantId, channel, status])
@@ -2130,29 +1768,29 @@ model AppClientSlot {
 }
 
 model AppClientSession {
-  id                                                            String                 @id @default(cuid())
-  sessionId                                                     String                 @unique
-  tenantId                                                      String?
-  userId                                                        String
-  slotId                                                        String
-  channel                                                       AppClientChannel
-  installationId                                                String
-  deviceId                                                      String?
-  deviceName                                                    String?
-  platform                                                      String?
-  appVersion                                                    String?
-  status                                                        AppClientSessionStatus @default(ACTIVE)
-  loginAt                                                       DateTime               @default(now())
-  lastActiveAt                                                  DateTime               @default(now())
-  logoutAt                                                      DateTime?
-  revokedAt                                                     DateTime?
-  revokeReason                                                  String?
-  createdAt                                                     DateTime               @default(now())
-  updatedAt                                                     DateTime               @updatedAt
-  slot                                                          AppClientSlot          @relation("AppClientSession_slotIdToAppClientSlot", fields: [slotId], references: [id], onDelete: Cascade)
-  AicloserWorkspace                                             AicloserWorkspace?     @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  AppAuthUser                                                   AppAuthUser            @relation(fields: [userId], references: [id], onDelete: Cascade)
-  activeForSlot                                                 AppClientSlot?         @relation("AppClientSlot_activeSessionIdToAppClientSession")
+  id                String                 @id @default(cuid())
+  sessionId         String                 @unique
+  tenantId          String?
+  userId            String
+  slotId            String
+  channel           AppClientChannel
+  installationId    String
+  deviceId          String?
+  deviceName        String?
+  platform          String?
+  appVersion        String?
+  status            AppClientSessionStatus @default(ACTIVE)
+  loginAt           DateTime               @default(now())
+  lastActiveAt      DateTime               @default(now())
+  logoutAt          DateTime?
+  revokedAt         DateTime?
+  revokeReason      String?
+  createdAt         DateTime               @default(now())
+  updatedAt         DateTime               @updatedAt
+  slot              AppClientSlot          @relation("AppClientSession_slotIdToAppClientSlot", fields: [slotId], references: [id], onDelete: Cascade)
+  AicloserWorkspace AicloserWorkspace?     @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  AppAuthUser       AppAuthUser            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  activeForSlot     AppClientSlot?         @relation("AppClientSlot_activeSessionIdToAppClientSession")
 
   @@index([userId, channel, createdAt])
   @@index([tenantId, lastActiveAt])
@@ -2308,34 +1946,6 @@ model AppSocialConnection {
   @@index([provider, status])
 }
 
-model AppFreelancerRating {
-  id           String      @id @default(cuid())
-  freelancerId String
-  agencyUserId String
-  assignmentId String?
-  score        Int
-  comment      String?
-  createdAt    DateTime    @default(now())
-  updatedAt    DateTime    @updatedAt
-  agency       AppAuthUser @relation("AgencyRatingsGiven", fields: [agencyUserId], references: [id], onDelete: Cascade)
-  freelancer   AppAuthUser @relation("FreelancerRatingsReceived", fields: [freelancerId], references: [id], onDelete: Cascade)
-
-  @@unique([assignmentId, agencyUserId])
-  @@index([freelancerId, createdAt])
-  @@index([agencyUserId])
-}
-
-model AppTrustScoreRule {
-  key         String   @id
-  label       String
-  weight      Int
-  isActive    Boolean  @default(true)
-  description String?
-  updatedById String?
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
-}
-
 model AppDripCampaign {
   id               String              @id @default(cuid())
   name             String
@@ -2355,31 +1965,8 @@ model AppDripCampaign {
   createdById      String?
   createdAt        DateTime            @default(now())
   updatedAt        DateTime            @updatedAt
-  deliveries       AppDripDelivery[]
 
   @@index([trigger, isActive])
-}
-
-model AppDripDelivery {
-  id          String             @id @default(cuid())
-  campaignId  String
-  userId      String
-  triggerKey  String
-  status      DripDeliveryStatus @default(PENDING)
-  scheduledAt DateTime
-  sentAt      DateTime?
-  skippedAt   DateTime?
-  failedAt    DateTime?
-  error       String?
-  metadata    Json               @default("{}")
-  createdAt   DateTime           @default(now())
-  updatedAt   DateTime           @updatedAt
-  campaign    AppDripCampaign    @relation(fields: [campaignId], references: [id], onDelete: Cascade)
-  user        AppAuthUser        @relation(fields: [userId], references: [id], onDelete: Cascade)
-
-  @@unique([campaignId, userId, triggerKey])
-  @@index([status, scheduledAt])
-  @@index([userId, createdAt])
 }
 
 model DevicePushToken {
@@ -2431,178 +2018,6 @@ model AppPasswordResetToken {
 
   @@index([userId])
   @@index([expiresAt])
-}
-
-model AppFreelancerWorkspace {
-  userId         String      @id
-  profile        Json
-  verification   Json
-  paymentDetails Json
-  payoutRequests Json
-  createdAt      DateTime    @default(now())
-  updatedAt      DateTime    @updatedAt
-  user           AppAuthUser @relation(fields: [userId], references: [id], onDelete: Cascade)
-}
-
-model AppFreelancerService {
-  id         String   @id
-  slug       String   @unique
-  ownerId    String
-  ownerName  String
-  ownerAlias String
-  status     String
-  payload    Json
-  createdAt  DateTime @default(now())
-  updatedAt  DateTime @updatedAt
-
-  @@index([ownerId])
-  @@index([status])
-}
-
-model AppFreelancerOnboarding {
-  userId              String      @id
-  version             Int         @default(1)
-  status              String      @default("IN_PROGRESS")
-  currentStep         Int         @default(1)
-  serviceId           String?
-  primaryCategory     String?
-  secondaryCategories String[]    @default([])
-  serviceSubmittedAt  DateTime?
-  profileCompletedAt  DateTime?
-  identityChoiceAt    DateTime?
-  completedAt         DateTime?
-  lastCampaignAt      DateTime?
-  campaignOptOut      Boolean     @default(false)
-  createdAt           DateTime    @default(now())
-  updatedAt           DateTime    @updatedAt
-  serviceDraft        Json?
-  profileDraft        Json?
-  user                AppAuthUser @relation(fields: [userId], references: [id], onDelete: Cascade)
-
-  @@index([status])
-  @@index([currentStep])
-}
-
-model AppFreelancerAssessment {
-  id              String      @id
-  userId          String      @unique
-  version         Int         @default(1)
-  primaryCategory String
-  questionIds     String[]    @default([])
-  answers         Json        @default("{}")
-  score           Int?
-  submittedAt     DateTime?
-  resetAt         DateTime?
-  resetByUserId   String?
-  createdAt       DateTime    @default(now())
-  updatedAt       DateTime    @updatedAt
-  user            AppAuthUser @relation(fields: [userId], references: [id], onDelete: Cascade)
-
-  @@index([submittedAt])
-}
-
-model AppFreelancerIdentity {
-  userId                String      @id
-  provider              String      @default("DIGILOCKER")
-  status                String      @default("NOT_STARTED")
-  providerSubject       String?
-  requestedDocumentType String?
-  documentType          String?
-  issuer                String?
-  verifiedName          String?
-  oauthStateHash        String?
-  oauthNonceHash        String?
-  oauthCodeVerifier     String?
-  oauthExpiresAt        DateTime?
-  consentedAt           DateTime?
-  skippedAt             DateTime?
-  verifiedAt            DateTime?
-  revokedAt             DateTime?
-  lastError             String?
-  createdAt             DateTime    @default(now())
-  updatedAt             DateTime    @updatedAt
-  user                  AppAuthUser @relation(fields: [userId], references: [id], onDelete: Cascade)
-
-  @@index([status])
-}
-
-model AppFreelancerTrustSnapshot {
-  userId               String      @id
-  score                Int         @default(0)
-  provisional          Boolean     @default(true)
-  assessmentPoints     Int         @default(0)
-  profilePoints        Int         @default(0)
-  portfolioPoints      Int         @default(0)
-  identityPoints       Int         @default(0)
-  reliabilityPoints    Int         @default(0)
-  onTimePoints         Int         @default(0)
-  responsePoints       Int         @default(0)
-  updatePoints         Int         @default(0)
-  ratingPoints         Int         @default(0)
-  completedAssignments Int         @default(0)
-  nextAction           String?
-  calculationVersion   Int         @default(1)
-  calculatedAt         DateTime    @default(now())
-  updatedAt            DateTime    @updatedAt
-  user                 AppAuthUser @relation(fields: [userId], references: [id], onDelete: Cascade)
-
-  @@index([score])
-}
-
-model AppFreelancerTrustEvent {
-  id         String                     @id
-  userId     String
-  component  String
-  delta      Int
-  scoreAfter Int
-  reason     String
-  sourceType String?
-  sourceId   String?
-  status     String                     @default("APPLIED")
-  occurredAt DateTime                   @default(now())
-  dispute    AppFreelancerTrustDispute?
-  user       AppAuthUser                @relation(fields: [userId], references: [id], onDelete: Cascade)
-
-  @@index([userId, occurredAt])
-  @@index([sourceType, sourceId])
-}
-
-model AppFreelancerTrustDispute {
-  id               String                  @id
-  eventId          String                  @unique
-  userId           String
-  reason           String
-  status           String                  @default("OPEN")
-  resolutionNote   String?
-  reviewedByUserId String?
-  reviewedAt       DateTime?
-  createdAt        DateTime                @default(now())
-  updatedAt        DateTime                @updatedAt
-  event            AppFreelancerTrustEvent @relation(fields: [eventId], references: [id], onDelete: Cascade)
-  user             AppAuthUser             @relation(fields: [userId], references: [id], onDelete: Cascade)
-
-  @@index([userId, status])
-}
-
-model AppFreelancerPortfolioReview {
-  id                String       @id
-  serviceId         String
-  freelancerId      String
-  submissionVersion Int          @default(1)
-  status            String       @default("PENDING")
-  portfolioUrl      String
-  note              String?
-  reviewedByUserId  String?
-  submittedAt       DateTime     @default(now())
-  reviewedAt        DateTime?
-  createdAt         DateTime     @default(now())
-  updatedAt         DateTime     @updatedAt
-  freelancer        AppAuthUser  @relation("FreelancerPortfolioReviews", fields: [freelancerId], references: [id], onDelete: Cascade)
-  reviewer          AppAuthUser? @relation("PortfolioReviewer", fields: [reviewedByUserId], references: [id])
-
-  @@index([status, submittedAt])
-  @@index([serviceId])
-  @@index([freelancerId])
 }
 
 model AppAssignmentProgressUpdate {
@@ -2729,55 +2144,6 @@ model AppTeamMembership {
   @@index([status])
 }
 
-model AppMarketplaceTask {
-  id                    String    @id
-  tenantId              String
-  agencyUserId          String
-  agencyName            String
-  title                 String
-  category              String
-  brief                 String
-  budgetAmount          Int
-  deadline              DateTime?
-  requiredSkills        String[]  @default([])
-  referenceLinks        String[]  @default([])
-  visibility            String
-  applicationDeadline   DateTime?
-  status                String
-  assignedFreelancerId  String?
-  acceptedApplicationId String?
-  metadata              Json      @default("{}")
-  createdAt             DateTime  @default(now())
-  updatedAt             DateTime  @default(now()) @updatedAt
-
-  @@index([tenantId])
-  @@index([status])
-  @@index([visibility])
-  @@index([assignedFreelancerId])
-}
-
-model AppTaskApplication {
-  id                  String   @id
-  taskId              String
-  tenantId            String
-  freelancerId        String
-  freelancerName      String
-  proposal            String
-  quotedAmount        Int
-  estimatedTurnaround String
-  portfolioReference  String
-  status              String
-  metadata            Json     @default("{}")
-  createdAt           DateTime @default(now())
-  updatedAt           DateTime @default(now()) @updatedAt
-
-  @@unique([taskId, freelancerId])
-  @@index([taskId])
-  @@index([tenantId])
-  @@index([freelancerId])
-  @@index([status])
-}
-
 model AppAssignmentRecord {
   id                 String                           @id
   tenantId           String
@@ -2817,54 +2183,6 @@ model AppAssignmentRecord {
   @@index([status])
 }
 
-model AppDeliverySubmission {
-  id             String    @id
-  assignmentId   String
-  tenantId       String
-  freelancerId   String
-  freelancerName String
-  version        Int
-  deliveryLinks  String[]  @default([])
-  notes          String
-  status         String
-  reviewedById   String?
-  reviewedByRole String?
-  reviewedAt     DateTime?
-  reviewNote     String?
-  metadata       Json      @default("{}")
-  createdAt      DateTime  @default(now())
-  updatedAt      DateTime  @default(now()) @updatedAt
-
-  @@index([assignmentId])
-  @@index([tenantId])
-  @@index([freelancerId])
-  @@index([status])
-}
-
-model AppRevisionRequest {
-  id              String    @id
-  assignmentId    String
-  submissionId    String?
-  tenantId        String
-  freelancerId    String
-  reason          String
-  notes           String
-  dueDate         DateTime?
-  status          String
-  requestedById   String
-  requestedByRole String
-  resolvedAt      DateTime?
-  metadata        Json      @default("{}")
-  createdAt       DateTime  @default(now())
-  updatedAt       DateTime  @default(now()) @updatedAt
-
-  @@index([assignmentId])
-  @@index([submissionId])
-  @@index([tenantId])
-  @@index([freelancerId])
-  @@index([status])
-}
-
 model AppPaymentRequest {
   id                       String    @id
   assignmentId             String
@@ -2901,32 +2219,6 @@ model AppPaymentRequest {
   @@index([assignmentId])
   @@index([tenantId])
   @@index([freelancerId])
-  @@index([status])
-  @@index([createdAt])
-}
-
-model AppFreelancerWalletEntry {
-  id                String    @id
-  freelancerId      String
-  tenantId          String
-  assignmentId      String
-  paymentRequestId  String    @unique
-  title             String
-  grossAmount       Int
-  commissionPercent Decimal   @default(30) @db.Decimal(5, 2)
-  commissionAmount  Int
-  netAmount         Int
-  status            String
-  source            String
-  availableAt       DateTime?
-  paidAt            DateTime?
-  metadata          Json      @default("{}")
-  createdAt         DateTime  @default(now())
-  updatedAt         DateTime  @updatedAt
-
-  @@index([freelancerId])
-  @@index([tenantId])
-  @@index([assignmentId])
   @@index([status])
   @@index([createdAt])
 }
@@ -3573,14 +2865,6 @@ model WhatsAppAuditLog {
   @@index([createdAt])
 }
 
-model AgencyResetBackup20260622 {
-  id          BigInt   @id @default(autoincrement())
-  sourceTable String
-  sourceId    String?
-  payload     Json
-  backedUpAt  DateTime @default(now()) @db.Timestamptz(6)
-}
-
 model AgencySitesSsoHandoff {
   id           String    @id
   codeHash     String    @unique
@@ -3628,30 +2912,30 @@ model AiConversationMemoryNode {
 }
 
 model AicloserWorkspace {
-  id                     String                   @id
-  name                   String
-  slug                   String?                  @unique
-  ownerUserId            String?
-  ownerEmail             String?
-  ownerPhone             String?
-  status                 String                   @default("ACTIVE")
-  planTier               String                   @default("PRO")
-  maxSeats               Int                      @default(5)
-  settings               Json                     @default("{}")
-  createdAt              DateTime                 @default(now())
-  updatedAt              DateTime                 @default(now())
-  users                  AppAuthUser[]
-  clientSessions         AppClientSession[]
-  clientSlots            AppClientSlot[]
-  conversations          AppConversation[]
-  marketingContacts      MarketingContact[]
-  activityLogs           SalesActivityLog[]
-  agentProfiles          SalesAgentProfile[]
-  leads                  SalesLeadAssignment[]
-  leadPoolItems          SalesLeadPoolItem[]
-  timelineEntries        SalesLeadTimelineEntry[]
-  mobileCalls            SalesMobileCall[]
-  mobileDevices          SalesMobileDevice[]
+  id                String                   @id
+  name              String
+  slug              String?                  @unique
+  ownerUserId       String?
+  ownerEmail        String?
+  ownerPhone        String?
+  status            String                   @default("ACTIVE")
+  planTier          String                   @default("PRO")
+  maxSeats          Int                      @default(5)
+  settings          Json                     @default("{}")
+  createdAt         DateTime                 @default(now())
+  updatedAt         DateTime                 @default(now())
+  users             AppAuthUser[]
+  clientSessions    AppClientSession[]
+  clientSlots       AppClientSlot[]
+  conversations     AppConversation[]
+  marketingContacts MarketingContact[]
+  activityLogs      SalesActivityLog[]
+  agentProfiles     SalesAgentProfile[]
+  leads             SalesLeadAssignment[]
+  leadPoolItems     SalesLeadPoolItem[]
+  timelineEntries   SalesLeadTimelineEntry[]
+  mobileCalls       SalesMobileCall[]
+  mobileDevices     SalesMobileDevice[]
 
   @@index([createdAt])
   @@index([status])
@@ -3671,44 +2955,6 @@ model AppAgencyApiToken {
 
   @@index([tenantId])
   @@index([tokenHash])
-}
-
-/// The underlying table does not contain a valid unique identifier and can therefore currently not be handled by Prisma Client.
-model AppConversation_AgencyDuplicates_Backup_20261003 {
-  id                     String?
-  tenantId               String?
-  serviceId              String?
-  serviceSlug            String?
-  assignedFreelancerId   String?
-  assignedFreelancerName String?
-  customerName           String?
-  customerPhone          String?
-  status                 String?
-  leadStatusId           String?
-  payload                Json?
-  createdAt              DateTime?
-  updatedAt              DateTime?
-
-  @@ignore
-}
-
-/// The underlying table does not contain a valid unique identifier and can therefore currently not be handled by Prisma Client.
-model AppConversation_Non9993328124_Backup_20261003 {
-  id                     String?
-  tenantId               String?
-  serviceId              String?
-  serviceSlug            String?
-  assignedFreelancerId   String?
-  assignedFreelancerName String?
-  customerName           String?
-  customerPhone          String?
-  status                 String?
-  leadStatusId           String?
-  payload                Json?
-  createdAt              DateTime?
-  updatedAt              DateTime?
-
-  @@ignore
 }
 
 model MobilePushToken {
@@ -3732,126 +2978,6 @@ model MobilePushToken {
   @@index([userId])
 }
 
-/// The underlying table does not contain a valid unique identifier and can therefore currently not be handled by Prisma Client.
-model SalesActivityLog_NonInbound_Backup_20261003 {
-  id           String?
-  assignmentId String?
-  actorUserId  String?
-  action       String?
-  note         String?
-  metadata     Json?
-  createdAt    DateTime?
-
-  @@ignore
-}
-
-/// The underlying table does not contain a valid unique identifier and can therefore currently not be handled by Prisma Client.
-model SalesLeadAssignment_AgencyDuplicates_Backup_20261003 {
-  id              String?
-  leadId          String?
-  assignedAgentId String?
-  createdById     String?
-  customerName    String?
-  customerPhone   String?
-  customerEmail   String?
-  source          String?
-  serviceInterest String?
-  budgetAmount    Decimal?        @db.Decimal(10, 2)
-  stage           SalesLeadStage?
-  followUpAt      DateTime?
-  notes           String?
-  createdAt       DateTime?
-  updatedAt       DateTime?
-  segment         String?
-  priority        String?
-  tags            String[]
-  conversationId  String?
-  lastContactedAt DateTime?
-
-  @@ignore
-}
-
-/// The underlying table does not contain a valid unique identifier and can therefore currently not be handled by Prisma Client.
-model SalesLeadAssignment_Non9993328124_Backup_20261003 {
-  id              String?
-  leadId          String?
-  assignedAgentId String?
-  createdById     String?
-  customerName    String?
-  customerPhone   String?
-  customerEmail   String?
-  source          String?
-  serviceInterest String?
-  budgetAmount    Decimal?        @db.Decimal(10, 2)
-  stage           SalesLeadStage?
-  followUpAt      DateTime?
-  notes           String?
-  createdAt       DateTime?
-  updatedAt       DateTime?
-  segment         String?
-  priority        String?
-  tags            String[]
-  conversationId  String?
-  lastContactedAt DateTime?
-
-  @@ignore
-}
-
-/// The underlying table does not contain a valid unique identifier and can therefore currently not be handled by Prisma Client.
-model SalesLeadAssignment_NonInbound_Backup_20261003_v2 {
-  id              String?
-  leadId          String?
-  assignedAgentId String?
-  createdById     String?
-  customerName    String?
-  customerPhone   String?
-  customerEmail   String?
-  source          String?
-  serviceInterest String?
-  budgetAmount    Decimal?        @db.Decimal(10, 2)
-  stage           SalesLeadStage?
-  followUpAt      DateTime?
-  notes           String?
-  createdAt       DateTime?
-  updatedAt       DateTime?
-  segment         String?
-  priority        String?
-  tags            String[]
-  conversationId  String?
-  lastContactedAt DateTime?
-
-  @@ignore
-}
-
-/// The underlying table does not contain a valid unique identifier and can therefore currently not be handled by Prisma Client.
-model SalesMobileCall_NonInbound_Backup_20261003 {
-  id                 String?
-  assignmentId       String?
-  agentId            String?
-  deviceId           String?
-  phoneNumber        String?
-  direction          SalesMobileCallDirection?
-  status             SalesMobileCallStatus?
-  startedAt          DateTime?
-  connectedAt        DateTime?
-  endedAt            DateTime?
-  durationSeconds    Int?
-  outcome            String?
-  note               String?
-  nextFollowUpAt     DateTime?
-  recordingStatus    SalesMobileRecordingStatus?
-  recordingPath      String?
-  recordingMimeType  String?
-  recordingSizeBytes Int?
-  recordingError     String?
-  noteRequired       Boolean?
-  noteSubmitted      Boolean?
-  createdAt          DateTime?
-  updatedAt          DateTime?
-
-  @@ignore
-}
-
 model notification_logs {
   id                String   @id
   user_id           String
@@ -3862,6 +2988,26 @@ model notification_logs {
   status            String
   failure_reason    String?
   created_at        DateTime @default(now()) @db.Timestamptz(6)
+}
+
+model GxLeadTask {
+  id           String    @id @default(cuid())
+  salesLeadId  String
+  ownerAgentId String?
+  createdById  String?
+  title        String
+  description  String?
+  priority     String    @default("NORMAL")
+  status       String    @default("OPEN")
+  dueAt        DateTime
+  completedAt  DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  @@index([salesLeadId, status, dueAt])
+  @@index([ownerAgentId, status, dueAt])
+  @@index([createdById, createdAt])
+  @@map("gx_lead_tasks")
 }
 
 enum UserRole {

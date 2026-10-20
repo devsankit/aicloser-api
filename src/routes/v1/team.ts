@@ -549,7 +549,7 @@ teamRouter.patch('/:id', requirePermissions(PERM_TEAM_MANAGE), validateBody(upda
   });
 
   if (profile.userId && (body.role || body.displayName || body.phone || body.email)) {
-    await prisma.user.update({
+    await prisma.appAuthUser.update({
       where: { id: profile.userId },
       data: {
         ...(body.role ? { role: body.role as any } : {}),

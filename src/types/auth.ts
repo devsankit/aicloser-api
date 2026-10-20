@@ -1,4 +1,4 @@
-export type UserRole = 'SUPER_ADMIN' | 'ADMIN' | 'MANAGER' | 'SALES_AGENT' | 'FREELANCER' | 'CLIENT';
+export type UserRole = 'SUPER_ADMIN' | 'ADMIN' | 'MANAGER' | 'CLOSER' | 'SALES_AGENT';
 
 export interface AuthenticatedUser {
   userId: string;

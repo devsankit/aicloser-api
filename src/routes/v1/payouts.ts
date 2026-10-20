@@ -88,8 +88,26 @@ payoutsRouter.get('/balance', async (req: Request, res: Response) => {
   const totalWonRevenue = Number(wonDeals._sum?.budgetAmount || 0);
   const totalPaid = Number(approvedPayouts._sum?.amount || 0);
   const totalPending = Number(pendingPayouts._sum?.amount || 0);
-  // Default closer commission is 20%
-  const totalEarnedCommission = Math.round(totalWonRevenue * 0.20 * 100) / 100;
+  // Resolve commission percentage dynamically from agent's profile or workspace settings
+  let commissionRate = 0.10;
+  if (agentProfileId && agentProfileId !== '__none__') {
+    const profile = await prisma.salesAgentProfile.findUnique({
+      where: { id: agentProfileId },
+      select: { commissionPercent: true },
+    });
+    if (profile?.commissionPercent != null) {
+      commissionRate = Number(profile.commissionPercent) / 100;
+    }
+  } else {
+    const settings = await prisma.salesSettings.findFirst({
+      select: { defaultCommissionPercent: true },
+    });
+    if (settings?.defaultCommissionPercent != null) {
+      commissionRate = Number(settings.defaultCommissionPercent) / 100;
+    }
+  }
+
+  const totalEarnedCommission = Math.round(totalWonRevenue * commissionRate * 100) / 100;
   const availableBalance = Math.max(0, Math.round((totalEarnedCommission - totalPaid - totalPending) * 100) / 100);
 
   res.json({

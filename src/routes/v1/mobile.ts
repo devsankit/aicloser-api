@@ -322,7 +322,7 @@ mobileRouter.post('/bootstrap', validateBody(bootstrapSchema), async (req: Reque
         },
       },
     }),
-    prisma.user.findUnique({
+    prisma.appAuthUser.findUnique({
       where: { id: userId },
       select: { id: true, email: true, displayName: true, role: true },
     }),

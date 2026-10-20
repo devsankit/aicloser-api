@@ -868,7 +868,7 @@ const handleAssignConversation = async (req: Request, res: Response) => {
   const user = req.user!;
   const id = String(req.params.id);
   const rawAgentId = String(
-    req.body?.assignedAgentId ||
+    req.body?.agentId || req.body?.assignedAgentId ||
     req.body?.freelancerId ||
     (Array.isArray(req.body?.freelancerIds) ? req.body.freelancerIds[0] : '') ||
     ''

@@ -612,8 +612,7 @@ reportsRouter.get('/responsibility', async (req: Request, res: Response) => {
       period: inPeriod,
       app: {
         audience: null,
-        agencyRegistered: false,
-        freelancerRegistered: false,
+        workspaceRegistered: true,
         appInstalled: false,
         onboardingStage: null,
         billingState: 'UNKNOWN',
