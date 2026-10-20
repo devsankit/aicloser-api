@@ -50,9 +50,13 @@ leadsRouter.get('/', validateQuery(listLeadsQuerySchema), async (req: Request, r
   if (stage) where.stage = stage;
 
   // Admins see the tenant; managers see their reporting team; closers see
-  // only their own assigned leads.
-  if (req.user?.role === 'SALES_AGENT' || req.user?.role === 'MANAGER') {
-    const scope = await getWorkspaceScope(tenantId, req.user);
+  // strictly only their own assigned leads.
+  const authUser = req.user;
+  if (authUser && (authUser.role === 'SALES_AGENT' || (authUser.role as any) === 'CLOSER')) {
+    const scope = await getWorkspaceScope(tenantId, authUser);
+    where.assignedAgentId = scope.profileIds.length === 1 ? scope.profileIds[0] : { in: scope.profileIds.length ? scope.profileIds : ['__NO_ACCESS__'] };
+  } else if (authUser && authUser.role === 'MANAGER') {
+    const scope = await getWorkspaceScope(tenantId, authUser);
     where.assignedAgentId = { in: scope.profileIds.length ? scope.profileIds : ['__NO_ACCESS__'] };
   } else if (assignedAgentId) {
     where.assignedAgentId = assignedAgentId;
@@ -306,7 +310,11 @@ leadsRouter.get('/pipeline-bootstrap', async (req: Request, res: Response) => {
   // 1. Compute access scope
   const where: any = { tenantId };
   let scopeProfileIds: string[] | null = null;
-  if (user.role === 'SALES_AGENT' || user.role === 'MANAGER') {
+  if (user.role === 'SALES_AGENT' || (user.role as any) === 'CLOSER') {
+    const scope = await getWorkspaceScope(tenantId, user);
+    scopeProfileIds = scope.profileIds.length ? scope.profileIds : ['__NO_ACCESS__'];
+    where.assignedAgentId = scope.profileIds.length === 1 ? scope.profileIds[0] : { in: scopeProfileIds };
+  } else if (user.role === 'MANAGER') {
     const scope = await getWorkspaceScope(tenantId, user);
     scopeProfileIds = scope.profileIds;
     where.assignedAgentId = { in: scope.profileIds.length ? scope.profileIds : ['__NO_ACCESS__'] };
@@ -321,7 +329,7 @@ leadsRouter.get('/pipeline-bootstrap', async (req: Request, res: Response) => {
   const limitParam = req.query.limit ? Number(req.query.limit) : 250;
   const leadLimit = Math.min(500, Math.max(1, isNaN(limitParam) ? 250 : limitParam));
   const maxVisibleToCloser = req.query.maxVisibleToCloser
-    ? Math.min(20, Math.max(1, Number(req.query.maxVisibleToCloser)))
+    ? Math.min(50, Math.max(1, isNaN(Number(req.query.maxVisibleToCloser)) ? 5 : Number(req.query.maxVisibleToCloser)))
     : 5;
 
   // 2. Run all sub-queries concurrently in parallel
@@ -675,14 +683,20 @@ leadsRouter.get('/dashboard-summary', async (req: Request, res: Response) => {
 leadsRouter.get('/pool', async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
 
-  const profile = req.user?.role === 'SALES_AGENT'
+  const maxVisibleParam = req.query.maxVisibleToCloser || req.query.limit;
+  const maxVisibleToCloser = maxVisibleParam
+    ? Math.min(50, Math.max(1, isNaN(Number(maxVisibleParam)) ? 5 : Number(maxVisibleParam)))
+    : (req.user?.role === 'SALES_AGENT' ? 5 : 50);
+
+  const user = req.user;
+  const profile = user && (user.role === 'SALES_AGENT' || (user.role as any) === 'CLOSER')
     ? await prisma.salesAgentProfile.findFirst({
-        where: { userId: req.user.userId, tenantId, status: 'ACTIVE' },
+        where: { userId: user.userId, tenantId, status: 'ACTIVE' },
         select: { id: true },
       })
     : null;
 
-  if (req.user?.role === 'SALES_AGENT' && !profile) {
+  if ((req.user?.role === 'SALES_AGENT' || (req.user?.role as any) === 'CLOSER') && !profile) {
     res.json({ success: true, data: [], error: null });
     return;
   }
@@ -693,11 +707,205 @@ leadsRouter.get('/pool', async (req: Request, res: Response) => {
       status: 'OPEN',
       ...(profile ? { OR: [{ assignedAgentId: null }, { assignedAgentId: profile.id }] } : {}),
     },
-    take: 50,
+    take: maxVisibleToCloser,
     orderBy: { createdAt: 'desc' },
   });
 
   res.json({ success: true, data: poolLeads });
+});
+
+// POST /pool/auto-distribute - Distribute open pool leads sequentially to active closers with remaining capacity
+const autoDistributeSchema = z.object({
+  count: z.number().int().positive().optional(),
+  poolItemIds: z.array(z.string()).optional(),
+});
+
+leadsRouter.post('/pool/auto-distribute', async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const user = req.user!;
+
+  if (user.role !== 'ADMIN' && user.role !== 'SUPER_ADMIN' && user.role !== 'MANAGER') {
+    res.status(403).json({ success: false, error: 'Forbidden', message: 'Only workspace admins and managers can auto-distribute pool leads' });
+    return;
+  }
+
+  const parsed = autoDistributeSchema.safeParse(req.body ?? {});
+  if (!parsed.success) {
+    res.status(400).json({ success: false, error: 'ValidationError', message: parsed.error.issues[0]?.message || 'Invalid request body' });
+    return;
+  }
+  const body = parsed.data;
+
+  // 1. Find eligible active sales agents
+  const activeProfiles = await prisma.salesAgentProfile.findMany({
+    where: {
+      tenantId,
+      status: 'ACTIVE',
+      user: { role: 'SALES_AGENT' },
+    },
+    include: {
+      user: { select: { id: true, displayName: true, email: true } },
+      _count: {
+        select: {
+          leadAssignments: {
+            where: { stage: { notIn: inactiveLeadStages } },
+          },
+        },
+      },
+    },
+    orderBy: { createdAt: 'asc' },
+  });
+
+  const eligibleClosers = activeProfiles
+    .map((p) => {
+      const maxActiveLeads = p.maxActiveLeads && p.maxActiveLeads > 0 ? p.maxActiveLeads : 15;
+      const currentActive = p._count.leadAssignments;
+      const remainingCapacity = Math.max(0, maxActiveLeads - currentActive);
+      return {
+        profile: p,
+        currentActive,
+        maxActiveLeads,
+        remainingCapacity,
+      };
+    })
+    .filter((c) => c.remainingCapacity > 0);
+
+  if (eligibleClosers.length === 0) {
+    res.status(409).json({
+      success: false,
+      error: 'NoEligibleClosers',
+      message: 'No active closers have available capacity for lead assignment',
+      count: 0,
+      assignments: [],
+    });
+    return;
+  }
+
+  // 2. Find OPEN SalesLeadPoolItem records
+  let itemsToDistribute: any[] = [];
+  if (body.poolItemIds && body.poolItemIds.length > 0) {
+    itemsToDistribute = await prisma.salesLeadPoolItem.findMany({
+      where: {
+        id: { in: body.poolItemIds },
+        tenantId,
+        status: 'OPEN',
+      },
+      orderBy: { createdAt: 'asc' },
+    });
+  } else {
+    const takeCount = body.count ? Math.min(body.count, 200) : 200;
+    itemsToDistribute = await prisma.salesLeadPoolItem.findMany({
+      where: {
+        tenantId,
+        status: 'OPEN',
+      },
+      take: takeCount,
+      orderBy: { createdAt: 'asc' },
+    });
+  }
+
+  if (itemsToDistribute.length === 0) {
+    res.json({
+      success: true,
+      count: 0,
+      assignments: [],
+      message: 'No open pool leads available for distribution',
+    });
+    return;
+  }
+
+  // 3. Plan round-robin assignments
+  let closerIndex = 0;
+  const assignmentsToCreate: Array<{ poolItem: any; closer: typeof eligibleClosers[0] }> = [];
+
+  for (const item of itemsToDistribute) {
+    let candidate = null;
+    for (let attempts = 0; attempts < eligibleClosers.length; attempts++) {
+      const currentCandidate = eligibleClosers[closerIndex % eligibleClosers.length];
+      closerIndex++;
+      if (currentCandidate.remainingCapacity > 0) {
+        candidate = currentCandidate;
+        candidate.remainingCapacity--;
+        break;
+      }
+    }
+    if (!candidate) break;
+    assignmentsToCreate.push({ poolItem: item, closer: candidate });
+  }
+
+  // 4. Atomic transaction
+  const distributedResults = await prisma.$transaction(async (tx) => {
+    const results = [];
+    for (const { poolItem, closer } of assignmentsToCreate) {
+      await tx.salesLeadPoolItem.update({
+        where: { id: poolItem.id },
+        data: {
+          status: 'CLAIMED',
+          claimedByAgentId: closer.profile.id,
+          claimedAt: new Date(),
+        },
+      });
+
+      const lead = await tx.salesLeadAssignment.create({
+        data: {
+          tenantId,
+          assignedAgentId: closer.profile.id,
+          createdById: user.userId,
+          customerName: poolItem.customerName,
+          customerPhone: poolItem.customerPhone,
+          customerEmail: poolItem.customerEmail,
+          source: poolItem.source || 'auto_distribute',
+          serviceInterest: poolItem.serviceInterest,
+          segment: poolItem.segment,
+          priority: poolItem.priority || 'normal',
+          budgetAmount: poolItem.budgetAmount,
+          stage: 'NEW',
+          notes: poolItem.notes
+            ? `${poolItem.notes} (Auto-distributed to ${closer.profile.agentCode})`
+            : `Auto-distributed to ${closer.profile.agentCode}`,
+          conversationId: poolItem.conversationId,
+        },
+      });
+
+      await tx.salesLeadPoolItem.update({
+        where: { id: poolItem.id },
+        data: { convertedAssignmentId: lead.id },
+      });
+
+      await tx.salesActivityLog.create({
+        data: {
+          tenantId,
+          assignmentId: lead.id,
+          actorUserId: user.userId,
+          action: 'LEAD_AUTO_DISTRIBUTED',
+          note: `Lead ${lead.customerName} auto-distributed from grab pool to closer ${closer.profile.user?.displayName || closer.profile.agentCode}`,
+          metadata: {
+            poolItemId: poolItem.id,
+            assignedAgentId: closer.profile.id,
+            agentCode: closer.profile.agentCode,
+          },
+        },
+      });
+
+      results.push({
+        leadId: lead.id,
+        poolItemId: poolItem.id,
+        customerName: lead.customerName,
+        customerPhone: lead.customerPhone,
+        assignedAgentId: closer.profile.id,
+        agentCode: closer.profile.agentCode,
+        closerName: closer.profile.user?.displayName,
+      });
+    }
+    return results;
+  });
+
+  res.json({
+    success: true,
+    count: distributedResults.length,
+    assignments: distributedResults,
+    message: `Successfully auto-distributed ${distributedResults.length} leads across active closers`,
+  });
 });
 
 // GET /duplicates - Detect duplicate leads by phone or email
@@ -1542,7 +1750,7 @@ async function handlePoolClaim(req: Request, res: Response) {
         throw new PoolClaimError(409, 'AlreadyClaimed', 'This lead has already been claimed');
       }
 
-      if (poolItem.assignedAgentId && poolItem.assignedAgentId !== profile.id) {
+      if (poolItem.assignedAgentId && poolItem.assignedAgentId !== profile.id && user.role !== 'ADMIN' && user.role !== 'SUPER_ADMIN' && user.role !== 'MANAGER') {
         throw new PoolClaimError(409, 'ReservedForAnotherCloser', 'This lead is reserved for another closer');
       }
 
@@ -1683,9 +1891,10 @@ leadsRouter.get('/:id/notes', async (req: Request, res: Response) => {
 leadsRouter.post('/:id/notes', async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const id = String(req.params.id);
-  const { body } = req.body as { body: string };
+  const rawBody = req.body || {};
+  const noteText = (rawBody.body || rawBody.note || rawBody.content || rawBody.text || '').trim();
 
-  if (!body || !body.trim()) {
+  if (!noteText) {
     res.status(400).json({ success: false, error: 'InvalidRequest', message: 'Note content cannot be empty' });
     return;
   }
@@ -1701,7 +1910,7 @@ leadsRouter.post('/:id/notes', async (req: Request, res: Response) => {
       tenantId,
       leadId: check.lead.id,
       type: 'NOTE',
-      body: body.trim(),
+      body: noteText,
       userId: req.user?.userId,
     },
   });
@@ -1825,15 +2034,17 @@ leadsRouter.get('/:id/tasks', async (req: Request, res: Response) => {
 // POST /:id/tasks - Create task for a lead
 leadsRouter.post('/:id/tasks', async (req: Request, res: Response) => {
   const id = String(req.params.id);
-  const { title, description, dueAt, priority } = req.body as {
-    title: string;
-    description?: string;
-    dueAt: string;
-    priority?: string;
-  };
+  const rawBody = req.body || {};
+  const title = (rawBody.title || rawBody.task || rawBody.name || rawBody.content || '').trim();
+  const description = (rawBody.description || rawBody.desc || rawBody.notes || '').trim() || null;
+  const rawDueAt = rawBody.dueAt || rawBody.dueDate || rawBody.due;
+  const dueAt = rawDueAt && !isNaN(new Date(rawDueAt).getTime())
+    ? new Date(rawDueAt)
+    : new Date(Date.now() + 24 * 60 * 60 * 1000);
+  const priority = (rawBody.priority || 'NORMAL').toUpperCase();
 
-  if (!title || !dueAt) {
-    res.status(400).json({ success: false, error: 'InvalidRequest', message: 'Title and due date are required' });
+  if (!title) {
+    res.status(400).json({ success: false, error: 'InvalidRequest', message: 'Task title is required' });
     return;
   }
 
@@ -1846,11 +2057,12 @@ leadsRouter.post('/:id/tasks', async (req: Request, res: Response) => {
   const task = await prisma.gxLeadTask.create({
     data: {
       salesLeadId: check.lead.id,
+      ownerAgentId: check.lead.assignedAgentId || null,
       createdById: req.user?.userId,
-      title: title.trim(),
-      description: description?.trim(),
-      dueAt: new Date(dueAt),
-      priority: (priority || 'NORMAL').toUpperCase(),
+      title,
+      description,
+      dueAt,
+      priority,
       status: 'OPEN',
     },
   });
