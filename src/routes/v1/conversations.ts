@@ -208,12 +208,130 @@ async function verifyCloserAccess(
   return result.hasAccess && (req.method === 'GET' || req.method === 'HEAD' || result.permission === 'REPLY');
 }
 
+// Universal conversation resolver: resolves direct IDs, QR scanned leads, sales lead IDs, and stripped prefixes
+export async function resolveAppConversation(tenantId: string, rawId: string, autoCreateFromLead = false) {
+  if (!rawId) return null;
+  const id = String(rawId).trim();
+
+  // 1. Direct match in AppConversation
+  let conv = await prisma.appConversation.findFirst({
+    where: { id, tenantId },
+  });
+  if (conv) return conv;
+
+  // 2. Strip prefixes: 'conv-lead-', 'lead-'
+  const cleanId = id.replace(/^conv-lead-/, '').replace(/^lead-/, '');
+
+  // 3. Direct match with stripped ID
+  conv = await prisma.appConversation.findFirst({
+    where: { id: cleanId, tenantId },
+  });
+  if (conv) return conv;
+
+  // 4. If cleanId starts with 'sales-conversation-', strip that too
+  if (cleanId.startsWith('sales-conversation-')) {
+    const directConvId = cleanId.replace(/^sales-conversation-/, '');
+    conv = await prisma.appConversation.findFirst({
+      where: { id: directConvId, tenantId },
+    });
+    if (conv) return conv;
+  }
+
+  // 5. Query SalesLeadAssignment for this lead
+  const lead = await prisma.salesLeadAssignment.findFirst({
+    where: {
+      tenantId,
+      OR: [
+        { id },
+        { id: cleanId },
+        { id: `lead-${cleanId}` },
+        { id: `sales-conversation-${cleanId}` },
+        { conversationId: id },
+        { conversationId: cleanId },
+        ...(cleanId.startsWith('sales-conversation-')
+          ? [{ conversationId: cleanId.replace(/^sales-conversation-/, '') }]
+          : []),
+      ],
+    },
+  });
+
+  if (lead) {
+    if (lead.conversationId) {
+      conv = await prisma.appConversation.findFirst({
+        where: { id: lead.conversationId, tenantId },
+      });
+      if (conv) return conv;
+    }
+    if (lead.customerPhone) {
+      const cleanPhone = lead.customerPhone.replace(/\D/g, '').slice(-10);
+      conv = await prisma.appConversation.findFirst({
+        where: {
+          tenantId,
+          OR: [
+            { customerPhone: lead.customerPhone },
+            { customerPhone: { contains: cleanPhone } },
+          ],
+        },
+      });
+      if (conv) {
+        await prisma.salesLeadAssignment.update({
+          where: { id: lead.id },
+          data: { conversationId: conv.id },
+        }).catch(() => undefined);
+        return conv;
+      }
+
+      if (autoCreateFromLead) {
+        conv = await prisma.appConversation.create({
+          data: {
+            id: `conv-${randomUUID().slice(0, 8)}`,
+            tenantId,
+            serviceId: 'svc-whatsapp',
+            serviceSlug: 'whatsapp',
+            leadStatusId: 'new',
+            customerName: lead.customerName || 'WhatsApp Contact',
+            customerPhone: lead.customerPhone,
+            status: 'Active',
+            payload: {
+              messages: [],
+              sourceChannel: 'whatsapp',
+              customerName: lead.customerName || 'WhatsApp Contact',
+              customerPhone: lead.customerPhone,
+            },
+          },
+        });
+        await prisma.salesLeadAssignment.update({
+          where: { id: lead.id },
+          data: { conversationId: conv.id },
+        }).catch(() => undefined);
+        return conv;
+      }
+    }
+  }
+
+  // 6. Match by phone digits if id has >= 10 digits
+  const digits = id.replace(/\D/g, '');
+  if (digits.length >= 10) {
+    const last10 = digits.slice(-10);
+    conv = await prisma.appConversation.findFirst({
+      where: {
+        tenantId,
+        customerPhone: { contains: last10 },
+      },
+    });
+    if (conv) return conv;
+  }
+
+  return null;
+}
+
 conversationsRouter.get('/:id/360', async (req: Request, res: Response) => {
-  const conversation = await prisma.appConversation.findFirst({ where: { id: String(req.params.id), tenantId: req.tenantId! } });
+  const tenantId = req.tenantId!;
+  const conversation = await resolveAppConversation(tenantId, String(req.params.id), false);
   if (!conversation) return void res.status(404).json({ success: false, error: 'NotFound', message: 'Conversation not found' });
   if (!(await verifyCloserAccess(req, conversation))) return void res.status(403).json({ success: false, error: 'Forbidden', message: 'Conversation access denied' });
   const lead = await prisma.salesLeadAssignment.findFirst({
-    where: { tenantId: req.tenantId!, OR: [{ conversationId: conversation.id }, ...phoneMatchConditions([conversation.customerPhone])] },
+    where: { tenantId, OR: [{ conversationId: conversation.id }, ...phoneMatchConditions([conversation.customerPhone])] },
     select: { id: true },
   });
   if (!lead) return void res.json({ success: true, data: { lead: null, notes: [], timeline: [], history: [], tasks: [], calls: [], payments: [] }, error: null });
@@ -534,9 +652,7 @@ conversationsRouter.get('/:id', async (req: Request, res: Response) => {
 
   if (id === 'chat-visibility') return;
 
-  const conversation = await prisma.appConversation.findFirst({
-    where: { id, tenantId },
-  });
+  const conversation = await resolveAppConversation(tenantId, id, false);
 
   if (!conversation) {
     res.status(404).json({ success: false, error: 'NotFound', message: 'Conversation not found in workspace' });
@@ -563,9 +679,7 @@ conversationsRouter.get('/:id/messages', async (req: Request, res: Response) => 
   const beforeCursor = typeof req.query.before === 'string' ? req.query.before : null;
   const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 50));
 
-  const conversation = await prisma.appConversation.findFirst({
-    where: { id, tenantId },
-  });
+  const conversation = await resolveAppConversation(tenantId, id, true);
 
   if (!conversation) {
     res.status(404).json({ success: false, data: null, error: 'NotFound', message: 'Conversation not found' });
@@ -647,45 +761,7 @@ conversationsRouter.post('/:id/messages', validateBody(sendMessageSchema), async
   const id = String(req.params.id);
   const body = req.body as z.infer<typeof sendMessageSchema>;
 
-  let conversation = await prisma.appConversation.findFirst({
-    where: { id, tenantId },
-  });
-
-  // If conversation not found directly, check if the ID is a lead ID
-  if (!conversation && id.startsWith('lead-')) {
-    const lead = await prisma.salesLeadAssignment.findFirst({
-      where: { id, tenantId },
-    });
-    if (lead && lead.customerPhone) {
-      conversation = await prisma.appConversation.findFirst({
-        where: { tenantId, customerPhone: lead.customerPhone },
-      });
-      if (!conversation) {
-        conversation = await prisma.appConversation.create({
-          data: {
-            id: `conv-${randomUUID().slice(0, 8)}`,
-            tenantId,
-            serviceId: 'svc-whatsapp',
-            serviceSlug: 'whatsapp',
-            leadStatusId: 'new',
-            customerName: lead.customerName || 'WhatsApp Contact',
-            customerPhone: lead.customerPhone,
-            status: 'Active',
-            payload: {
-              messages: [],
-              sourceChannel: 'whatsapp',
-              customerName: lead.customerName || 'WhatsApp Contact',
-              customerPhone: lead.customerPhone,
-            },
-          },
-        });
-      }
-      await prisma.salesLeadAssignment.update({
-        where: { id: lead.id },
-        data: { conversationId: conversation.id },
-      }).catch(() => undefined);
-    }
-  }
+  const conversation = await resolveAppConversation(tenantId, id, true);
 
   if (!conversation) {
     res.status(404).json({ success: false, data: null, error: 'NotFound', message: 'Conversation not found' });
@@ -836,9 +912,7 @@ conversationsRouter.post('/:id/read', async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const id = String(req.params.id);
 
-  const conversation = await prisma.appConversation.findFirst({
-    where: { id, tenantId },
-  });
+  const conversation = await resolveAppConversation(tenantId, id, false);
 
   if (!conversation) {
     res.status(404).json({ success: false, error: 'NotFound', message: 'Conversation not found in this workspace' });
@@ -2170,24 +2244,7 @@ conversationsRouter.post('/:id/ai-auto-reply', async (req: Request, res: Respons
   const id = String(req.params.id);
   const disabled = Boolean(req.body?.disabled);
 
-  let conversation = await prisma.appConversation.findFirst({
-    where: { id, tenantId },
-  });
-
-  if (!conversation) {
-    const cleanId = id.replace(/^conv-lead-|^lead-/, '');
-    const lead = await prisma.salesLeadAssignment.findFirst({
-      where: {
-        tenantId,
-        OR: [{ id: cleanId }, { conversationId: cleanId }],
-      },
-    });
-    if (lead?.conversationId) {
-      conversation = await prisma.appConversation.findFirst({
-        where: { id: lead.conversationId, tenantId },
-      });
-    }
-  }
+  const conversation = await resolveAppConversation(tenantId, id, false);
 
   if (!conversation) {
     res.status(404).json({ success: false, error: 'NotFound', message: 'Conversation not found' });
