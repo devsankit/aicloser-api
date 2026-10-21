@@ -106,6 +106,122 @@ paymentsRouter.get('/public/:tokenOrId', async (req: Request, res: Response) => 
   });
 });
 
+// POST /public/:tokenOrId/confirm - Public endpoint for customer payment confirmation (no auth required)
+paymentsRouter.post('/public/:tokenOrId/confirm', upload.any(), async (req: Request, res: Response) => {
+  try {
+    const tokenOrId = String(req.params.tokenOrId).trim();
+    const payment = await prisma.upiPaymentLink.findFirst({
+      where: {
+        OR: [
+          { publicToken: tokenOrId },
+          { id: tokenOrId },
+        ],
+      },
+    });
+
+    if (!payment) {
+      res.status(404).json({ success: false, error: 'NotFound', message: 'Payment request not found or expired' });
+      return;
+    }
+
+    if (!['PENDING', 'CUSTOMER_CONFIRMED'].includes(payment.status)) {
+      res.status(400).json({ success: false, error: 'InvalidStatus', message: 'This payment link has already been settled or cancelled' });
+      return;
+    }
+
+    const file = (req.files && Array.isArray(req.files) ? req.files[0] : req.file);
+    const { utrReference, utrNumber, note, confirmationNote, base64Data, mimeType: bodyMimeType } = req.body as {
+      utrReference?: string;
+      utrNumber?: string;
+      note?: string;
+      confirmationNote?: string;
+      base64Data?: string;
+      mimeType?: string;
+    };
+
+    let fileBuffer: Buffer | null = null;
+    let mimeType = 'image/jpeg';
+    let sizeBytes = 0;
+    let ext = 'jpg';
+
+    if (file) {
+      fileBuffer = file.buffer;
+      mimeType = file.mimetype || 'image/jpeg';
+      sizeBytes = file.size;
+      if (mimeType.includes('png')) ext = 'png';
+      else if (mimeType.includes('webp')) ext = 'webp';
+      else if (mimeType.includes('pdf')) ext = 'pdf';
+      else ext = 'jpg';
+    } else if (base64Data) {
+      const cleanBase64 = base64Data.replace(/^data:.*?;base64,/, '');
+      fileBuffer = Buffer.from(cleanBase64, 'base64');
+      mimeType = bodyMimeType || 'image/jpeg';
+      sizeBytes = fileBuffer.length;
+      if (mimeType.includes('png')) ext = 'png';
+      else if (mimeType.includes('webp')) ext = 'webp';
+      else if (mimeType.includes('pdf')) ext = 'pdf';
+      else ext = 'jpg';
+    }
+
+    let proofRelativePath: string | null = null;
+    if (fileBuffer && fileBuffer.length > 0) {
+      const filename = `${payment.id}-${randomUUID().slice(0, 8)}.${ext}`;
+      proofRelativePath = path.join(payment.tenantId, filename);
+      const storageFilePath = path.resolve(PROOF_BASE_DIR, proofRelativePath);
+      fs.mkdirSync(path.dirname(storageFilePath), { recursive: true });
+      fs.writeFileSync(storageFilePath, fileBuffer);
+    }
+
+    const cleanUtr = (utrReference || utrNumber || '').trim();
+    const cleanNote = (note || confirmationNote || '').trim();
+
+    const updated = await prisma.upiPaymentLink.update({
+      where: { id: payment.id },
+      data: {
+        status: UpiPaymentLinkStatus.CUSTOMER_CONFIRMED,
+        confirmedAt: new Date(),
+        utrReference: cleanUtr ? cleanUtr : payment.utrReference,
+        confirmationNote: cleanNote ? cleanNote : payment.confirmationNote,
+        ...(proofRelativePath ? {
+          proofStoragePath: proofRelativePath,
+          proofMimeType: mimeType,
+          proofSizeBytes: sizeBytes,
+        } : {}),
+      },
+    });
+
+    await persistApiRealtimeEvent({
+      tenantId: payment.tenantId,
+      eventType: 'payment.customer_confirmed',
+      payload: {
+        paymentId: updated.id,
+        publicToken: updated.publicToken,
+        status: updated.status,
+        utrReference: updated.utrReference,
+        confirmationNote: updated.confirmationNote,
+        hasProof: Boolean(updated.proofStoragePath),
+      },
+    });
+
+    res.json({
+      success: true,
+      message: 'Payment confirmation recorded successfully',
+      payment: {
+        id: updated.id,
+        status: updated.status,
+        utrReference: updated.utrReference,
+        confirmedAt: updated.confirmedAt,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: 'ConfirmationFailed',
+      message: error instanceof Error ? error.message : 'Could not submit payment confirmation',
+    });
+  }
+});
+
 // ==========================================
 // AUTHENTICATED & TENANT-ISOLATED PIPELINE
 // ==========================================
@@ -837,24 +953,23 @@ paymentsRouter.post('/:id/proof', upload.any(), async (req: Request, res: Respon
       else ext = 'jpg';
     }
 
-    if (!fileBuffer || fileBuffer.length === 0) {
-      res.status(400).json({ success: false, error: 'FileRequired', message: 'Please provide a payment proof screenshot file or base64Data' });
-      return;
+    let proofRelativePath: string | null = null;
+    if (fileBuffer && fileBuffer.length > 0) {
+      const filename = `${payment.id}-${randomUUID().slice(0, 8)}.${ext}`;
+      proofRelativePath = path.join(tenantId, filename);
+      const storageFilePath = path.resolve(PROOF_BASE_DIR, proofRelativePath);
+      fs.mkdirSync(path.dirname(storageFilePath), { recursive: true });
+      fs.writeFileSync(storageFilePath, fileBuffer);
     }
-
-    const filename = `${payment.id}-${randomUUID().slice(0, 8)}.${ext}`;
-    const proofRelativePath = path.join(tenantId, filename);
-    const storageFilePath = path.resolve(PROOF_BASE_DIR, proofRelativePath);
-
-    fs.mkdirSync(path.dirname(storageFilePath), { recursive: true });
-    fs.writeFileSync(storageFilePath, fileBuffer);
 
     const updated = await prisma.upiPaymentLink.update({
       where: { id: payment.id },
       data: {
-        proofStoragePath: proofRelativePath,
-        proofMimeType: mimeType,
-        proofSizeBytes: sizeBytes,
+        ...(proofRelativePath ? {
+          proofStoragePath: proofRelativePath,
+          proofMimeType: mimeType,
+          proofSizeBytes: sizeBytes,
+        } : {}),
         status: UpiPaymentLinkStatus.CUSTOMER_CONFIRMED,
         confirmedAt: new Date(),
         confirmedByUserId: req.user?.userId || null,
