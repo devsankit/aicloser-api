@@ -490,13 +490,45 @@ conversationsRouter.get('/', validateQuery(listConversationsQuerySchema), async 
     const payload = (c.payload as Record<string, unknown>) || {};
     const rawMessages = Array.isArray(payload.messages) ? (payload.messages as Record<string, unknown>[]) : [];
     const readState = (payload.readStateByAudience as Record<string, string>) || {};
-    const lastReadAt = readState.sales ? new Date(readState.sales) : new Date(0);
+    const candidateReadDates: number[] = [0];
+    if (readState.sales) candidateReadDates.push(new Date(readState.sales).getTime());
+    if (readState.admin) candidateReadDates.push(new Date(readState.admin).getTime());
+    if (readState.closer) candidateReadDates.push(new Date(readState.closer).getTime());
+    if (readState.agent) candidateReadDates.push(new Date(readState.agent).getTime());
+    if (req.user?.userId && readState[req.user.userId]) {
+      candidateReadDates.push(new Date(readState[req.user.userId]).getTime());
+    }
+    for (const val of Object.values(readState)) {
+      if (typeof val === 'string') {
+        const t = new Date(val).getTime();
+        if (!isNaN(t)) candidateReadDates.push(t);
+      }
+    }
+    const maxReadTime = Math.max(...candidateReadDates);
+
+    let lastStaffMessageTime = 0;
+    for (const msg of rawMessages) {
+      const isOutbound =
+        msg.fromMe === true ||
+        msg.direction === 'OUTBOUND' ||
+        ['sales', 'admin', 'closer', 'agent'].includes(String(msg.senderRole || msg.role || ''));
+      if (isOutbound && msg.createdAt) {
+        const t = new Date(String(msg.createdAt)).getTime();
+        if (t > lastStaffMessageTime) lastStaffMessageTime = t;
+      }
+    }
+    const effectiveReadTime = Math.max(maxReadTime, lastStaffMessageTime);
 
     let unreadCount = 0;
     for (const msg of rawMessages) {
-      if (msg.senderRole === 'customer') {
-        const msgDate = msg.createdAt ? new Date(String(msg.createdAt)) : new Date();
-        if (msgDate > lastReadAt) unreadCount++;
+      const isCustomer =
+        msg.senderRole === 'customer' ||
+        msg.role === 'customer' ||
+        msg.lane === 'customer' ||
+        (!msg.fromMe && msg.direction !== 'OUTBOUND' && !['sales', 'admin', 'closer', 'agent', 'system'].includes(String(msg.senderRole || msg.role || '')));
+      if (isCustomer) {
+        const msgDate = msg.createdAt ? new Date(String(msg.createdAt)).getTime() : 0;
+        if (msgDate > effectiveReadTime) unreadCount++;
       }
     }
 
@@ -735,6 +767,24 @@ conversationsRouter.get('/:id/messages', async (req: Request, res: Response) => 
     };
   });
 
+  // Auto-mark conversation read on message thread fetch
+  const autoReadNowIso = new Date().toISOString();
+  const msgReadState = (payload.readStateByAudience as Record<string, string>) || {};
+  msgReadState.sales = autoReadNowIso;
+  msgReadState.admin = autoReadNowIso;
+  msgReadState.closer = autoReadNowIso;
+  msgReadState.agent = autoReadNowIso;
+  if (req.user?.userId) msgReadState[req.user.userId] = autoReadNowIso;
+  prisma.appConversation.update({
+    where: { id: conversation.id },
+    data: {
+      payload: {
+        ...payload,
+        readStateByAudience: msgReadState,
+      } as unknown as Prisma.InputJsonValue,
+    },
+  }).catch(() => undefined);
+
   res.json({
     success: true,
     data: {
@@ -907,6 +957,37 @@ conversationsRouter.post('/:id/messages', validateBody(sendMessageSchema), async
   });
 });
 
+// 3b. POST /read-all - Mark all conversations as read for workspace
+conversationsRouter.post('/read-all', async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const convs = await prisma.appConversation.findMany({
+    where: { tenantId },
+    select: { id: true, payload: true },
+  });
+
+  const nowIso = new Date().toISOString();
+  for (const c of convs) {
+    const payload = (c.payload as Record<string, unknown>) || {};
+    const readState = (payload.readStateByAudience as Record<string, string>) || {};
+    readState.sales = nowIso;
+    readState.admin = nowIso;
+    readState.closer = nowIso;
+    readState.agent = nowIso;
+    if (req.user?.userId) readState[req.user.userId] = nowIso;
+    await prisma.appConversation.update({
+      where: { id: c.id },
+      data: {
+        payload: {
+          ...payload,
+          readStateByAudience: readState,
+        } as unknown as Prisma.InputJsonValue,
+      },
+    });
+  }
+
+  res.json({ success: true, message: 'All conversations marked as read', error: null });
+});
+
 // 4. POST /:id/read - Mark conversation read
 conversationsRouter.post('/:id/read', async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
@@ -926,7 +1007,14 @@ conversationsRouter.post('/:id/read', async (req: Request, res: Response) => {
 
   const payload = (conversation.payload as Record<string, unknown>) || {};
   const readState = (payload.readStateByAudience as Record<string, string>) || {};
-  readState.sales = new Date().toISOString();
+  const nowIso = new Date().toISOString();
+  readState.sales = nowIso;
+  readState.admin = nowIso;
+  readState.closer = nowIso;
+  readState.agent = nowIso;
+  if (req.user?.userId) {
+    readState[req.user.userId] = nowIso;
+  }
 
   await prisma.appConversation.update({
     where: { id: conversation.id },
