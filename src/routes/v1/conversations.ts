@@ -1,4 +1,6 @@
 import { maskPhoneNumber, isPhoneMaskingRequired } from '../../lib/phone-mask.js';
+import { decryptWhatsAppToken } from '../../lib/crypto-vault.js';
+import { logger } from '../../lib/logger.js';
 import { Router, Request, Response } from 'express';
 import multer from 'multer';
 import fs from 'fs';
@@ -33,6 +35,7 @@ export interface CleanChatMessage {
   senderUserId?: string | null;
   aiAgentId?: string | null;
   status?: 'sent' | 'delivered' | 'read' | 'failed';
+  externalMessageId?: string | null;
   attachments?: Array<{
     id?: string;
     name: string;
@@ -641,9 +644,45 @@ conversationsRouter.post('/:id/messages', validateBody(sendMessageSchema), async
   const id = String(req.params.id);
   const body = req.body as z.infer<typeof sendMessageSchema>;
 
-  const conversation = await prisma.appConversation.findFirst({
+  let conversation = await prisma.appConversation.findFirst({
     where: { id, tenantId },
   });
+
+  // If conversation not found directly, check if the ID is a lead ID
+  if (!conversation && id.startsWith('lead-')) {
+    const lead = await prisma.salesLeadAssignment.findFirst({
+      where: { id, tenantId },
+    });
+    if (lead && lead.customerPhone) {
+      conversation = await prisma.appConversation.findFirst({
+        where: { tenantId, customerPhone: lead.customerPhone },
+      });
+      if (!conversation) {
+        conversation = await prisma.appConversation.create({
+          data: {
+            id: `conv-${randomUUID().slice(0, 8)}`,
+            tenantId,
+            serviceId: 'svc-whatsapp',
+            serviceSlug: 'whatsapp',
+            leadStatusId: 'new',
+            customerName: lead.customerName || 'WhatsApp Contact',
+            customerPhone: lead.customerPhone,
+            status: 'Active',
+            payload: {
+              messages: [],
+              sourceChannel: 'whatsapp',
+              customerName: lead.customerName || 'WhatsApp Contact',
+              customerPhone: lead.customerPhone,
+            },
+          },
+        });
+      }
+      await prisma.salesLeadAssignment.update({
+        where: { id: lead.id },
+        data: { conversationId: conversation.id },
+      }).catch(() => undefined);
+    }
+  }
 
   if (!conversation) {
     res.status(404).json({ success: false, data: null, error: 'NotFound', message: 'Conversation not found' });
@@ -688,6 +727,70 @@ conversationsRouter.post('/:id/messages', validateBody(sendMessageSchema), async
     (payload.aiSettings as any).lastHumanMessageAt = new Date().toISOString();
   }
 
+  // Outbound dispatch to Meta WhatsApp Cloud API if lane is customer and customer has a phone
+  let outboundDispatchError: string | null = null;
+  if (body.lane !== 'internal' && conversation.customerPhone) {
+    const cleanPhone = conversation.customerPhone.replace(/\D/g, '');
+    if (cleanPhone.length >= 8) {
+      try {
+        const channel = await prisma.whatsAppChannel.findFirst({
+          where: { tenantId, status: 'ACTIVE' },
+          orderBy: { isDefault: 'desc' },
+        });
+
+        if (channel && channel.phoneNumberId) {
+          const decryptedToken = decryptWhatsAppToken(channel.encryptedAccessToken);
+          if (decryptedToken) {
+            const apiVer = channel.graphApiVersion || 'v22.0';
+            const metaUrl = `https://graph.facebook.com/${apiVer}/${channel.phoneNumberId}/messages`;
+            const metaRes = await fetch(metaUrl, {
+              method: 'POST',
+              headers: {
+                'Authorization': `Bearer ${decryptedToken}`,
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify({
+                messaging_product: 'whatsapp',
+                recipient_type: 'individual',
+                to: cleanPhone,
+                type: 'text',
+                text: { preview_url: false, body: body.body },
+              }),
+            });
+
+            const metaData = (await metaRes.json().catch(() => null)) as any;
+            if (metaRes.ok && metaData?.messages?.[0]?.id) {
+              const realWamid = metaData.messages[0].id;
+              newMessage.externalMessageId = realWamid;
+              newMessage.status = 'sent';
+              logger.info('WhatsApp outbound message dispatched successfully', {
+                conversationId: conversation.id,
+                recipientPhone: cleanPhone,
+                wamid: realWamid,
+              });
+            } else {
+              const metaErrMsg = metaData?.error?.message || (metaData ? JSON.stringify(metaData) : 'Meta API error');
+              outboundDispatchError = metaErrMsg;
+              logger.error('Meta WhatsApp outbound dispatch failed', {
+                conversationId: conversation.id,
+                recipientPhone: cleanPhone,
+                metaError: metaErrMsg,
+              });
+            }
+          } else {
+            logger.warn('WhatsApp channel access token could not be decrypted', { tenantId, channelId: channel.id });
+          }
+        }
+      } catch (waErr: any) {
+        logger.error('Error during WhatsApp outbound dispatch', {
+          conversationId: conversation.id,
+          error: waErr?.message || String(waErr),
+        });
+        outboundDispatchError = waErr?.message || 'Failed to dispatch WhatsApp message';
+      }
+    }
+  }
+
   rawMessages.push(newMessage as unknown as Record<string, unknown>);
 
   const readState = (payload.readStateByAudience as Record<string, string>) || {};
@@ -717,7 +820,12 @@ conversationsRouter.post('/:id/messages', validateBody(sendMessageSchema), async
     actorUserId: req.user?.userId,
   }).catch(() => undefined);
 
-  res.status(201).json({ success: true, data: newMessage, error: null });
+  res.status(201).json({
+    success: true,
+    data: newMessage,
+    outboundError: outboundDispatchError,
+    error: null,
+  });
 });
 
 // 4. POST /:id/read - Mark conversation read

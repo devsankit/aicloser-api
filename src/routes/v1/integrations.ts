@@ -2,6 +2,7 @@ import { Router, Request, Response } from 'express';
 import { Readable } from 'node:stream';
 import { z } from 'zod';
 import { prisma } from '../../lib/prisma.js';
+import { decryptWhatsAppToken } from '../../lib/crypto-vault.js';
 import { authenticate } from '../../middlewares/auth.js';
 import { enforceTenantIsolation } from '../../middlewares/tenant-isolation.js';
 import { requireRoles } from '../../middlewares/rbac.js';
@@ -322,7 +323,8 @@ integrationsRouter.post('/whatsapp/channels/:id/register-phone', requireRoles('A
     return;
   }
 
-  if (!channel.encryptedAccessToken || !channel.phoneNumberId) {
+  const token = decryptWhatsAppToken(channel.encryptedAccessToken);
+  if (!token || !channel.phoneNumberId) {
     res.status(400).json({
       success: false,
       error: 'ChannelNotConfigured',
@@ -335,7 +337,7 @@ integrationsRouter.post('/whatsapp/channels/:id/register-phone', requireRoles('A
     const response = await fetch(`https://graph.facebook.com/v21.0/${channel.phoneNumberId}/register`, {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${channel.encryptedAccessToken}`,
+        'Authorization': `Bearer ${token}`,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({ messaging_product: 'whatsapp', pin }),
@@ -492,7 +494,8 @@ integrationsRouter.post('/whatsapp/messages', validateBody(sendWhatsAppMessageSc
         orderBy: { isDefault: 'desc' },
       });
 
-  if (!channel || !channel.encryptedAccessToken || !channel.phoneNumberId) {
+  const decryptedToken = decryptWhatsAppToken(channel?.encryptedAccessToken);
+  if (!channel || !decryptedToken || !channel.phoneNumberId) {
     res.status(400).json({
       success: false,
       error: 'WhatsAppNotConfigured',
@@ -502,11 +505,12 @@ integrationsRouter.post('/whatsapp/messages', validateBody(sendWhatsAppMessageSc
   }
 
   try {
-    const metaUrl = `https://graph.facebook.com/v21.0/${channel.phoneNumberId}/messages`;
+    const metaApiVersion = channel.graphApiVersion || 'v22.0';
+    const metaUrl = `https://graph.facebook.com/${metaApiVersion}/${channel.phoneNumberId}/messages`;
     const response = await fetch(metaUrl, {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${channel.encryptedAccessToken}`,
+        'Authorization': `Bearer ${decryptedToken}`,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
@@ -572,7 +576,7 @@ integrationsRouter.get('/whatsapp/media/:mediaId', async (req: Request, res: Res
     orderBy: [{ isDefault: 'desc' }, { updatedAt: 'desc' }],
   });
 
-  const accessToken = channel?.encryptedAccessToken?.trim();
+  const accessToken = decryptWhatsAppToken(channel?.encryptedAccessToken);
   if (!accessToken) {
     res.status(503).json({
       success: false,

@@ -2,6 +2,7 @@ import { Router, Request, Response } from 'express';
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { prisma } from '../../lib/prisma.js';
+import { decryptWhatsAppToken } from '../../lib/crypto-vault.js';
 import { authenticate } from '../../middlewares/auth.js';
 import { enforceTenantIsolation } from '../../middlewares/tenant-isolation.js';
 import { requireRoles, requirePermissions, PERM_CONTACTS_VIEW } from '../../middlewares/rbac.js';
@@ -29,12 +30,13 @@ async function sendApprovedTemplateMessage(input: {
   recipientPhone: string;
   variableValues?: Record<string, unknown>;
 }) {
+  const token = decryptWhatsAppToken(input.channel.encryptedAccessToken);
   const response = await fetch(
     `https://graph.facebook.com/${input.channel.graphApiVersion || 'v22.0'}/${input.channel.phoneNumberId}/messages`,
     {
       method: 'POST',
       headers: {
-        Authorization: `Bearer ${input.channel.encryptedAccessToken}`,
+        Authorization: `Bearer ${token}`,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({

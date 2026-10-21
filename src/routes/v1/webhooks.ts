@@ -1,5 +1,6 @@
 import { assignLeadToNextCloser } from '../../lib/lead-assignment-engine.js';
 import { generateAiCloserReply } from '../../lib/ai-provider-engine.js';
+import { decryptWhatsAppToken } from '../../lib/crypto-vault.js';
 import { Router, Request, Response } from 'express';
 import { verifyWebhookSignature } from '../../middlewares/webhook-signature.js';
 import { logger } from '../../lib/logger.js';
@@ -251,32 +252,52 @@ webhooksRouter.post(['/meta', '/whatsapp', '/whatsapp-marketing'], verifyWebhook
               // Dispatch to Meta Graph API if access token exists
               const channelRecord = await prisma.whatsAppChannel.findFirst({
                 where: { phoneNumberId: channelId },
-                select: { encryptedAccessToken: true, phoneNumberId: true },
+                select: { encryptedAccessToken: true, phoneNumberId: true, graphApiVersion: true },
               });
 
-              const token = channelRecord?.encryptedAccessToken || process.env.META_ACCESS_TOKEN;
+              const rawToken = channelRecord?.encryptedAccessToken || process.env.META_ACCESS_TOKEN;
+              const token = decryptWhatsAppToken(rawToken);
+              let aiExternalMessageId: string | null = null;
+
               if (token && channelRecord) {
-                await fetch(`https://graph.facebook.com/v22.0/${channelRecord.phoneNumberId}/messages`, {
-                  method: 'POST',
-                  headers: {
-                    'Content-Type': 'application/json',
-                    Authorization: `Bearer ${token}`,
-                  },
-                  body: JSON.stringify({
-                    messaging_product: 'whatsapp',
-                    recipient_type: 'individual',
-                    to: normalizedPhone.replace(/\D/g, ''),
-                    type: 'text',
-                    text: { preview_url: false, body: aiResult.reply },
-                  }),
-                }).catch((err) => {
-                  logger.warn('Meta Graph API outbound dispatch failed', { error: String(err) });
-                });
+                const apiVer = channelRecord.graphApiVersion || 'v22.0';
+                try {
+                  const metaRes = await fetch(`https://graph.facebook.com/${apiVer}/${channelRecord.phoneNumberId}/messages`, {
+                    method: 'POST',
+                    headers: {
+                      'Content-Type': 'application/json',
+                      Authorization: `Bearer ${token}`,
+                    },
+                    body: JSON.stringify({
+                      messaging_product: 'whatsapp',
+                      recipient_type: 'individual',
+                      to: normalizedPhone.replace(/\D/g, ''),
+                      type: 'text',
+                      text: { preview_url: false, body: aiResult.reply },
+                    }),
+                  });
+                  const metaData = (await metaRes.json().catch(() => null)) as any;
+                  if (metaRes.ok && metaData?.messages?.[0]?.id) {
+                    aiExternalMessageId = metaData.messages[0].id;
+                    logger.info('Meta Graph API outbound AI reply dispatched', {
+                      wamid: aiExternalMessageId,
+                      recipientPhone: normalizedPhone,
+                    });
+                  } else {
+                    logger.warn('Meta Graph API outbound AI reply failed', {
+                      status: metaRes.status,
+                      error: metaData?.error || metaData,
+                    });
+                  }
+                } catch (err) {
+                  logger.warn('Meta Graph API outbound dispatch caught error', { error: String(err) });
+                }
               }
 
               // Record outbound message in conversation payload
               const outboundMessage = {
                 id: `ai-msg-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+                externalMessageId: aiExternalMessageId,
                 role: 'assistant',
                 senderRole: 'ai',
                 senderLabel: 'AI Closer Bot',
