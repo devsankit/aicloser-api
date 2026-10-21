@@ -571,26 +571,29 @@ async function executeCampaignDispatch(campaignId: string, tenantId: string, for
 
   // If campaign had no queued recipients, advance baseline counts
   if (campaign.recipients.length === 0) {
-    sentCount = campaign.sentCount || campaign.totalRecipients || 1;
+    sentCount = campaign.sentCount || campaign.totalRecipients || 0;
   }
 
   const finalSent = (campaign.sentCount || 0) + (campaign.recipients.length > 0 ? sentCount : 0) || sentCount;
-  const finalDelivered = (campaign.deliveredCount || 0) + Math.floor(sentCount * 0.95);
-  const finalRead = (campaign.readCount || 0) + Math.floor(sentCount * 0.75);
-  const finalReplied = (campaign.repliedCount || 0) + Math.floor(sentCount * 0.12);
+  const finalDelivered = campaign.deliveredCount || 0; // Pure live metric - 0 until Meta delivery callbacks arrive
+  const finalRead = campaign.readCount || 0; // Pure live metric - 0 until Meta read callbacks arrive
+  const finalReplied = campaign.repliedCount || 0;
   const finalFailed = (campaign.failedCount || 0) + failedCount;
+
+  const finalStatus: 'RUNNING' | 'COMPLETED' | 'FAILED' =
+    finalSent === 0 && finalFailed > 0 ? 'FAILED' : 'RUNNING';
 
   const updated = await prisma.whatsAppCampaign.update({
     where: { id: campaign.id },
     data: {
-      status: 'COMPLETED',
+      status: finalStatus,
       dispatchedAt: now,
-      completedAt: new Date(),
       sentCount: finalSent,
       deliveredCount: finalDelivered,
       readCount: finalRead,
       repliedCount: finalReplied,
       failedCount: finalFailed,
+      ...(finalStatus === 'FAILED' ? { completedAt: new Date() } : {}),
     },
   });
 
@@ -822,6 +825,32 @@ marketingRouter.get('/campaigns/:id/analytics', async (req: Request, res: Respon
       },
       channel: campaign.channel,
       template: campaign.template,
+      recipients: (
+        await prisma.whatsAppCampaignRecipient.findMany({
+          where: { campaignId: campaign.id },
+          include: {
+            contact: { select: { fullName: true, email: true } },
+            messages: {
+              select: { wamid: true, status: true, errorMessage: true, sentAt: true, deliveredAt: true, readAt: true, failedAt: true },
+              take: 1,
+              orderBy: { createdAt: 'desc' },
+            },
+          },
+          orderBy: { createdAt: 'desc' },
+        })
+      ).map((r) => ({
+        id: r.id,
+        phone: r.e164Phone,
+        status: r.status,
+        name: r.contact?.fullName || r.e164Phone,
+        email: r.contact?.email || null,
+        sentAt: r.sentAt || r.messages?.[0]?.sentAt || null,
+        deliveredAt: r.deliveredAt || r.messages?.[0]?.deliveredAt || null,
+        readAt: r.readAt || r.messages?.[0]?.readAt || null,
+        failedAt: r.failedAt || r.messages?.[0]?.failedAt || null,
+        errorMessage: r.errorMessage || r.messages?.[0]?.errorMessage || null,
+        wamid: r.messages?.[0]?.wamid || null,
+      })),
     },
     error: null,
   });
@@ -1029,26 +1058,29 @@ marketingRouter.post('/campaigns/:id/dispatch', requireRoles('ADMIN', 'SUPER_ADM
 
   // If campaign had no queued recipients, advance baseline counts
   if (campaign.recipients.length === 0) {
-    sentCount = campaign.sentCount || campaign.totalRecipients || 1;
+    sentCount = campaign.sentCount || campaign.totalRecipients || 0;
   }
 
   const finalSent = (campaign.sentCount || 0) + (campaign.recipients.length > 0 ? sentCount : 0) || sentCount;
-  const finalDelivered = (campaign.deliveredCount || 0) + Math.floor(sentCount * 0.95);
-  const finalRead = (campaign.readCount || 0) + Math.floor(sentCount * 0.75);
-  const finalReplied = (campaign.repliedCount || 0) + Math.floor(sentCount * 0.12);
+  const finalDelivered = campaign.deliveredCount || 0; // Pure live metric - 0 until Meta delivery callbacks arrive
+  const finalRead = campaign.readCount || 0; // Pure live metric - 0 until Meta read callbacks arrive
+  const finalReplied = campaign.repliedCount || 0;
   const finalFailed = (campaign.failedCount || 0) + failedCount;
+
+  const finalStatus: 'RUNNING' | 'COMPLETED' | 'FAILED' =
+    finalSent === 0 && finalFailed > 0 ? 'FAILED' : 'RUNNING';
 
   const updated = await prisma.whatsAppCampaign.update({
     where: { id: campaign.id },
     data: {
-      status: 'COMPLETED',
+      status: finalStatus,
       dispatchedAt: now,
-      completedAt: new Date(),
       sentCount: finalSent,
       deliveredCount: finalDelivered,
       readCount: finalRead,
       repliedCount: finalReplied,
       failedCount: finalFailed,
+      ...(finalStatus === 'FAILED' ? { completedAt: new Date() } : {}),
     },
   });
 

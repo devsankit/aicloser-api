@@ -228,6 +228,26 @@ webhooksRouter.post(['/meta', '/whatsapp', '/whatsapp-marketing'], verifyWebhook
           },
         }).catch(() => undefined);
 
+        // Track reply in WhatsApp marketing campaign if customer is a campaign recipient
+        try {
+          const campRecip = await prisma.whatsAppCampaignRecipient.findFirst({
+            where: {
+              e164Phone: normalizedPhone,
+              campaign: { tenantId },
+            },
+            orderBy: { createdAt: 'desc' },
+          });
+
+          if (campRecip) {
+            await prisma.whatsAppCampaign.update({
+              where: { id: campRecip.campaignId },
+              data: {
+                repliedCount: { increment: 1 },
+              },
+            }).catch(() => undefined);
+          }
+        } catch {}
+
         // ==========================================
         // Runtime AI Auto-Reply Execution
         // ==========================================
@@ -378,13 +398,20 @@ webhooksRouter.post(['/meta', '/whatsapp', '/whatsapp-marketing'], verifyWebhook
       for (const st of value.statuses) {
         const wamid = st.id;
         const statusStr = (st.status || 'SENT').toUpperCase();
+        const occurredAt = new Date(Number(st.timestamp || Date.now() / 1000) * 1000);
+
+        let errorMessage: string | null = null;
+        if (Array.isArray(st.errors) && st.errors.length > 0) {
+          const err = st.errors[0];
+          errorMessage = err.error_data?.details || err.message || err.title || ("Meta error code " + err.code);
+        }
 
         await prisma.whatsAppMessageEvent.create({
           data: {
             tenantId,
             wamid,
             eventType: statusStr,
-            occurredAt: new Date(Number(st.timestamp || Date.now() / 1000) * 1000),
+            occurredAt,
             rawPayload: st,
           },
         }).catch(() => undefined);
@@ -398,6 +425,118 @@ webhooksRouter.post(['/meta', '/whatsapp', '/whatsapp-marketing'], verifyWebhook
             timestamp: new Date().toISOString(),
           },
         }).catch(() => undefined);
+
+        // Reconcile with WhatsApp Campaign Message and Recipient
+        try {
+          const campMsg = await prisma.whatsAppCampaignMessage.findFirst({
+            where: { wamid },
+            include: { campaign: true, recipient: true },
+          });
+
+          if (campMsg) {
+            const dataMsg: Record<string, any> = { rawPayload: st };
+            const dataRecip: Record<string, any> = {};
+
+            if (statusStr === 'DELIVERED') {
+              dataMsg.status = 'DELIVERED';
+              dataMsg.deliveredAt = occurredAt;
+              dataRecip.status = 'DELIVERED';
+              dataRecip.deliveredAt = occurredAt;
+            } else if (statusStr === 'READ') {
+              dataMsg.status = 'READ';
+              dataMsg.readAt = occurredAt;
+              if (!campMsg.deliveredAt) dataMsg.deliveredAt = occurredAt;
+              dataRecip.status = 'READ';
+              dataRecip.readAt = occurredAt;
+              if (!campMsg.recipient?.deliveredAt) dataRecip.deliveredAt = occurredAt;
+            } else if (statusStr === 'FAILED') {
+              dataMsg.status = 'FAILED';
+              dataMsg.failedAt = occurredAt;
+              dataMsg.errorMessage = errorMessage || 'Meta delivery failed';
+              dataRecip.status = 'FAILED';
+              dataRecip.failedAt = occurredAt;
+              dataRecip.errorMessage = errorMessage || 'Meta delivery failed';
+            } else if (statusStr === 'SENT') {
+              dataMsg.status = 'SENT';
+              if (!campMsg.sentAt) dataMsg.sentAt = occurredAt;
+              dataRecip.status = 'SENT';
+              if (!campMsg.recipient?.sentAt) dataRecip.sentAt = occurredAt;
+            }
+
+            await prisma.$transaction([
+              prisma.whatsAppCampaignMessage.update({
+                where: { id: campMsg.id },
+                data: dataMsg,
+              }),
+              prisma.whatsAppCampaignRecipient.update({
+                where: { id: campMsg.recipientId },
+                data: dataRecip,
+              }),
+            ]);
+
+            // Re-aggregate campaign recipient statuses for 100% exact live numbers
+            const groupCounts = await prisma.whatsAppCampaignRecipient.groupBy({
+              by: ['status'],
+              where: { campaignId: campMsg.campaignId },
+              _count: { _all: true },
+            });
+
+            const statusMap: Record<string, number> = {};
+            for (const item of groupCounts) {
+              statusMap[item.status] = item._count._all;
+            }
+
+            const deliveredTotal = (statusMap['DELIVERED'] || 0) + (statusMap['READ'] || 0); // Read implies delivered
+            const readTotal = statusMap['READ'] || 0;
+            const failedTotal = statusMap['FAILED'] || 0;
+            const queuedTotal = statusMap['QUEUED'] || 0;
+            const sentInFlight = statusMap['SENT'] || 0;
+            const sentTotal = sentInFlight + deliveredTotal + failedTotal;
+
+            let campaignStatus = campMsg.campaign.status;
+            if (queuedTotal === 0 && sentInFlight === 0) {
+              if (deliveredTotal === 0 && failedTotal > 0) {
+                campaignStatus = 'FAILED';
+              } else {
+                campaignStatus = 'COMPLETED';
+              }
+            } else if (campaignStatus === 'SENDING' && queuedTotal === 0) {
+              campaignStatus = 'RUNNING';
+            }
+
+            await prisma.whatsAppCampaign.update({
+              where: { id: campMsg.campaignId },
+              data: {
+                status: campaignStatus,
+                sentCount: sentTotal,
+                deliveredCount: deliveredTotal,
+                readCount: readTotal,
+                failedCount: failedTotal,
+                ...(campaignStatus === 'COMPLETED' || campaignStatus === 'FAILED' ? { completedAt: new Date() } : {}),
+              },
+            });
+
+            await persistApiRealtimeEvent({
+              tenantId,
+              eventType: 'marketing.campaign_status_updated',
+              payload: {
+                campaignId: campMsg.campaignId,
+                wamid,
+                status: statusStr,
+                recipientPhone: campMsg.recipient?.e164Phone,
+                errorMessage,
+                counts: {
+                  sent: sentTotal,
+                  delivered: deliveredTotal,
+                  read: readTotal,
+                  failed: failedTotal,
+                },
+              },
+            }).catch(() => undefined);
+          }
+        } catch (campErr) {
+          logger.warn('Failed to reconcile campaign status from Meta webhook', { error: String(campErr), wamid });
+        }
       }
     }
   } catch (err: unknown) {
