@@ -419,6 +419,8 @@ conversationsRouter.get('/', validateQuery(listConversationsQuerySchema), async 
       ),
       sharesCount: Array.isArray(payload.shares) ? (payload.shares as any[]).filter((s: any) => !s.revokedAt).length : 0,
       unreadCount,
+      aiAutoReplyDisabled: Boolean(payload.aiAutoReplyDisabled),
+      payload,
       lastMessage: lastMsg
         ? {
             id: String(lastMsg.id || ''),
@@ -627,6 +629,7 @@ conversationsRouter.get('/:id/messages', async (req: Request, res: Response) => 
       customerPhone: conversation.customerPhone,
       status: conversation.status,
       channel: conversation.serviceSlug ? conversation.serviceSlug.toUpperCase() : 'WHATSAPP',
+      aiAutoReplyDisabled: Boolean((conversation.payload as any)?.aiAutoReplyDisabled),
       messages,
       pagination: {
         hasMore: startIndex > 0,
@@ -2167,9 +2170,24 @@ conversationsRouter.post('/:id/ai-auto-reply', async (req: Request, res: Respons
   const id = String(req.params.id);
   const disabled = Boolean(req.body?.disabled);
 
-  const conversation = await prisma.appConversation.findFirst({
+  let conversation = await prisma.appConversation.findFirst({
     where: { id, tenantId },
   });
+
+  if (!conversation) {
+    const cleanId = id.replace(/^conv-lead-|^lead-/, '');
+    const lead = await prisma.salesLeadAssignment.findFirst({
+      where: {
+        tenantId,
+        OR: [{ id: cleanId }, { conversationId: cleanId }],
+      },
+    });
+    if (lead?.conversationId) {
+      conversation = await prisma.appConversation.findFirst({
+        where: { id: lead.conversationId, tenantId },
+      });
+    }
+  }
 
   if (!conversation) {
     res.status(404).json({ success: false, error: 'NotFound', message: 'Conversation not found' });
