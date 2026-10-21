@@ -12,7 +12,7 @@ export function verifyWebhookSignature(req: Request, res: Response, next: NextFu
     return;
   }
 
-  const secrets = [env.META_APP_SECRET, env.WEBHOOK_APP_SECRET, 'b21af41afc075d5ee39e7785765bcb27'].filter(Boolean);
+  const secrets = [env.META_APP_SECRET, env.WEBHOOK_APP_SECRET].filter(Boolean);
   const rawBody = (req as unknown as { rawBody?: Buffer }).rawBody || Buffer.from(JSON.stringify(req.body));
   const sigBuffer = Buffer.from(signature);
 

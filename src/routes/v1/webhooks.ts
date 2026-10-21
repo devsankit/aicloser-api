@@ -23,9 +23,6 @@ webhooksRouter.get(['/meta', '/whatsapp', '/whatsapp-marketing'], async (req: Re
   const allowedTokens = [
     env.META_VERIFY_TOKEN,
     process.env.META_VERIFY_TOKEN,
-    'aicloser_webhook_secret_2026',
-    'gigxomi_whatsapp_marketing_token',
-    'b21af41afc075d5ee39e7785765bcb27',
   ].filter(Boolean);
 
   let verified = mode === 'subscribe' && typeof token === 'string' && allowedTokens.includes(token);

@@ -2,7 +2,7 @@ import { Router, Request, Response } from 'express';
 import { Readable } from 'node:stream';
 import { z } from 'zod';
 import { prisma } from '../../lib/prisma.js';
-import { decryptWhatsAppToken } from '../../lib/crypto-vault.js';
+import { decryptWhatsAppToken, encryptSecret } from '../../lib/crypto-vault.js';
 import { authenticate } from '../../middlewares/auth.js';
 import { enforceTenantIsolation } from '../../middlewares/tenant-isolation.js';
 import { requireRoles } from '../../middlewares/rbac.js';
@@ -95,12 +95,20 @@ integrationsRouter.post(
     const { wabaId, phoneNumberId, displayPhoneNumber, verifiedName, accessToken, isDefault } = req.body;
 
     try {
+      const existing = await prisma.whatsAppChannel.findUnique({ where: { phoneNumberId } });
+      if (existing && existing.tenantId !== tenantId) {
+        res.status(409).json({ success: false, error: 'ChannelConflict', message: 'This WhatsApp Phone Number is already linked to another workspace' });
+        return;
+      }
+
       if (isDefault) {
         await prisma.whatsAppChannel.updateMany({
           where: { tenantId },
           data: { isDefault: false },
         });
       }
+
+      const encryptedToken = accessToken ? encryptSecret(accessToken) : (existing?.encryptedAccessToken || '');
 
       const channel = await prisma.whatsAppChannel.upsert({
         where: { phoneNumberId },
@@ -110,7 +118,7 @@ integrationsRouter.post(
           phoneNumberId,
           displayPhoneNumber,
           verifiedName: verifiedName || 'AI Closer Channel',
-          encryptedAccessToken: accessToken || '',
+          encryptedAccessToken: encryptedToken,
           status: 'ACTIVE',
           isDefault: Boolean(isDefault),
           lastSyncedAt: new Date(),
@@ -120,17 +128,19 @@ integrationsRouter.post(
           wabaId,
           displayPhoneNumber,
           verifiedName: verifiedName || undefined,
-          encryptedAccessToken: accessToken || undefined,
+          encryptedAccessToken: accessToken ? encryptedToken : undefined,
           status: 'ACTIVE',
           isDefault: Boolean(isDefault),
           lastSyncedAt: new Date(),
         },
       });
 
+      const { encryptedAccessToken: _, ...safeChannel } = channel;
+
       res.status(201).json({
         success: true,
         message: 'WhatsApp Business channel linked successfully',
-        data: channel,
+        data: safeChannel,
         error: null,
       });
     } catch (err: unknown) {

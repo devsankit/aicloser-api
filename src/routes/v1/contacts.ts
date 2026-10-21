@@ -276,15 +276,15 @@ contactsRouter.get('/duplicates', requirePermissions(PERM_CONTACTS_VIEW), async 
   const tenantId = req.tenantId!;
 
   // Group by phone
-  const phoneDups = await prisma.$queryRawUnsafe<Array<{ e164Phone: string; count: number }>>(`
+  const phoneDups = await prisma.$queryRaw<Array<{ e164Phone: string; count: number }>>`
     SELECT "e164Phone", COUNT(*)::int as count
     FROM "MarketingContact"
-    WHERE "tenantId" = $1 AND "e164Phone" IS NOT NULL AND "e164Phone" != ''
+    WHERE "tenantId" = ${tenantId} AND "e164Phone" IS NOT NULL AND "e164Phone" != ''
     GROUP BY "e164Phone"
     HAVING COUNT(*) > 1
     ORDER BY count DESC
     LIMIT 50
-  `, tenantId);
+  `;
 
   const duplicateGroups = await Promise.all(
     phoneDups.map(async (d) => {

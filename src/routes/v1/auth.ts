@@ -5,6 +5,7 @@ import { z } from 'zod';
 import { prisma } from '../../lib/prisma.js';
 import { env } from '../../config/env.js';
 import { authenticate } from '../../middlewares/auth.js';
+import { requireRoles } from '../../middlewares/rbac.js';
 import { validateBody } from '../../middlewares/validate.js';
 import { AuthenticatedUser } from '../../types/auth.js';
 import { acquireClientSession, ClientSlotOccupiedError, closeClientSession, touchClientSession } from '../../lib/client-sessions.js';
@@ -448,5 +449,5 @@ const issueDevTokenHandler = async (req: Request, res: Response, isCreate: boole
   });
 };
 
-authRouter.get('/developer-token', authenticate, (req: Request, res: Response) => issueDevTokenHandler(req, res, false));
-authRouter.post('/developer-token', authenticate, (req: Request, res: Response) => issueDevTokenHandler(req, res, true));
+authRouter.get('/developer-token', authenticate, requireRoles('ADMIN', 'SUPER_ADMIN'), (req: Request, res: Response) => issueDevTokenHandler(req, res, false));
+authRouter.post('/developer-token', authenticate, requireRoles('ADMIN', 'SUPER_ADMIN'), (req: Request, res: Response) => issueDevTokenHandler(req, res, true));

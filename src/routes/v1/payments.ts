@@ -1,4 +1,5 @@
 import { persistApiRealtimeEvent } from '../../lib/realtime.js';
+import { maskPhoneNumber } from '../../lib/phone-mask.js';
 import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import { randomUUID } from 'crypto';
@@ -44,13 +45,8 @@ function resolveProofFilePath(relativePath: string): string | null {
 paymentsRouter.get('/public/:tokenOrId', async (req: Request, res: Response) => {
   const tokenOrId = String(req.params.tokenOrId).trim();
 
-  const payment = await prisma.upiPaymentLink.findFirst({
-    where: {
-      OR: [
-        { publicToken: tokenOrId },
-        { id: tokenOrId },
-      ],
-    },
+  const payment = await prisma.upiPaymentLink.findUnique({
+    where: { publicToken: tokenOrId },
     include: {
       createdBy: {
         select: { displayName: true, email: true },
@@ -81,8 +77,8 @@ paymentsRouter.get('/public/:tokenOrId', async (req: Request, res: Response) => 
     totalAmount: amount,
     currency: payment.currency || 'INR',
     customerName: payment.customerName,
-    customerPhone: payment.customerPhone,
-    customerEmail: payment.customerEmail,
+    customerPhone: payment.customerPhone ? maskPhoneNumber(payment.customerPhone, true) : '',
+    customerEmail: payment.customerEmail ? `${payment.customerEmail.slice(0, 3)}***@***` : '',
     productName: payment.productName,
     description: payment.productName,
     customerNote: payment.customerNote,
@@ -95,8 +91,7 @@ paymentsRouter.get('/public/:tokenOrId', async (req: Request, res: Response) => 
     utrReference: payment.utrReference,
     paidAt: payment.paidAt,
     createdAt: payment.createdAt,
-    tenantId: payment.tenantId,
-    creatorName: payment.createdBy?.displayName || 'Sales Agent',
+    creatorName: payment.createdBy?.displayName || 'Sales Specialist',
   };
 
   res.json({
@@ -110,13 +105,8 @@ paymentsRouter.get('/public/:tokenOrId', async (req: Request, res: Response) => 
 paymentsRouter.post('/public/:tokenOrId/confirm', upload.any(), async (req: Request, res: Response) => {
   try {
     const tokenOrId = String(req.params.tokenOrId).trim();
-    const payment = await prisma.upiPaymentLink.findFirst({
-      where: {
-        OR: [
-          { publicToken: tokenOrId },
-          { id: tokenOrId },
-        ],
-      },
+    const payment = await prisma.upiPaymentLink.findUnique({
+      where: { publicToken: tokenOrId },
     });
 
     if (!payment) {
