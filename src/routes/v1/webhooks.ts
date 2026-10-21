@@ -242,17 +242,24 @@ webhooksRouter.post(['/meta', '/whatsapp', '/whatsapp-marketing'], verifyWebhook
 
           if (botConfig.enabled) {
             const currentPayload = (conversation.payload as Record<string, any>) || {};
-            const recentMsgs = Array.isArray(currentPayload.messages) ? currentPayload.messages.slice(-8) : [];
 
-            const aiResult = await generateAiCloserReply({
-              tenantId,
-              customerPhone: normalizedPhone,
-              customerName: profileName,
-              messageText,
-              recentMessages: recentMsgs,
-            });
+            if (currentPayload.aiAutoReplyDisabled === true) {
+              logger.info('AI auto-reply skipped: thread has aiAutoReplyDisabled=true (human takeover)', {
+                conversationId: conversation.id,
+                customerPhone: normalizedPhone,
+              });
+            } else {
+              const recentMsgs = Array.isArray(currentPayload.messages) ? currentPayload.messages.slice(-8) : [];
 
-            if (aiResult?.reply) {
+              const aiResult = await generateAiCloserReply({
+                tenantId,
+                customerPhone: normalizedPhone,
+                customerName: profileName,
+                messageText,
+                recentMessages: recentMsgs,
+              });
+
+              if (aiResult?.reply) {
               // Dispatch to Meta Graph API if access token exists
               const channelRecord = await prisma.whatsAppChannel.findFirst({
                 where: { phoneNumberId: channelId },
@@ -357,6 +364,7 @@ webhooksRouter.post(['/meta', '/whatsapp', '/whatsapp-marketing'], verifyWebhook
                   }).catch(() => undefined);
                 }
               }
+            }
             }
           }
         } catch (aiErr) {
