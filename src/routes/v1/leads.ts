@@ -137,6 +137,10 @@ const createLeadSchema = z.object({
   notes: z.string().optional(),
   stage: salesLeadStageSchema.default('NEW'),
   budgetAmount: z.number().optional(),
+  source: z.string().optional(),
+  followUpAt: z.string().datetime().nullable().optional(),
+  tags: z.array(z.string()).optional(),
+  customFields: z.record(z.unknown()).optional(),
 });
 
 leadsRouter.post('/', validateBody(createLeadSchema), async (req: Request, res: Response) => {
@@ -263,6 +267,10 @@ leadsRouter.post('/', validateBody(createLeadSchema), async (req: Request, res: 
         notes: body.notes,
         stage: body.stage,
         budgetAmount: body.budgetAmount,
+        source: body.source || 'manual',
+        followUpAt: body.followUpAt ? new Date(body.followUpAt) : null,
+        tags: body.tags || [],
+        customFields: body.customFields || {},
       },
     });
   } catch (err: any) {
