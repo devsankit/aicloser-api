@@ -241,11 +241,15 @@ webhooksRouter.post(['/meta', '/whatsapp', '/whatsapp-marketing'], verifyWebhook
           const botConfig = wsSettings.aiBotConfig || {};
 
           if (botConfig.enabled) {
+            const currentPayload = (conversation.payload as Record<string, any>) || {};
+            const recentMsgs = Array.isArray(currentPayload.messages) ? currentPayload.messages.slice(-8) : [];
+
             const aiResult = await generateAiCloserReply({
               tenantId,
               customerPhone: normalizedPhone,
               customerName: profileName,
               messageText,
+              recentMessages: recentMsgs,
             });
 
             if (aiResult?.reply) {

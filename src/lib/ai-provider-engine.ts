@@ -272,14 +272,16 @@ async function callGrok(apiKey: string, model: string, systemPrompt: string, use
 function executeDeterministicFallback(
   message: string,
   customerName: string,
-  botConfig: any
+  botConfig: any,
+  recentMessages?: Array<{ role?: string; senderRole?: string; body?: string; text?: string }>
 ): { reply: string; matchedIntent: string; suggestedFollowUps: string[]; sources: string[] } {
   const cleanMessage = message.trim();
+  const lowerMsg = cleanMessage.toLowerCase();
 
   // 1. Check workspace training QA pairs
   const trainingQA = Array.isArray(botConfig?.trainingQA) ? botConfig.trainingQA : [];
   for (const qa of trainingQA) {
-    if (qa.question && cleanMessage.toLowerCase().includes(qa.question.toLowerCase())) {
+    if (qa.question && lowerMsg.includes(qa.question.toLowerCase())) {
       return {
         reply: qa.answer,
         matchedIntent: 'TRAINED_QA_MATCH',
@@ -302,7 +304,37 @@ function executeDeterministicFallback(
     }
   }
 
-  // 3. Consultative Closer Rules
+  // 3. Negative / Disinterest / Opt-out ("no", "nope", "nah", "nahi", "not interested", "na", "nhi", "stop")
+  if (/^(no|nope|nah|nahi|na|not interested|nhi|mat karo|cancel|stop)\b/i.test(lowerMsg) || /^(no|nope|nah)\s*[,.]?$/i.test(lowerMsg)) {
+    return {
+      reply: `Understood ${customerName}! No problem at all. If you ever have any questions about AI Closer or need assistance, feel free to reach out anytime. Have a wonderful day!`,
+      matchedIntent: 'OPT_OUT_POLITE_CLOSE',
+      suggestedFollowUps: ['Reopen Chat', 'Share Feedback'],
+      sources: ['domain_consultative_engine'],
+    };
+  }
+
+  // 4. Uncertainty or Confusion ("i don't know", "pata nahi", "not sure", "what is this", "who are you")
+  if (/don'?t know|pata nahi|not sure|kya hai|what is this|who are you|who is this/i.test(lowerMsg)) {
+    return {
+      reply: `No problem ${customerName}! AI Closer is an automated sales CRM that records business SIM calls and organizes WhatsApp chats in one dashboard. Would you like me to share a quick 1-minute intro video?`,
+      matchedIntent: 'UNCERTAINTY_EXPLANATION',
+      suggestedFollowUps: ['Send 1-Min Video', 'Talk to Sales Team'],
+      sources: ['domain_consultative_engine'],
+    };
+  }
+
+  // 5. Short Polite Acknowledgment ("sir", "ok", "ok sir", "yes", "ji", "haan", "tell me")
+  if (/^(sir|ok sir|ji|haan|yes|tell me|batao|boliye|ok)\b/i.test(lowerMsg)) {
+    return {
+      reply: `Sure ${customerName}! How many sales closers or telecallers are currently in your team? We can tailor the setup accordingly.`,
+      matchedIntent: 'QUALIFICATION_QUERY',
+      suggestedFollowUps: ['1-3 Agents', '4-10 Agents', '10+ Agents'],
+      sources: ['domain_consultative_engine'],
+    };
+  }
+
+  // 6. Consultative Closer Rules (Pricing, Demo, Discount)
   if (/price|pricing|cost|charge|kitna|rate|fee/i.test(cleanMessage)) {
     return {
       reply: `Hi ${customerName}, our transparent enterprise plans start at ₹25,000/year, which includes unlimited SIM call recording vault, omnichannel WhatsApp messaging, and full closer team tracking. Would you like me to share the pricing PDF breakdown?`,
@@ -330,6 +362,22 @@ function executeDeterministicFallback(
     };
   }
 
+  // 7. Avoid repeating initial pitch if already sent in this thread
+  const alreadyGreeted = recentMessages?.some(
+    (m) =>
+      (m.senderRole === 'ai' || m.role === 'assistant') &&
+      /centralizes all client communications/i.test(m.body || m.text || '')
+  );
+
+  if (alreadyGreeted) {
+    return {
+      reply: `Got it ${customerName}. Let me know if you would like to explore pricing, see a live demo, or speak with our sales team directly.`,
+      matchedIntent: 'FOLLOWUP_ENGAGEMENT',
+      suggestedFollowUps: ['View Pricing', 'Talk to Closer'],
+      sources: ['domain_consultative_engine'],
+    };
+  }
+
   // Default Consultative Closer pitch
   return {
     reply: `Hi ${customerName}, thanks for reaching out! AI Closer centralizes all client communications and SIM call logs into one verified dashboard with zero extra apps for your clients. Would you like a quick 5-minute walkthrough today?`,
@@ -346,8 +394,9 @@ export async function generateAiCloserReply(params: {
   customerName?: string;
   messageText: string;
   systemContext?: string;
+  recentMessages?: Array<{ role?: string; senderRole?: string; body?: string; text?: string }>;
 }): Promise<AiGenerationResult> {
-  const { tenantId, messageText, customerName = 'there', systemContext } = params;
+  const { tenantId, messageText, customerName = 'there', systemContext, recentMessages } = params;
   const startTime = Date.now();
 
   // Load workspace AI settings & bot config
@@ -466,7 +515,7 @@ export async function generateAiCloserReply(params: {
       }
 
       if (provider.id === 'fallback') {
-        const fallback = executeDeterministicFallback(messageText, customerName, botConfig);
+        const fallback = executeDeterministicFallback(messageText, customerName, botConfig, recentMessages);
         return {
           reply: fallback.reply,
           provider: 'fallback',
