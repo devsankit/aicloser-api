@@ -82,6 +82,9 @@ const listConversationsQuerySchema = z.object({
   search: z.string().optional(),
   customerPhone: z.string().optional(),
   channel: z.string().optional(),
+  sourceType: z.enum(['ALL', 'OFFICIAL_API', 'QR_SCANNER']).optional(),
+  agentId: z.string().optional(),
+  agentName: z.string().optional(),
 });
 
 const sendMessageSchema = z.object({
@@ -341,17 +344,44 @@ conversationsRouter.get('/:id/360', async (req: Request, res: Response) => {
 
 // 1. GET / - List conversations with strict closer scoping and rich UI fields
 conversationsRouter.get('/', validateQuery(listConversationsQuerySchema), async (req: Request, res: Response) => {
-  const { page, limit, status, search, customerPhone, channel } = req.query as unknown as {
+  const { page, limit, status, search, customerPhone, channel, sourceType, agentId, agentName } = req.query as unknown as {
     page: number;
     limit: number;
     status?: string;
     search?: string;
     customerPhone?: string;
     channel?: string;
+    sourceType?: 'ALL' | 'OFFICIAL_API' | 'QR_SCANNER';
+    agentId?: string;
+    agentName?: string;
   };
 
   const tenantId = req.tenantId!;
   const andConditions: any[] = [{ tenantId }];
+
+  // Dedicated API vs QR Scanner filtering
+  if (sourceType === 'OFFICIAL_API') {
+    andConditions.push({ serviceSlug: { not: 'manual-chat' } });
+  } else if (sourceType === 'QR_SCANNER') {
+    andConditions.push({ serviceSlug: 'manual-chat' });
+  }
+
+  // Filter by specific closer/agent when requested (e.g. Admin selected agent in header)
+  if (agentId) {
+    andConditions.push({
+      OR: [
+        { assignedFreelancerId: agentId },
+        { payload: { path: ['scannedByUserId'], equals: agentId } },
+      ],
+    });
+  } else if (agentName) {
+    andConditions.push({
+      OR: [
+        { assignedFreelancerName: { contains: agentName, mode: 'insensitive' } },
+        { payload: { path: ['scannedByName'], string_contains: agentName } },
+      ],
+    });
+  }
 
   // Closers see their assigned conversations. Managers see their reporting
   // team. Admins retain the tenant-wide inbox.
@@ -485,6 +515,13 @@ conversationsRouter.get('/', validateQuery(listConversationsQuerySchema), async 
   });
   const shouldMask = isPhoneMaskingRequired(req.user, wsSettingsForConv?.settings as Record<string, any>);
 
+  const closerProfile = req.user?.role === 'SALES_AGENT'
+    ? await prisma.salesAgentProfile.findFirst({
+        where: { userId: req.user.userId, tenantId },
+        select: { id: true },
+      })
+    : null;
+
   // Clean and project conversation summaries with rich UI metadata
   const items = conversations.map((c) => {
     const payload = (c.payload as Record<string, unknown>) || {};
@@ -536,6 +573,61 @@ conversationsRouter.get('/', validateQuery(listConversationsQuerySchema), async 
     const lead = leadByConvId.get(c.id) || (c.customerPhone ? leadByPhone.get(normalizePhone(c.customerPhone)) : undefined);
     const sourceChannel = c.serviceSlug ? c.serviceSlug.toUpperCase() : 'WHATSAPP';
 
+    // Channel Source Classification & Distinctions
+    const extType = String(payload.externalSourceType || '').toLowerCase();
+    const serviceSlug = String(c.serviceSlug || '').toLowerCase();
+    const internalNotes = String(payload.internalNotes || '').toLowerCase();
+    const provider = String(payload.provider || '').toLowerCase();
+
+    const isMetaApi =
+      serviceSlug === 'whatsapp-intake' ||
+      extType === 'company_whatsapp' ||
+      provider === 'meta_cloud_api' ||
+      Boolean(payload.wabaId || payload.phoneNumberId);
+
+    const isQrScanner =
+      serviceSlug === 'manual-chat' ||
+      extType.includes('whatsapp_business') ||
+      extType.includes('whatsapp_personal') ||
+      internalNotes.includes('scanner') ||
+      internalNotes.includes('private rep line') ||
+      Boolean(payload.scannedByUserId || payload.scannedByName || payload.scannerDeviceName || payload.deviceSessionId);
+
+    let channelSource: 'OFFICIAL_API' | 'QR_SCANNER' | 'INSTAGRAM' | 'WEBSITE' = 'OFFICIAL_API';
+    if (serviceSlug.includes('instagram') || extType.includes('instagram')) {
+      channelSource = 'INSTAGRAM';
+    } else if (serviceSlug.includes('website') || extType.includes('website') || serviceSlug.includes('lead-form')) {
+      channelSource = 'WEBSITE';
+    } else if (isQrScanner) {
+      channelSource = 'QR_SCANNER';
+    } else if (isMetaApi) {
+      channelSource = 'OFFICIAL_API';
+    } else {
+      channelSource = 'OFFICIAL_API';
+    }
+
+    const scannedByName =
+      (typeof payload.scannedByName === 'string' && payload.scannedByName) ||
+      (typeof payload.scannedBy === 'string' && payload.scannedBy) ||
+      (typeof payload.scannerDeviceName === 'string' && payload.scannerDeviceName) ||
+      lead?.assignedAgent?.user?.displayName ||
+      c.assignedFreelancerName ||
+      null;
+
+    let channelSourceLabel = 'Official API';
+    if (channelSource === 'OFFICIAL_API') {
+      const companyPhone = typeof payload.externalSourceLabel === 'string' && payload.externalSourceLabel.includes('•')
+        ? payload.externalSourceLabel.split('•')[1]?.trim()
+        : '919589510954';
+      channelSourceLabel = `Company API • ${companyPhone}`;
+    } else if (channelSource === 'QR_SCANNER') {
+      channelSourceLabel = scannedByName ? `QR: ${scannedByName}` : 'Personal WhatsApp QR';
+    } else if (channelSource === 'INSTAGRAM') {
+      channelSourceLabel = 'Instagram DM';
+    } else if (channelSource === 'WEBSITE') {
+      channelSourceLabel = 'Website Form';
+    }
+
     return {
       id: c.id,
       tenantId: c.tenantId,
@@ -544,6 +636,12 @@ conversationsRouter.get('/', validateQuery(listConversationsQuerySchema), async 
       status: c.status,
       channel: sourceChannel,
       sourceChannel,
+      channelSource,
+      channelSourceLabel,
+      scannedByName,
+      isOfficialApi: channelSource === 'OFFICIAL_API',
+      isPersonalQr: channelSource === 'QR_SCANNER',
+      isReassignable: req.user?.role === 'ADMIN' || req.user?.role === 'SUPER_ADMIN' || !isQrScanner,
       stage: lead?.stage || 'NEW',
       leadStage: lead?.stage || 'NEW',
       leadId: lead?.id || null,
@@ -591,17 +689,30 @@ conversationsRouter.get('/', validateQuery(listConversationsQuerySchema), async 
     };
   });
 
+  // Enforce closer QR data isolation: personal QR chats belonging to Closer A are strictly hidden from Closer B
+  const accessibleItems = items.filter((item) => {
+    if (req.user?.role === 'SALES_AGENT' && item.isPersonalQr) {
+      const isMine =
+        (item.payload.scannedByUserId && item.payload.scannedByUserId === req.user.userId) ||
+        (item.assignedAgent?.id && closerProfile && item.assignedAgent.id === closerProfile.id) ||
+        (item.scannedByName && req.user.displayName && item.scannedByName.toLowerCase() === req.user.displayName.toLowerCase()) ||
+        item.isSharedWithMe;
+      return isMine;
+    }
+    return true;
+  });
+
   res.json({
     success: true,
-    data: items,
-    conversations: items,
+    data: accessibleItems,
+    conversations: accessibleItems,
     pagination: {
-      total,
+      total: accessibleItems.length,
       page,
       limit,
-      totalPages: Math.ceil(total / limit),
+      totalPages: Math.ceil(accessibleItems.length / limit) || 1,
       hasMore: total > page * limit,
-      nextCursor: items.length > 0 ? items[items.length - 1].id : null,
+      nextCursor: accessibleItems.length > 0 ? accessibleItems[accessibleItems.length - 1].id : null,
     },
     error: null,
   });
@@ -1188,6 +1299,26 @@ const handleAssignConversation = async (req: Request, res: Response) => {
       code: 'TENANT_ISOLATION_VIOLATION',
       error: 'TenantIsolationViolation',
       message: 'Cross-tenant assignment is strictly prohibited: conversation belongs to another workspace',
+    });
+    return;
+  }
+
+  // Personal QR line isolation check:
+  // Personal WhatsApp QR scanned chats are isolated to the closer.
+  // Sales agents cannot reassign them. Only ADMIN or SUPER_ADMIN can rotate / reassign QR chats.
+  const convPayload = (conversation.payload as Record<string, unknown>) || {};
+  const isConvQr =
+    conversation.serviceSlug === 'manual-chat' ||
+    String(convPayload.externalSourceType || '').includes('whatsapp_personal') ||
+    String(convPayload.externalSourceType || '').includes('whatsapp_business') ||
+    Boolean(convPayload.scannedByUserId || convPayload.scannedByName || convPayload.deviceSessionId);
+
+  if (isConvQr && user.role !== 'ADMIN' && user.role !== 'SUPER_ADMIN') {
+    res.status(403).json({
+      success: false,
+      code: 'PERMISSION_DENIED',
+      error: 'PermissionDenied',
+      message: 'Personal WhatsApp QR scanned chats are strictly isolated to the closer and cannot be reassigned by sales agents. Only workspace Admins have authority to rotate or reassign QR chats.',
     });
     return;
   }

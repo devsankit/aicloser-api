@@ -662,6 +662,8 @@ export interface WhatsAppCompanionDevice {
   pendingLeads: number;
   protocol: string;
   isPrimary?: boolean;
+  scannedByUserId?: string;
+  scannedByName?: string;
   lastSyncedAt: string;
   createdAt: string;
   sampleLeads: Array<{
@@ -805,6 +807,9 @@ integrationsRouter.post('/whatsapp/devices/confirm-pair', validateBody(confirmPa
 
   const devices = getTenantDevices(tenantId);
 
+  const scannedByUserId = req.user?.userId;
+  const scannedByName = req.user?.displayName || req.user?.email || 'Closer';
+
   const newDevice: WhatsAppCompanionDevice = {
     id: `wa-dev-${Date.now()}`,
     tenantId,
@@ -817,6 +822,8 @@ integrationsRouter.post('/whatsapp/devices/confirm-pair', validateBody(confirmPa
     pendingLeads: 2,
     protocol: 'Baileys QR Multi-Device v2.24',
     isPrimary: devices.length === 0,
+    scannedByUserId,
+    scannedByName,
     lastSyncedAt: new Date().toISOString(),
     createdAt: new Date().toISOString(),
     sampleLeads: [
@@ -839,6 +846,75 @@ integrationsRouter.post('/whatsapp/devices/confirm-pair', validateBody(confirmPa
 
   devices.unshift(newDevice);
   companionDevicesStore.set(tenantId, devices);
+
+  // Auto-provision companion leads into AppConversation & SalesLeadAssignment
+  const profile = await prisma.salesAgentProfile.findFirst({
+    where: { userId: scannedByUserId, tenantId },
+    select: { id: true },
+  });
+
+  const assignedCloserId = profile?.id || scannedByUserId || null;
+  const assignedCloserName = scannedByName;
+
+  for (const item of newDevice.sampleLeads) {
+    const convId = `conv-${Math.random().toString(36).slice(2, 10)}`;
+    const leadId = `lead-${Math.random().toString(36).slice(2, 10)}`;
+
+    await prisma.appConversation.create({
+      data: {
+        id: convId,
+        tenantId,
+        serviceId: newDevice.id,
+        serviceSlug: 'manual-chat',
+        assignedFreelancerId: assignedCloserId,
+        assignedFreelancerName: assignedCloserName,
+        customerName: item.name,
+        customerPhone: item.phone,
+        status: 'ACTIVE',
+        leadStatusId: 'NEW',
+        payload: {
+          provider: 'baileys_scanner',
+          externalSourceType: 'whatsapp_personal',
+          channelSource: 'QR_SCANNER',
+          scannedByUserId,
+          scannedByName,
+          scannerDeviceName: newDevice.name,
+          deviceSessionId: newDevice.id,
+          internalNotes: `Linked via WA Business Scanner (${newDevice.name})`,
+          messages: [
+            {
+              id: `msg-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+              body: item.topic,
+              lane: 'customer',
+              senderRole: 'customer',
+              senderLabel: item.name,
+              senderType: 'CUSTOMER',
+              status: 'delivered',
+              createdAt: new Date().toISOString(),
+            },
+          ],
+        },
+      },
+    }).catch(() => null);
+
+    if (profile?.id) {
+      await prisma.salesLeadAssignment.create({
+        data: {
+          id: leadId,
+          tenantId,
+          assignedAgentId: profile.id,
+          customerName: item.name,
+          customerPhone: item.phone,
+          source: 'whatsapp_personal_qr',
+          serviceInterest: item.topic,
+          budgetAmount: Number(item.value) || 0,
+          stage: 'NEW',
+          notes: `Synced with chat history via WA Business Scanner: "${item.topic}"`,
+          conversationId: convId,
+        },
+      }).catch(() => null);
+    }
+  }
 
   res.status(201).json({
     success: true,
