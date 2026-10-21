@@ -92,7 +92,32 @@ webhooksRouter.post(['/meta', '/whatsapp', '/whatsapp-marketing'], verifyWebhook
       for (const msg of value.messages) {
         const rawFrom = String(msg.from || '').replace(/\D/g, '');
         const normalizedPhone = rawFrom.startsWith('+') ? rawFrom : (rawFrom.length === 10 ? `+91${rawFrom}` : `+${rawFrom}`);
-        const messageText = msg.text?.body || msg.caption || (msg.type ? `[${msg.type}]` : '[Attachment]');
+        const messageText = ((): string => {
+          if (msg.text?.body) return msg.text.body;
+          if (msg.caption) return msg.caption;
+          if (msg.reaction?.emoji) return msg.reaction.emoji;
+          if (msg.interactive?.button_reply?.title) return msg.interactive.button_reply.title;
+          if (msg.interactive?.list_reply?.title) return msg.interactive.list_reply.title;
+          if (msg.interactive?.header?.text) return msg.interactive.header.text;
+          if (msg.button?.text) return msg.button.text;
+          if (msg.image) return msg.image.caption ? `📷 ${msg.image.caption}` : '📷 Photo';
+          if (msg.video) return msg.video.caption ? `🎥 ${msg.video.caption}` : '🎥 Video';
+          if (msg.document) return msg.document.filename ? `📄 ${msg.document.filename}` : '📄 Document';
+          if (msg.audio || msg.voice) return '🎤 Voice message';
+          if (msg.sticker) return '🏷️ Sticker';
+          if (msg.location) return msg.location.name ? `📍 ${msg.location.name}` : `📍 Location (${msg.location.latitude || ''}, ${msg.location.longitude || ''})`;
+          if (msg.contacts?.length) return `👤 Contact: ${msg.contacts[0]?.name?.formatted_name || msg.contacts[0]?.phones?.[0]?.phone || 'Card'}`;
+          if (msg.type === 'reaction' && msg.reaction?.emoji) return msg.reaction.emoji;
+          if (msg.type === 'unsupported') {
+            const errDetail = msg.errors?.[0]?.details || msg.errors?.[0]?.title;
+            if (errDetail && !errDetail.toLowerCase().includes('not supported')) {
+              return `[${errDetail}]`;
+            }
+            return 'OK 👍';
+          }
+          if (msg.type) return `[${msg.type}]`;
+          return '[Attachment]';
+        })();
         const messageId = msg.id || `msg-${Date.now()}`;
         const profileName = value.contacts?.[0]?.profile?.name || normalizedPhone;
 
@@ -425,6 +450,41 @@ webhooksRouter.post(['/meta', '/whatsapp', '/whatsapp-marketing'], verifyWebhook
             timestamp: new Date().toISOString(),
           },
         }).catch(() => undefined);
+
+        // Reconcile and persist status in AppConversation
+        try {
+          const mappedStatus = statusStr === 'READ' ? 'read' : statusStr === 'DELIVERED' ? 'delivered' : statusStr === 'FAILED' ? 'failed' : 'sent';
+          if (st.recipient_id) {
+            const cleanRecip = st.recipient_id.replace(/\D/g, '').slice(-10);
+            const conv = await prisma.appConversation.findFirst({
+              where: {
+                tenantId,
+                customerPhone: { contains: cleanRecip },
+              },
+            });
+            if (conv && conv.payload && typeof conv.payload === 'object') {
+              const p = conv.payload as Record<string, any>;
+              if (Array.isArray(p.messages)) {
+                let modified = false;
+                const updatedMessages = p.messages.map((m: any) => {
+                  if (m.externalMessageId === wamid || m.wamid === wamid || m.id === wamid) {
+                    modified = true;
+                    return { ...m, status: mappedStatus };
+                  }
+                  return m;
+                });
+                if (modified) {
+                  await prisma.appConversation.update({
+                    where: { id: conv.id },
+                    data: {
+                      payload: { ...p, messages: updatedMessages },
+                    },
+                  }).catch(() => undefined);
+                }
+              }
+            }
+          }
+        } catch {}
 
         // Reconcile with WhatsApp Campaign Message and Recipient
         try {

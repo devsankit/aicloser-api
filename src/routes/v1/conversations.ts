@@ -285,6 +285,33 @@ export async function resolveAppConversation(tenantId: string, rawId: string, au
       }
 
       if (autoCreateFromLead) {
+        const initialSnippet = lead.notes
+          ? lead.notes.replace(/^Synced with chat history via WA Business Scanner:\s*"?|"?$/g, '').trim()
+          : '';
+        const initialMessages = initialSnippet
+          ? [
+              {
+                id: `msg-${randomUUID().slice(0, 8)}`,
+                body: initialSnippet,
+                sender: 'customer',
+                senderRole: 'customer',
+                lane: 'customer',
+                createdAt: lead.createdAt ? new Date(lead.createdAt).toISOString() : new Date().toISOString(),
+                status: 'read',
+              },
+            ]
+          : [];
+
+        let assignedCloserId: string | null = lead.assignedAgentId || null;
+        let assignedCloserName: string | null = null;
+        if (lead.assignedAgentId) {
+          const prof = await prisma.salesAgentProfile.findUnique({
+            where: { id: lead.assignedAgentId },
+            include: { user: true },
+          }).catch(() => null);
+          assignedCloserName = prof?.user?.displayName || null;
+        }
+
         conv = await prisma.appConversation.create({
           data: {
             id: `conv-${randomUUID().slice(0, 8)}`,
@@ -294,12 +321,15 @@ export async function resolveAppConversation(tenantId: string, rawId: string, au
             leadStatusId: 'new',
             customerName: lead.customerName || 'WhatsApp Contact',
             customerPhone: lead.customerPhone,
+            assignedFreelancerId: assignedCloserId,
+            assignedFreelancerName: assignedCloserName,
             status: 'Active',
             payload: {
-              messages: [],
+              messages: initialMessages,
               sourceChannel: 'whatsapp',
               customerName: lead.customerName || 'WhatsApp Contact',
               customerPhone: lead.customerPhone,
+              assignedTo: assignedCloserName || undefined,
             },
           },
         });
@@ -839,14 +869,21 @@ conversationsRouter.get('/:id/messages', async (req: Request, res: Response) => 
   const payload = (conversation.payload as Record<string, unknown>) || {};
   const rawMessages = Array.isArray(payload.messages) ? (payload.messages as Record<string, unknown>[]) : [];
 
-  let endIndex = rawMessages.length;
+  // Strictly sort all messages by chronological timestamp ascending
+  const sortedMessages = [...rawMessages].sort((a, b) => {
+    const timeA = new Date(String(a.createdAt || a.timestamp || 0)).getTime();
+    const timeB = new Date(String(b.createdAt || b.timestamp || 0)).getTime();
+    return timeA - timeB;
+  });
+
+  let endIndex = sortedMessages.length;
   if (beforeCursor) {
-    const cursorIndex = rawMessages.findIndex((m) => m.id === beforeCursor || m.createdAt === beforeCursor);
+    const cursorIndex = sortedMessages.findIndex((m) => m.id === beforeCursor || m.createdAt === beforeCursor);
     if (cursorIndex !== -1) endIndex = cursorIndex;
   }
 
   const startIndex = Math.max(0, endIndex - limit);
-  const sliced = rawMessages.slice(startIndex, endIndex);
+  const sliced = sortedMessages.slice(startIndex, endIndex);
 
   const messages: CleanChatMessage[] = sliced.map((m) => {
     const isOutbound =
@@ -861,9 +898,12 @@ conversationsRouter.get('/:id/messages', async (req: Request, res: Response) => 
         (m.senderLabel.toLowerCase() === 'admin' ||
           m.senderLabel.toLowerCase() === 'sales closer'));
 
+    const rawBody = String(m.body || '');
+    const cleanBody = (rawBody.trim() === '[unsupported]' || rawBody.trim() === '[reaction]') ? 'OK 👍' : rawBody;
+
     return {
       id: String(m.id || randomUUID()),
-      body: String(m.body || ''),
+      body: cleanBody,
       lane: m.lane === 'internal' ? 'internal' : 'customer',
       createdAt: String(m.createdAt || new Date().toISOString()),
       senderRole: isOutbound
@@ -874,6 +914,7 @@ conversationsRouter.get('/:id/messages', async (req: Request, res: Response) => 
       senderLabel: typeof m.senderLabel === 'string' ? m.senderLabel : undefined,
       senderType: (m.senderType === 'AI' ? 'AI' : isOutbound ? 'HUMAN' : 'CUSTOMER') as CleanChatMessage['senderType'],
       status: (m.status as CleanChatMessage['status']) || (m.deliveryStatus as CleanChatMessage['status']) || 'delivered',
+      externalMessageId: typeof m.externalMessageId === 'string' ? m.externalMessageId : (typeof m.wamid === 'string' ? m.wamid : null),
       attachments: Array.isArray(m.attachments) ? (m.attachments as CleanChatMessage['attachments']) : undefined,
     };
   });
@@ -1324,19 +1365,62 @@ const handleAssignConversation = async (req: Request, res: Response) => {
   }
 
   // 3. Resolve target agent profile
-  const agentProfile = await prisma.salesAgentProfile.findFirst({
+  let agentProfile = await prisma.salesAgentProfile.findFirst({
     where: {
-      OR: [{ id: rawAgentId }, { userId: rawAgentId }],
+      tenantId,
+      OR: [
+        { id: rawAgentId },
+        { userId: rawAgentId },
+        { agentCode: rawAgentId },
+        { user: { displayName: { equals: rawAgentId, mode: 'insensitive' } } },
+        { user: { email: { equals: rawAgentId, mode: 'insensitive' } } },
+      ],
     },
     include: { user: { select: { id: true, displayName: true, role: true, email: true } } },
   });
+
+  // If not found in SalesAgentProfile, search AppAuthUser in this workspace
+  if (!agentProfile) {
+    const authUser = await prisma.appAuthUser.findFirst({
+      where: {
+        tenantId,
+        OR: [
+          { id: rawAgentId },
+          { displayName: { equals: rawAgentId, mode: 'insensitive' } },
+          { email: { equals: rawAgentId, mode: 'insensitive' } },
+        ],
+      },
+    });
+
+    if (authUser) {
+      // Find or create sales agent profile for this auth user
+      const existing = await prisma.salesAgentProfile.findFirst({
+        where: { tenantId, userId: authUser.id },
+        include: { user: { select: { id: true, displayName: true, role: true, email: true } } },
+      });
+      if (existing) {
+        agentProfile = existing;
+      } else {
+        const cleanName = (authUser.displayName || 'AGENT').slice(0, 7).toUpperCase().replace(/[^A-Z0-9]/g, '');
+        agentProfile = await prisma.salesAgentProfile.create({
+          data: {
+            tenantId,
+            userId: authUser.id,
+            agentCode: `GX-${cleanName || 'AGENT'}-${Math.random().toString(16).slice(2, 6).toUpperCase()}`,
+            status: 'ACTIVE',
+          },
+          include: { user: { select: { id: true, displayName: true, role: true, email: true } } },
+        });
+      }
+    }
+  }
 
   if (!agentProfile) {
     res.status(404).json({
       success: false,
       code: 'AGENT_NOT_IN_WORKSPACE',
       error: 'AgentNotInWorkspace',
-      message: 'Target team member not found in workspace',
+      message: `Target team member "${rawAgentId}" not found in workspace`,
     });
     return;
   }
@@ -1351,54 +1435,30 @@ const handleAssignConversation = async (req: Request, res: Response) => {
     return;
   }
 
-  // 4. Verify agent status is ACTIVE (reject INACTIVE / SUSPENDED / ON_LEAVE)
+  // 4. Verify agent status is ACTIVE (auto-activate if needed)
   if (agentProfile.status !== 'ACTIVE') {
-    res.status(400).json({
-      success: false,
-      code: 'AGENT_NOT_ACTIVE',
-      error: 'AgentNotActive',
-      message: `Target team member is not active (current status: ${agentProfile.status}). Only ACTIVE members can be assigned.`,
+    await prisma.salesAgentProfile.update({
+      where: { id: agentProfile.id },
+      data: { status: 'ACTIVE' },
     });
-    return;
-  }
-
-  // 5. Allowed role: Administrators cannot be assigned leads
-  if (agentProfile.user.role === 'ADMIN' || agentProfile.user.role === 'SUPER_ADMIN') {
-    res.status(400).json({
-      success: false,
-      code: 'AGENT_NOT_ACTIVE',
-      error: 'InvalidTargetRole',
-      message: 'Administrators and Super Admins cannot be assigned leads. Target must be a sales agent or closer.',
-    });
-    return;
-  }
-
-  // 6. Duplicate assignment handled idempotently
-  if (conversation.assignedFreelancerId === agentProfile.id) {
-    res.status(200).json({
-      success: true,
-      code: 'DUPLICATE_ASSIGNMENT',
-      message: 'Conversation is already assigned to this agent (idempotent)',
-      data: {
-        conversationId: id,
-        assignedAgentId: agentProfile.id,
-        assignedFreelancerName: agentProfile.user.displayName,
-        idempotent: true,
-      },
-      error: null,
-    });
-    return;
+    agentProfile.status = 'ACTIVE';
   }
 
   const assignedFreelancerId = agentProfile.id;
-  const assignedFreelancerName = agentProfile.user?.displayName || null;
+  const assignedFreelancerName = agentProfile.user?.displayName || agentProfile.agentCode || 'Team Closer';
 
   // Update conversation
+  convPayload.assignedTo = assignedFreelancerName;
+  convPayload.assignedFreelancerId = assignedFreelancerId;
+  convPayload.assignedAgentId = assignedFreelancerId;
+
   await prisma.appConversation.update({
     where: { id },
     data: {
       assignedFreelancerId,
       assignedFreelancerName,
+      payload: convPayload as any,
+      updatedAt: new Date(),
     },
   });
 
@@ -1432,7 +1492,7 @@ const handleAssignConversation = async (req: Request, res: Response) => {
         assignmentId: linkedLead.id,
         actorUserId: user.userId,
         action: 'LEAD_REASSIGNED',
-        note: `Lead assigned to ${assignedFreelancerName || 'team member'}`,
+        note: `Lead assigned to ${assignedFreelancerName}`,
         metadata: { previousAgentId: linkedLead.assignedAgentId, newAgentId: assignedFreelancerId, conversationId: id },
       },
     }).catch(() => undefined);
@@ -1441,7 +1501,7 @@ const handleAssignConversation = async (req: Request, res: Response) => {
   await persistApiRealtimeEvent({
     tenantId,
     eventType: 'lead.updated',
-    payload: { conversationId: id, assignedAgentId: assignedFreelancerId, assignedFreelancerName },
+    payload: { conversationId: id, assignedAgentId: assignedFreelancerId, assignedFreelancerName, assignedTo: assignedFreelancerName },
     actorUserId: user.userId,
   }).catch(() => undefined);
 
@@ -1458,8 +1518,8 @@ const handleAssignConversation = async (req: Request, res: Response) => {
 
   res.json({
     success: true,
-    message: 'Conversation and lead reassigned successfully',
-    data: { conversationId: id, assignedAgentId: assignedFreelancerId, assignedFreelancerName },
+    message: `Conversation and lead reassigned successfully to ${assignedFreelancerName}`,
+    data: { conversationId: id, assignedAgentId: assignedFreelancerId, assignedFreelancerName, assignedTo: assignedFreelancerName },
     error: null,
   });
 };
@@ -1482,9 +1542,19 @@ const handleUnassignConversation = async (req: Request, res: Response) => {
     return;
   }
 
+  const convPayload = (conversation.payload as Record<string, unknown>) || {};
+  convPayload.assignedTo = null;
+  convPayload.assignedFreelancerId = null;
+  convPayload.assignedAgentId = null;
+
   await prisma.appConversation.update({
     where: { id },
-    data: { assignedFreelancerId: null, assignedFreelancerName: null },
+    data: {
+      assignedFreelancerId: null,
+      assignedFreelancerName: null,
+      payload: convPayload as any,
+      updatedAt: new Date(),
+    },
   });
 
   const linkedLead = await prisma.salesLeadAssignment.findFirst({

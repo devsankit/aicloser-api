@@ -598,6 +598,10 @@ contactsRouter.get('/whatsapp/scanner', requirePermissions(PERM_CONTACTS_VIEW), 
 
   const isConnected = channel.status === 'ACTIVE' || Boolean(channel.encryptedAccessToken);
 
+  const realMsgCount = await prisma.appConversation.count({
+    where: { tenantId, serviceSlug: 'whatsapp' },
+  }).catch(() => 0);
+
   res.json({
     success: true,
     data: {
@@ -609,7 +613,7 @@ contactsRouter.get('/whatsapp/scanner', requirePermissions(PERM_CONTACTS_VIEW), 
       qrCode: isConnected ? null : 'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="200" height="200"><rect width="100%" height="100%" fill="%23f3f4f6"/><text x="50%" y="50%" dominant-baseline="middle" text-anchor="middle" fill="%236b7280" font-family="sans-serif" font-size="14">QR Code Ready</text></svg>',
       lastSyncedAt: channel.lastSyncedAt || channel.updatedAt,
       qualityRating: channel.qualityRating || 'GREEN',
-      messagesCount: 142,
+      messagesCount: realMsgCount,
     },
     error: null,
   });

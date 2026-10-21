@@ -8,7 +8,7 @@ import { prisma } from '../../lib/prisma.js';
 import { authenticate } from '../../middlewares/auth.js';
 import { enforceTenantIsolation } from '../../middlewares/tenant-isolation.js';
 import { validateBody, validateQuery } from '../../middlewares/validate.js';
-import { SalesLeadStage, salesLeadStageSchema } from '../../types/leads.js';
+import { SalesLeadStage, salesLeadStageSchema, SALES_LEAD_STAGES } from '../../types/leads.js';
 import { hasPermission, requirePermissions, PERM_LEADS_CLAIM, PERM_LEADS_REASSIGN } from '../../middlewares/rbac.js';
 import { persistApiRealtimeEvent } from '../../lib/realtime.js';
 import { syncMarketingContactForLead, normalizeLeadPhone, deleteContactsAndLinkedLeadsTransactional } from '../../lib/lead-contact-sync.js';
@@ -126,6 +126,30 @@ leadsRouter.get('/', validateQuery(listLeadsQuerySchema), async (req: Request, r
   });
 });
 
+const leadStageInputSchema = z
+  .string()
+  .optional()
+  .transform((v): SalesLeadStage => {
+    if (!v) return 'NEW';
+    const s = v.toUpperCase().replace(/[\s-]+/g, '_');
+    if (s === 'WON') return 'CLOSED_WON';
+    if (s === 'IN_PROGRESS' || s === 'PROGRESS') return 'CONTACTED';
+    if (s === 'DEMO') return 'QUALIFIED';
+    if (s === 'CALL_SCHEDULED') return 'FOLLOW_UP';
+    if ((SALES_LEAD_STAGES as readonly string[]).includes(s)) return s as SalesLeadStage;
+    return 'NEW';
+  });
+
+const leadFollowUpInputSchema = z
+  .string()
+  .nullable()
+  .optional()
+  .transform((v) => {
+    if (!v) return null;
+    const d = new Date(v);
+    return isNaN(d.getTime()) ? null : d.toISOString();
+  });
+
 const createLeadSchema = z.object({
   customerName: z.string().min(1, 'Customer name is required'),
   customerPhone: z.string().min(5, 'Phone number is required'),
@@ -135,10 +159,10 @@ const createLeadSchema = z.object({
   segment: z.string().optional(),
   priority: z.string().default('normal'),
   notes: z.string().optional(),
-  stage: salesLeadStageSchema.default('NEW'),
+  stage: leadStageInputSchema.default('NEW'),
   budgetAmount: z.number().optional(),
   source: z.string().optional(),
-  followUpAt: z.string().datetime().nullable().optional(),
+  followUpAt: leadFollowUpInputSchema,
   tags: z.array(z.string()).optional(),
   customFields: z.record(z.unknown()).optional(),
 });
@@ -1422,11 +1446,11 @@ const updateLeadSchema = z.object({
   customerEmail: z.string().trim().email().max(320).nullable().optional(),
   serviceInterest: z.string().trim().max(200).nullable().optional(),
   segment: z.string().trim().max(120).nullable().optional(),
-  stage: salesLeadStageSchema.optional(),
+  stage: leadStageInputSchema.optional(),
   kanbanPosition: z.number().optional(),
   priority: z.string().optional(),
   notes: z.string().optional(),
-  followUpAt: z.string().datetime().nullable().optional(),
+  followUpAt: leadFollowUpInputSchema,
   budgetAmount: z.number().optional(),
   assignedAgentId: z.string().optional(),
   tags: z.array(z.string().trim().min(1).max(80)).max(50).optional(),

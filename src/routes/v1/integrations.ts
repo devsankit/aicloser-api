@@ -675,75 +675,12 @@ export interface WhatsAppCompanionDevice {
   }>;
 }
 
-const DEFAULT_COMPANION_DEVICES: WhatsAppCompanionDevice[] = [
-  {
-    id: 'wa-dev-1',
-    tenantId: 'default',
-    name: 'Xiaomi Redmi Note 12 5G (SIM Relay Desk 1)',
-    phoneNumber: '+91 76185 34225',
-    batteryLevel: 92,
-    isCharging: false,
-    status: 'connected',
-    activeConversations: 24,
-    pendingLeads: 4,
-    protocol: 'Baileys QR Multi-Device v2.24',
-    isPrimary: true,
-    lastSyncedAt: new Date().toISOString(),
-    createdAt: new Date(Date.now() - 86400000 * 7).toISOString(),
-    sampleLeads: [
-      { name: 'Rajesh Gupta (Buyer)', company: 'Gupta Steels & Pipes', phone: '+91 98200 88776', topic: 'Need 5 licenses for regional desk', value: '150000' },
-      { name: 'Dr. Aris Mehta', company: 'Mehta Eye Centers', phone: '+91 99870 55443', topic: 'Inquired about missed call auto WhatsApp', value: '80000' },
-      { name: 'Suresh Patel', company: 'Patel Infrastructure', phone: '+91 98250 11223', topic: 'Requested pricing brochure via WhatsApp', value: '210000' },
-      { name: 'Kavita Shah', company: 'Kavita Jewels Online', phone: '+91 98211 44556', topic: 'Follow up on catalogue demo', value: '95000' },
-    ],
-  },
-  {
-    id: 'wa-dev-2',
-    tenantId: 'default',
-    name: 'POCO X5 Pro 5G (Sales Desk 2 - Anshita)',
-    phoneNumber: '+91 98201 54321',
-    batteryLevel: 84,
-    isCharging: true,
-    status: 'connected',
-    activeConversations: 19,
-    pendingLeads: 3,
-    protocol: 'Baileys QR Multi-Device v2.24',
-    isPrimary: false,
-    lastSyncedAt: new Date(Date.now() - 60000).toISOString(),
-    createdAt: new Date(Date.now() - 86400000 * 3).toISOString(),
-    sampleLeads: [
-      { name: 'Amit Malhotra', company: 'Malhotra Solar Solutions', phone: '+91 98111 22334', topic: 'Asked for enterprise onboarding quotation', value: '180000' },
-      { name: 'Sneha Kulkarni', company: 'Kulkarni Legal Tech', phone: '+91 98220 77665', topic: 'Requires 2 SIM call recorders', value: '120000' },
-      { name: 'Vikas Aggarwal', company: 'Aggarwal Logistics', phone: '+91 98990 44332', topic: 'Wants API webhook for Razorpay payments', value: '90000' },
-    ],
-  },
-  {
-    id: 'wa-dev-3',
-    tenantId: 'default',
-    name: 'OnePlus 11R (Inbound Leads Desk 3)',
-    phoneNumber: '+91 97112 88990',
-    batteryLevel: 95,
-    isCharging: false,
-    status: 'connected',
-    activeConversations: 12,
-    pendingLeads: 2,
-    protocol: 'Baileys QR Multi-Device v2.24',
-    isPrimary: false,
-    lastSyncedAt: new Date(Date.now() - 120000).toISOString(),
-    createdAt: new Date(Date.now() - 86400000 * 1).toISOString(),
-    sampleLeads: [
-      { name: 'Sandeep Jain', company: 'Jain Marble Exports', phone: '+91 98290 66554', topic: 'Inbound inquiry from WhatsApp catalog', value: '240000' },
-      { name: 'Meenakshi Sundaram', company: 'Chennai Agro Exports', phone: '+91 98400 33221', topic: 'Follow up on lead distribution workflow', value: '160000' },
-    ],
-  },
-];
-
 const companionDevicesStore = new Map<string, WhatsAppCompanionDevice[]>();
 
 function getTenantDevices(tenantId: string): WhatsAppCompanionDevice[] {
   let list = companionDevicesStore.get(tenantId);
   if (!list) {
-    list = DEFAULT_COMPANION_DEVICES.map((d) => ({ ...d, tenantId }));
+    list = [];
     companionDevicesStore.set(tenantId, list);
   }
   return list;
@@ -815,106 +752,22 @@ integrationsRouter.post('/whatsapp/devices/confirm-pair', validateBody(confirmPa
     tenantId,
     name: name.trim(),
     phoneNumber: phoneNumber.trim(),
-    batteryLevel: 98,
+    batteryLevel: 100,
     isCharging: false,
     status: 'connected',
-    activeConversations: 8,
-    pendingLeads: 2,
+    activeConversations: 0,
+    pendingLeads: 0,
     protocol: 'Baileys QR Multi-Device v2.24',
     isPrimary: devices.length === 0,
     scannedByUserId,
     scannedByName,
     lastSyncedAt: new Date().toISOString(),
     createdAt: new Date().toISOString(),
-    sampleLeads: [
-      {
-        name: `Lead via ${name}`,
-        company: 'Inbound WhatsApp Inquiry',
-        phone: '+91 98' + Math.floor(10000000 + Math.random() * 90000000),
-        topic: 'Inquired about enterprise CRM with multi-WhatsApp support',
-        value: '135000',
-      },
-      {
-        name: `Prospect via ${name}`,
-        company: 'FastTrack Trade Hub',
-        phone: '+91 99' + Math.floor(10000000 + Math.random() * 90000000),
-        topic: 'Requested product catalog and quote',
-        value: '95000',
-      },
-    ],
+    sampleLeads: [],
   };
 
   devices.unshift(newDevice);
   companionDevicesStore.set(tenantId, devices);
-
-  // Auto-provision companion leads into AppConversation & SalesLeadAssignment
-  const profile = await prisma.salesAgentProfile.findFirst({
-    where: { userId: scannedByUserId, tenantId },
-    select: { id: true },
-  });
-
-  const assignedCloserId = profile?.id || scannedByUserId || null;
-  const assignedCloserName = scannedByName;
-
-  for (const item of newDevice.sampleLeads) {
-    const convId = `conv-${Math.random().toString(36).slice(2, 10)}`;
-    const leadId = `lead-${Math.random().toString(36).slice(2, 10)}`;
-
-    await prisma.appConversation.create({
-      data: {
-        id: convId,
-        tenantId,
-        serviceId: newDevice.id,
-        serviceSlug: 'manual-chat',
-        assignedFreelancerId: assignedCloserId,
-        assignedFreelancerName: assignedCloserName,
-        customerName: item.name,
-        customerPhone: item.phone,
-        status: 'ACTIVE',
-        leadStatusId: 'NEW',
-        payload: {
-          provider: 'baileys_scanner',
-          externalSourceType: 'whatsapp_personal',
-          channelSource: 'QR_SCANNER',
-          scannedByUserId,
-          scannedByName,
-          scannerDeviceName: newDevice.name,
-          deviceSessionId: newDevice.id,
-          internalNotes: `Linked via WA Business Scanner (${newDevice.name})`,
-          messages: [
-            {
-              id: `msg-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-              body: item.topic,
-              lane: 'customer',
-              senderRole: 'customer',
-              senderLabel: item.name,
-              senderType: 'CUSTOMER',
-              status: 'delivered',
-              createdAt: new Date().toISOString(),
-            },
-          ],
-        },
-      },
-    }).catch(() => null);
-
-    if (profile?.id) {
-      await prisma.salesLeadAssignment.create({
-        data: {
-          id: leadId,
-          tenantId,
-          assignedAgentId: profile.id,
-          customerName: item.name,
-          customerPhone: item.phone,
-          source: 'whatsapp_personal_qr',
-          serviceInterest: item.topic,
-          budgetAmount: Number(item.value) || 0,
-          stage: 'NEW',
-          notes: `Synced with chat history via WA Business Scanner: "${item.topic}"`,
-          conversationId: convId,
-        },
-      }).catch(() => null);
-    }
-  }
 
   res.status(201).json({
     success: true,
