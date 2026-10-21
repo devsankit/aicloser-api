@@ -287,12 +287,20 @@ conversationsRouter.get('/', validateQuery(listConversationsQuerySchema), async 
   if (customerPhone) andConditions.push({ customerPhone: { contains: customerPhone } });
   if (channel) andConditions.push({ serviceSlug: { contains: channel.toLowerCase() } });
   if (search) {
-    andConditions.push({
-      OR: [
-        { customerName: { contains: search, mode: 'insensitive' } },
-        { customerPhone: { contains: search } },
-      ],
-    });
+    const trimmed = search.trim();
+    const digitsOnly = trimmed.replace(/\D/g, '');
+    const phoneVariation = trimmed.startsWith('+') ? trimmed : `+${trimmed}`;
+    const orConditions: any[] = [
+      { customerName: { contains: trimmed, mode: 'insensitive' } },
+      { customerPhone: { contains: trimmed } },
+      { customerPhone: { contains: phoneVariation } },
+    ];
+    if (digitsOnly.length >= 7) {
+      orConditions.push({ customerPhone: { contains: digitsOnly } });
+      orConditions.push({ customerPhone: { contains: `+91${digitsOnly.slice(-10)}` } });
+      orConditions.push({ customerPhone: { contains: digitsOnly.slice(-10) } });
+    }
+    andConditions.push({ OR: orConditions });
   }
 
   const where = { AND: andConditions };

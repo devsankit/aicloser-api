@@ -22,7 +22,7 @@ leadsRouter.use(authenticate, enforceTenantIsolation);
 
 const listLeadsQuerySchema = z.object({
   page: z.string().optional().transform((v) => (v ? Math.max(1, Number(v)) : 1)),
-  limit: z.string().optional().transform((v) => (v ? Math.min(100, Math.max(1, Number(v))) : 25)),
+  limit: z.string().optional().transform((v) => (v ? Math.min(1000, Math.max(1, Number(v))) : 50)),
   stage: salesLeadStageSchema.optional(),
   status: salesLeadStageSchema.optional(),
   search: z.string().optional(),
@@ -64,13 +64,20 @@ leadsRouter.get('/', validateQuery(listLeadsQuerySchema), async (req: Request, r
 
   if (search) {
     const trimmed = search.trim();
+    const digitsOnly = trimmed.replace(/\D/g, '');
     const phoneVariation = trimmed.startsWith('+') ? trimmed : `+${trimmed}`;
-    where.OR = [
+    const orConditions: any[] = [
       { customerName: { contains: trimmed, mode: 'insensitive' } },
       { customerPhone: { contains: trimmed } },
       { customerPhone: { contains: phoneVariation } },
       { customerEmail: { contains: trimmed, mode: 'insensitive' } },
     ];
+    if (digitsOnly.length >= 7) {
+      orConditions.push({ customerPhone: { contains: digitsOnly } });
+      orConditions.push({ customerPhone: { contains: `+91${digitsOnly.slice(-10)}` } });
+      orConditions.push({ customerPhone: { contains: digitsOnly.slice(-10) } });
+    }
+    where.OR = orConditions;
   }
 
   const [total, leads] = await Promise.all([
