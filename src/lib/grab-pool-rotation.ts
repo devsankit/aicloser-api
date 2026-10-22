@@ -173,17 +173,19 @@ export async function syncAndRotatePoolSlots(
           };
           stateChanged = true;
 
-          // Record activity log for missed pool lead
-          await prisma.salesActivityLog.create({
-            data: {
-              tenantId,
-              assignmentId: item.convertedAssignmentId || item.id,
-              actorUserId: closer?.userId,
-              action: 'POOL_LEAD_MISSED',
-              note: `Grab pool lead ${item.customerName} expired without claim by closer ${closer?.user?.displayName || slot.slottedAgentId}. Rotated to ${nextCloser.user?.displayName || nextCloser.agentCode}.`,
-              metadata: { poolItemId: item.id, missedByAgentId: slot.slottedAgentId, rotatedToAgentId: nextCloser.id },
-            },
-          }).catch(() => undefined);
+          // Record activity log for missed pool lead (if linked to an assignment)
+          if (item.convertedAssignmentId) {
+            await prisma.salesActivityLog.create({
+              data: {
+                tenantId,
+                assignmentId: item.convertedAssignmentId,
+                actorUserId: closer?.userId,
+                action: 'POOL_LEAD_MISSED',
+                note: `Grab pool lead ${item.customerName} expired without claim by closer ${closer?.user?.displayName || slot.slottedAgentId}. Rotated to ${nextCloser.user?.displayName || nextCloser.agentCode}.`,
+                metadata: { poolItemId: item.id, missedByAgentId: slot.slottedAgentId, rotatedToAgentId: nextCloser.id },
+              },
+            }).catch(() => undefined);
+          }
         }
       }
     } else {
