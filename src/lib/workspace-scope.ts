@@ -65,3 +65,72 @@ export async function getWorkspaceScope(tenantId: string, user: ScopeUser): Prom
     userIds: visibleProfiles.map((profile) => profile.userId),
   };
 }
+
+/**
+ * Check if two users/agents belong to the same reporting team or hierarchy branch.
+ * Same reporting team condition:
+ * - Same user or same profile
+ * - Same group (groupId matches)
+ * - Same direct parent/manager (parentAgentId matches)
+ * - One is the direct or ancestor manager/parent of the other
+ */
+export async function checkSameReportingTeam(
+  tenantId: string,
+  requesterUserIdOrProfileId: string,
+  targetUserIdOrProfileId: string
+): Promise<boolean> {
+  if (!requesterUserIdOrProfileId || !targetUserIdOrProfileId) return false;
+  if (requesterUserIdOrProfileId === targetUserIdOrProfileId) return true;
+
+  const profiles = await prisma.salesAgentProfile.findMany({
+    where: {
+      tenantId,
+      status: { not: 'SUSPENDED' },
+    },
+    select: { id: true, userId: true, parentAgentId: true, groupId: true },
+  });
+
+  const requester = profiles.find(
+    (p) => p.userId === requesterUserIdOrProfileId || p.id === requesterUserIdOrProfileId
+  );
+  const target = profiles.find(
+    (p) => p.userId === targetUserIdOrProfileId || p.id === targetUserIdOrProfileId
+  );
+
+  if (!requester || !target) return false;
+  if (requester.id === target.id) return true;
+
+  // 1. Same group
+  if (requester.groupId && target.groupId && requester.groupId === target.groupId) {
+    return true;
+  }
+
+  // 2. Same parent agent / manager
+  if (requester.parentAgentId && target.parentAgentId && requester.parentAgentId === target.parentAgentId) {
+    return true;
+  }
+
+  // 3. Direct manager-subordinate relationship
+  if (requester.id === target.parentAgentId || target.id === requester.parentAgentId) {
+    return true;
+  }
+
+  // 4. Ancestor/descendant relationship in tree
+  const isDescendant = (ancestorId: string, childId: string): boolean => {
+    let curr = profiles.find((p) => p.id === childId);
+    const visited = new Set<string>();
+    while (curr && curr.parentAgentId && !visited.has(curr.parentAgentId)) {
+      visited.add(curr.parentAgentId);
+      if (curr.parentAgentId === ancestorId) return true;
+      curr = profiles.find((p) => p.id === curr!.parentAgentId);
+    }
+    return false;
+  };
+
+  if (isDescendant(requester.id, target.id) || isDescendant(target.id, requester.id)) {
+    return true;
+  }
+
+  return false;
+}
+

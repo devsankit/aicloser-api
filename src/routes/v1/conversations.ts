@@ -14,7 +14,7 @@ import { enforceTenantIsolation } from '../../middlewares/tenant-isolation.js';
 import { validateBody, validateQuery } from '../../middlewares/validate.js';
 import { requireRoles, hasPermission, PERM_LEADS_REASSIGN } from '../../middlewares/rbac.js';
 import { persistApiRealtimeEvent } from '../../lib/realtime.js';
-import { getWorkspaceScope } from '../../lib/workspace-scope.js';
+import { getWorkspaceScope, checkSameReportingTeam } from '../../lib/workspace-scope.js';
 import { syncMarketingContactForLead } from '../../lib/lead-contact-sync.js';
 import { getLead360 } from './leads.js';
 
@@ -144,7 +144,8 @@ async function checkConversationAccess(
   if (!user) return { hasAccess: false, isOwnerOrAssigned: false, isShared: false, permission: 'VIEW' };
 
   // Super Admin and Admin have unconditional permanent REPLY access
-  if (user.role === 'ADMIN' || user.role === 'SUPER_ADMIN') {
+  const roleUpper = String(user.role || '').toUpperCase();
+  if (roleUpper === 'ADMIN' || roleUpper === 'SUPER_ADMIN') {
     return { hasAccess: true, isOwnerOrAssigned: true, isShared: false, permission: 'REPLY' };
   }
 
@@ -171,7 +172,7 @@ async function checkConversationAccess(
     }
   }
 
-  const mode = user.role === 'SALES_AGENT' ? await getChatVisibilityMode(tenantId) : 'ASSIGNED_ONLY';
+  const mode = (roleUpper === 'SALES_AGENT' || roleUpper === 'CLOSER') ? await getChatVisibilityMode(tenantId) : 'COMPANY_WIDE';
   if (mode === 'COMPANY_WIDE') {
     return { hasAccess: true, isOwnerOrAssigned: true, isShared: false, permission: 'REPLY' };
   }
@@ -1769,6 +1770,38 @@ conversationsRouter.post('/:id/share', validateBody(directShareBodySchema), asyn
     return;
   }
 
+  // Only admin, manager, or currently assigned closer can share a chat
+  const access = await checkConversationAccess(req, conversation);
+  if (!access.hasAccess || (!access.isOwnerOrAssigned && req.user?.role !== 'ADMIN' && req.user?.role !== 'SUPER_ADMIN' && req.user?.role !== 'MANAGER')) {
+    res.status(403).json({
+      success: false,
+      error: 'Forbidden',
+      message: 'Only workspace administrators or the assigned agent can share this conversation',
+    });
+    return;
+  }
+
+  // Hierarchical team scoping governance check
+  const workspace = await prisma.aicloserWorkspace.findUnique({
+    where: { id: tenantId },
+    select: { settings: true },
+  });
+  const wsSettings = (workspace?.settings as Record<string, any>) || {};
+  const userRole = req.user?.role;
+  const isSalesAgent = userRole === 'SALES_AGENT' || (userRole as string) === 'CLOSER';
+
+  if (wsSettings.chatSharingScope === 'REPORTING_TEAM_ONLY' && isSalesAgent) {
+    const isSameTeam = await checkSameReportingTeam(tenantId, req.user!.userId, targetUserId);
+    if (!isSameTeam) {
+      res.status(403).json({
+        success: false,
+        error: 'Conversation sharing is restricted to your direct reporting team under workspace governance policy.',
+        message: 'Conversation sharing is restricted to your direct reporting team under workspace governance policy.',
+      });
+      return;
+    }
+  }
+
   const payload = (conversation.payload && typeof conversation.payload === 'object' && !Array.isArray(conversation.payload))
     ? { ...(conversation.payload as Record<string, any>) }
     : {};
@@ -1922,6 +1955,27 @@ conversationsRouter.post('/:id/shares', validateBody(createShareSchema), async (
       message: 'This user is already the primary assigned agent for this conversation',
     });
     return;
+  }
+
+  // Hierarchical team scoping governance check
+  const workspace = await prisma.aicloserWorkspace.findUnique({
+    where: { id: tenantId },
+    select: { settings: true },
+  });
+  const wsSettings = (workspace?.settings as Record<string, any>) || {};
+  const userRole = req.user?.role;
+  const isSalesAgent = userRole === 'SALES_AGENT' || (userRole as string) === 'CLOSER';
+
+  if (wsSettings.chatSharingScope === 'REPORTING_TEAM_ONLY' && isSalesAgent) {
+    const isSameTeam = await checkSameReportingTeam(tenantId, req.user!.userId, targetUserId);
+    if (!isSameTeam) {
+      res.status(403).json({
+        success: false,
+        error: 'Conversation sharing is restricted to your direct reporting team under workspace governance policy.',
+        message: 'Conversation sharing is restricted to your direct reporting team under workspace governance policy.',
+      });
+      return;
+    }
   }
 
   const payload = (conversation.payload as Record<string, unknown>) || {};

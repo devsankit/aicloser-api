@@ -13,7 +13,7 @@ import { SalesLeadStage, salesLeadStageSchema, SALES_LEAD_STAGES } from '../../t
 import { hasPermission, requirePermissions, PERM_LEADS_CLAIM, PERM_LEADS_REASSIGN } from '../../middlewares/rbac.js';
 import { persistApiRealtimeEvent } from '../../lib/realtime.js';
 import { syncMarketingContactForLead, normalizeLeadPhone, deleteContactsAndLinkedLeadsTransactional } from '../../lib/lead-contact-sync.js';
-import { getWorkspaceScope } from '../../lib/workspace-scope.js';
+import { getWorkspaceScope, checkSameReportingTeam } from '../../lib/workspace-scope.js';
 import { getWorkspaceStages } from './stages.js';
 
 export const leadsRouter = Router();
@@ -1359,7 +1359,36 @@ export async function getLead360(req: Request, res: Response) {
     .toLowerCase()
     .replace(/\b\w/g, (character) => character.toUpperCase());
 
-  const history: Array<Record<string, unknown>> = [
+  // Deduplicate and filter activityLogs against calls and timeline
+  const filteredActivityLogs = activityLogs.filter((act) => {
+    const action = String(act.action || '').toUpperCase();
+    const actTime = act.createdAt ? new Date(act.createdAt).getTime() : 0;
+
+    // Filter redundant call activity logs when enrichedCalls has a corresponding record
+    if (['MOBILE_CALL_LOGGED', 'CALL_COMPLETED', 'CALL_LOGGED', 'CALL'].includes(action)) {
+      const actCallId = (act.metadata as any)?.callId || (act.metadata as any)?.mobileCallId;
+      const matchingCall = enrichedCalls.find((call) => {
+        if (actCallId && (call.id === actCallId || (call as any).mobileCallId === actCallId)) return true;
+        const callTime = call.startedAt ? new Date(call.startedAt).getTime() : 0;
+        return Math.abs(actTime - callTime) <= 60000;
+      });
+      if (matchingCall) return false;
+    }
+
+    // Filter redundant stage changed activity logs when timeline has corresponding record
+    if (['STAGE_CHANGED', 'LEAD_STAGE_CHANGED', 'STAGE_UPDATE'].includes(action)) {
+      const matchingTimeline = timeline.find((t) => {
+        const tTime = t.createdAt ? new Date(t.createdAt).getTime() : 0;
+        const tType = String(t.type || '').toUpperCase();
+        return (tType.includes('STAGE') || tType === 'STAGE_CHANGE') && Math.abs(actTime - tTime) <= 60000;
+      });
+      if (matchingTimeline) return false;
+    }
+
+    return true;
+  });
+
+  const rawHistory: Array<Record<string, unknown>> = [
     ...timeline.map((entry) => ({
       id: `timeline:${entry.id}`,
       kind: entry.type || 'NOTE',
@@ -1368,7 +1397,7 @@ export async function getLead360(req: Request, res: Response) {
       createdAt: entry.createdAt.toISOString(),
       author: authorMap.get(entry.userId || '') || null,
     })),
-    ...activityLogs.map((entry) => ({
+    ...filteredActivityLogs.map((entry) => ({
       id: `activity:${entry.id}`,
       kind: 'ACTIVITY',
       title: humanizeHistoryAction(entry.action),
@@ -1413,7 +1442,18 @@ export async function getLead360(req: Request, res: Response) {
       createdAt: delivery.sentAt || delivery.deliveredAt || new Date().toISOString(),
       metadata: delivery,
     })),
-  ].sort((left, right) => String(right.createdAt).localeCompare(String(left.createdAt)));
+  ];
+
+  // Guarantee unique deterministic IDs and sort chronologically
+  const seenHistoryIds = new Set<string>();
+  const history = rawHistory
+    .filter((item) => {
+      const itemId = String(item.id || '');
+      if (!itemId || seenHistoryIds.has(itemId)) return false;
+      seenHistoryIds.add(itemId);
+      return true;
+    })
+    .sort((left, right) => String(right.createdAt).localeCompare(String(left.createdAt)));
 
   const raw360Data = {
     lead: {
@@ -1766,28 +1806,49 @@ leadsRouter.patch('/:id', validateBody(updateLeadSchema), async (req: Request, r
     return;
   }
 
-  // Strict closer scoping: Closers can only update leads assigned to them and cannot reassign
-  if (req.user?.role === 'SALES_AGENT') {
+  // Strict closer scoping: Closers can only update leads assigned to them
+  const userRole = req.user?.role;
+  const isSalesAgent = userRole === 'SALES_AGENT' || (userRole as string) === 'CLOSER';
+  if (isSalesAgent) {
     const profile = await prisma.salesAgentProfile.findFirst({
-      where: { userId: req.user.userId, tenantId },
+      where: { userId: req.user!.userId, tenantId },
       select: { id: true },
     });
     if (existing.assignedAgentId !== profile?.id) {
       res.status(403).json({ success: false, error: 'Forbidden', message: 'You can only update leads assigned to you' });
       return;
     }
-    if (body.assignedAgentId && body.assignedAgentId !== existing.assignedAgentId) {
-      const canReassign = await hasPermission(req.user.userId, tenantId, req.user.role, PERM_LEADS_REASSIGN);
-      if (!canReassign) {
-        res.status(403).json({ success: false, error: 'Forbidden', message: 'Only workspace administrators or authorized users can reassign leads' });
-        return;
-      }
-    }
   }
 
-  // If reassigning (admin/manager), verify target agent belongs to same tenant (resolving SalesAgentProfile.id or User.id)
+  // If reassigning agent, verify workspace governance policies
   let targetAgentId: string | undefined = undefined;
   if (body.assignedAgentId && body.assignedAgentId !== existing.assignedAgentId) {
+    const workspace = await prisma.aicloserWorkspace.findUnique({
+      where: { id: tenantId },
+      select: { settings: true },
+    });
+    const wsSettings = (workspace?.settings as Record<string, any>) || {};
+
+    // 1. allowAgentLeadReassign policy check
+    if (isSalesAgent) {
+      if (wsSettings.allowAgentLeadReassign === false) {
+        res.status(403).json({
+          success: false,
+          error: 'Lead reassignment is disabled for sales agents in workspace control settings.',
+          message: 'Lead reassignment is disabled for sales agents in workspace control settings.',
+        });
+        return;
+      }
+      if (wsSettings.allowAgentLeadReassign !== true) {
+        const canReassign = await hasPermission(req.user!.userId, tenantId, req.user!.role, PERM_LEADS_REASSIGN);
+        if (!canReassign) {
+          res.status(403).json({ success: false, error: 'Forbidden', message: 'Only workspace administrators or authorized users can reassign leads' });
+          return;
+        }
+      }
+    }
+
+    // Resolve target agent in this tenant (can be profile ID or user ID)
     const targetAgent = await prisma.salesAgentProfile.findFirst({
       where: {
         tenantId,
@@ -1802,6 +1863,20 @@ leadsRouter.patch('/:id', validateBody(updateLeadSchema), async (req: Request, r
       return;
     }
     targetAgentId = targetAgent.id;
+
+    // 2. leadAssignmentScope hierarchical team scoping policy check
+    const roleUpper = String(userRole || '').toUpperCase();
+    if (wsSettings.leadAssignmentScope === 'REPORTING_TEAM_ONLY' && roleUpper !== 'ADMIN' && roleUpper !== 'SUPER_ADMIN') {
+      const isSameTeam = await checkSameReportingTeam(tenantId, req.user!.userId, targetAgent.id);
+      if (!isSameTeam) {
+        res.status(403).json({
+          success: false,
+          error: 'Lead reassignment is restricted to your direct reporting team under workspace governance policy.',
+          message: 'Lead reassignment is restricted to your direct reporting team under workspace governance policy.',
+        });
+        return;
+      }
+    }
   }
 
   const targetStage = body.stage ?? body.status;

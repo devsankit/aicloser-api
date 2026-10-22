@@ -10,7 +10,14 @@ export const labelsRouter = Router();
 
 labelsRouter.use(authenticate, enforceTenantIsolation);
 
-// GET /api/v1/labels - Returns distinct tags from leads + predefined workspace labels
+export interface WorkspaceLabel {
+  name: string;
+  color: string;
+  usageCount: number;
+  createdAt: string;
+}
+
+// GET /api/v1/labels - Returns distinct tags from leads + predefined workspace labels with usageCount
 labelsRouter.get('/', async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
 
@@ -20,35 +27,45 @@ labelsRouter.get('/', async (req: Request, res: Response) => {
     select: { settings: true },
   });
   const settings = (workspace?.settings as Record<string, any>) || {};
-  const predefinedLabels: Array<{ name: string; color?: string; id?: string }> = Array.isArray(settings.labels)
+  const predefinedLabels: Array<{ name: string; color?: string; createdAt?: string }> = Array.isArray(settings.labels)
     ? settings.labels
     : [];
 
-  // 2. Fetch distinct tags from SalesLeadAssignment for this tenant
+  // 2. Fetch tags from all SalesLeadAssignment records for this tenant
   const leadTags = await prisma.salesLeadAssignment.findMany({
     where: { tenantId },
     select: { tags: true },
   });
 
+  // 3. Compute usage counts for all tags
+  const tagCountMap = new Map<string, number>();
   const leadTagSet = new Set<string>();
+
   for (const lead of leadTags) {
     if (Array.isArray(lead.tags)) {
       for (const tag of lead.tags) {
         const trimmed = String(tag).trim();
-        if (trimmed) leadTagSet.add(trimmed);
+        if (trimmed) {
+          leadTagSet.add(trimmed);
+          const lower = trimmed.toLowerCase();
+          tagCountMap.set(lower, (tagCountMap.get(lower) || 0) + 1);
+        }
       }
     }
   }
 
   // Predefined label map
-  const labelMap = new Map<string, { name: string; color?: string }>();
+  const labelMap = new Map<string, WorkspaceLabel>();
 
   // Add workspace predefined labels
   for (const pl of predefinedLabels) {
     if (pl && pl.name) {
-      labelMap.set(pl.name.toLowerCase(), {
+      const lower = pl.name.toLowerCase();
+      labelMap.set(lower, {
         name: pl.name,
         color: pl.color || '#6366f1',
+        usageCount: tagCountMap.get(lower) || 0,
+        createdAt: pl.createdAt || new Date().toISOString(),
       });
     }
   }
@@ -62,6 +79,8 @@ labelsRouter.get('/', async (req: Request, res: Response) => {
       labelMap.set(lower, {
         name: tag,
         color: defaultPalette[colorIdx % defaultPalette.length],
+        usageCount: tagCountMap.get(lower) || 0,
+        createdAt: new Date().toISOString(),
       });
       colorIdx++;
     }
@@ -99,10 +118,11 @@ labelsRouter.post('/', requireRoles('ADMIN', 'SUPER_ADMIN', 'MANAGER'), validate
     : [];
 
   const existingIdx = labels.findIndex((l) => l.name.toLowerCase() === name.trim().toLowerCase());
+  const now = new Date().toISOString();
   const newLabel = {
     name: name.trim(),
     color: color || '#3b82f6',
-    createdAt: new Date().toISOString(),
+    createdAt: now,
   };
 
   if (existingIdx !== -1) {
@@ -111,20 +131,161 @@ labelsRouter.post('/', requireRoles('ADMIN', 'SUPER_ADMIN', 'MANAGER'), validate
     labels.push(newLabel);
   }
 
+  // Count existing usage if any
+  const count = await prisma.salesLeadAssignment.count({
+    where: { tenantId, tags: { has: name.trim() } },
+  });
+
   await prisma.aicloserWorkspace.update({
     where: { id: tenantId },
     data: {
       settings: {
         ...settings,
         labels,
-      },
+      } as any,
+      updatedAt: new Date(),
+    },
+  });
+
+  res.status(201).json({
+    success: true,
+    message: 'Label created successfully',
+    data: {
+      ...newLabel,
+      usageCount: count,
+    },
+    error: null,
+  });
+});
+
+const updateLabelSchema = z.object({
+  newName: z.string().optional(),
+  name: z.string().optional(),
+  color: z.string().optional(),
+}).refine((data) => Boolean(data.newName || data.name), {
+  message: 'name or newName is required',
+});
+
+// PUT /api/v1/labels/:name - Update label name & color, and cascade updates to SalesLeadAssignment tags
+labelsRouter.put('/:name', requireRoles('ADMIN', 'SUPER_ADMIN', 'MANAGER'), validateBody(updateLabelSchema), async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const oldName = decodeURIComponent(String(req.params.name)).trim();
+  const rawBody = req.body as { newName?: string; name?: string; color?: string };
+  const newName = String(rawBody.newName || rawBody.name || '').trim();
+  const color = rawBody.color;
+
+  const workspace = await prisma.aicloserWorkspace.findUnique({
+    where: { id: tenantId },
+    select: { settings: true },
+  });
+
+  const settings = (workspace?.settings as Record<string, any>) || {};
+  const labels: Array<{ name: string; color?: string; createdAt?: string }> = Array.isArray(settings.labels)
+    ? [...settings.labels]
+    : [];
+
+  const targetIdx = labels.findIndex((l) => l.name.toLowerCase() === oldName.toLowerCase());
+  const updatedColor = color || (targetIdx !== -1 ? labels[targetIdx].color : '#3b82f6') || '#3b82f6';
+  const now = new Date().toISOString();
+
+  if (targetIdx !== -1) {
+    labels[targetIdx] = {
+      ...labels[targetIdx],
+      name: newName.trim(),
+      color: updatedColor,
+    };
+  } else {
+    labels.push({
+      name: newName.trim(),
+      color: updatedColor,
+      createdAt: now,
+    });
+  }
+
+  // If newName !== oldName, batch update all SalesLeadAssignment records where tags has oldName
+  const leadsWithTag = await prisma.salesLeadAssignment.findMany({
+    where: { tenantId, tags: { has: oldName } },
+    select: { id: true, tags: true },
+  });
+
+  if (newName.toLowerCase() !== oldName.toLowerCase()) {
+    for (const l of leadsWithTag) {
+      const updatedTags = Array.from(new Set(l.tags.map((t) => (t.toLowerCase() === oldName.toLowerCase() ? newName.trim() : t))));
+      await prisma.salesLeadAssignment.update({
+        where: { id: l.id },
+        data: { tags: updatedTags },
+      });
+    }
+  }
+
+  await prisma.aicloserWorkspace.update({
+    where: { id: tenantId },
+    data: {
+      settings: {
+        ...settings,
+        labels,
+      } as any,
+      updatedAt: new Date(),
     },
   });
 
   res.json({
     success: true,
-    message: 'Label created successfully',
-    data: newLabel,
+    message: 'Label updated successfully',
+    data: {
+      name: newName.trim(),
+      color: updatedColor,
+      usageCount: leadsWithTag.length,
+    },
+    error: null,
+  });
+});
+
+// DELETE /api/v1/labels/:name - Delete label from settings and purge from all leads in the tenant
+labelsRouter.delete('/:name', requireRoles('ADMIN', 'SUPER_ADMIN', 'MANAGER'), async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const targetName = decodeURIComponent(String(req.params.name)).trim();
+
+  const workspace = await prisma.aicloserWorkspace.findUnique({
+    where: { id: tenantId },
+    select: { settings: true },
+  });
+
+  const settings = (workspace?.settings as Record<string, any>) || {};
+  const labels: Array<{ name: string; color?: string; createdAt?: string }> = Array.isArray(settings.labels)
+    ? settings.labels.filter((l) => l.name.toLowerCase() !== targetName.toLowerCase())
+    : [];
+
+  // Batch update all SalesLeadAssignment records in the tenant to remove the tag
+  const leadsWithTag = await prisma.salesLeadAssignment.findMany({
+    where: { tenantId, tags: { has: targetName } },
+    select: { id: true, tags: true },
+  });
+
+  for (const l of leadsWithTag) {
+    const updatedTags = l.tags.filter((t) => t.toLowerCase() !== targetName.toLowerCase());
+    await prisma.salesLeadAssignment.update({
+      where: { id: l.id },
+      data: { tags: updatedTags },
+    });
+  }
+
+  await prisma.aicloserWorkspace.update({
+    where: { id: tenantId },
+    data: {
+      settings: {
+        ...settings,
+        labels,
+      } as any,
+      updatedAt: new Date(),
+    },
+  });
+
+  res.json({
+    success: true,
+    message: 'Label deleted successfully',
+    deletedName: targetName,
+    affectedLeadsCount: leadsWithTag.length,
     error: null,
   });
 });
