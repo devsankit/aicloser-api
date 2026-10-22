@@ -235,6 +235,7 @@ const listPaymentsQuerySchema = z.object({
 
 const createPaymentSchema = z.object({
   leadId: z.string().optional(),
+  customFields: z.record(z.any()).optional(),
   customerName: z.string().optional(),
   customerPhone: z.string().optional(),
   customerEmail: z.string().email().optional(),
@@ -508,6 +509,12 @@ paymentsRouter.post('/', validateBody(createPaymentSchema), async (req: Request,
       return;
     }
 
+    const effectiveLeadId = body.leadId || (body.customFields as any)?.leadId || lead?.id || null;
+    const paymentCustomFields: Record<string, any> = {
+      ...(typeof body.customFields === 'object' && body.customFields ? body.customFields : {}),
+      ...(effectiveLeadId ? { leadId: effectiveLeadId } : {}),
+    };
+
     const payment = await prisma.upiPaymentLink.create({
       data: {
         tenantId,
@@ -526,7 +533,7 @@ paymentsRouter.post('/', validateBody(createPaymentSchema), async (req: Request,
         customerEmail,
         productName,
         customerNote,
-        customFields: (lead?.id || body.leadId) ? { ...(typeof (body as any).customFields === 'object' && (body as any).customFields ? (body as any).customFields : {}), leadId: lead?.id || body.leadId } : ((body as any).customFields || undefined),
+        customFields: Object.keys(paymentCustomFields).length > 0 ? paymentCustomFields : undefined,
         status: UpiPaymentLinkStatus.PENDING,
       },
     });

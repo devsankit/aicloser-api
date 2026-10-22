@@ -11,10 +11,222 @@ import { requireRoles } from '../../middlewares/rbac.js';
 import { validateBody } from '../../middlewares/validate.js';
 import { logger } from '../../lib/logger.js';
 import { env } from '../../config/env.js';
+import { upsertCompanyLead } from '../../lib/lead-upsert-pipeline.js';
 
 export const integrationsRouter = Router();
 
+// ==========================================
+// Inbound Public Webhooks (No Bearer Auth Required)
+// ==========================================
+
+// POST /justdial/webhook - Inbound webhook for JustDial leads
+integrationsRouter.post('/justdial/webhook', async (req: Request, res: Response) => {
+  try {
+    const tenantId = (
+      req.query.tenantId ||
+      req.query.token ||
+      req.headers['x-tenant-id'] ||
+      req.body?.tenantId
+    ) as string;
+
+    if (!tenantId) {
+      res.status(400).json({ status: 'ERROR', message: 'tenantId is required (via query param, X-Tenant-Id header, or body)' });
+      return;
+    }
+
+    const workspace = await prisma.aicloserWorkspace.findUnique({
+      where: { id: tenantId },
+      select: { id: true },
+    });
+    if (!workspace) {
+      res.status(404).json({ status: 'ERROR', message: 'Workspace not found' });
+      return;
+    }
+
+    const body = req.body || {};
+    const customerName = String(body.lead_name || body.name || body.customerName || body.contact_name || 'JustDial Lead').trim();
+    const customerPhone = String(body.lead_phone || body.mobile || body.phone || body.customerPhone || '').trim();
+    const customerEmail = body.lead_email || body.email || body.customerEmail ? String(body.lead_email || body.email || body.customerEmail).trim() : null;
+    const requirement = String(body.requirement || body.lead_requirement || body.category || body.query || body.notes || '').trim();
+    const area = String(body.area || body.city || body.location || '').trim();
+    const notes = [requirement, area ? `Area: ${area}` : null].filter(Boolean).join(' | ') || 'JustDial Inbound Lead';
+
+    await upsertCompanyLead({
+      tenantId,
+      customerName,
+      customerPhone: customerPhone || null,
+      customerEmail,
+      source: 'JUSTDIAL',
+      notes,
+      customFields: { area, requirement, rawPayload: body },
+    });
+
+    res.status(200).json({ status: 'OK', message: 'JustDial lead processed' });
+  } catch (err) {
+    logger.error('JustDial webhook processing failed', { error: err });
+    res.status(500).json({ status: 'ERROR', message: 'Could not process JustDial lead' });
+  }
+});
+
 integrationsRouter.use(authenticate, enforceTenantIsolation);
+
+// ==========================================
+// IndiaMART Ingestion & Sync APIs
+// ==========================================
+
+const indiamartConfigSchema = z.object({
+  crmKey: z.string().min(1, 'CRM Key is required'),
+  mobileNumber: z.string().optional(),
+  syncIntervalMinutes: z.number().int().positive().optional().default(15),
+  distributionMode: z.enum(['ROUND_ROBIN', 'POOL']).optional().default('ROUND_ROBIN'),
+});
+
+// POST /indiamart/config - Save IndiaMART configuration
+integrationsRouter.post('/indiamart/config', requireRoles('ADMIN', 'SUPER_ADMIN'), validateBody(indiamartConfigSchema), async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const body = req.body as z.infer<typeof indiamartConfigSchema>;
+
+  const workspace = await prisma.aicloserWorkspace.findUnique({
+    where: { id: tenantId },
+    select: { settings: true },
+  });
+  const wsSettings = (workspace?.settings as Record<string, any>) || {};
+  const integrations = wsSettings.integrations || {};
+
+  const updatedSettings = {
+    ...wsSettings,
+    integrations: {
+      ...integrations,
+      indiamart: {
+        crmKey: body.crmKey.trim(),
+        mobileNumber: body.mobileNumber?.trim() || null,
+        syncIntervalMinutes: body.syncIntervalMinutes || 15,
+        distributionMode: body.distributionMode || 'ROUND_ROBIN',
+        updatedAt: new Date().toISOString(),
+      },
+    },
+  };
+
+  await prisma.aicloserWorkspace.update({
+    where: { id: tenantId },
+    data: {
+      settings: updatedSettings as any,
+      updatedAt: new Date(),
+    },
+  });
+
+  res.json({
+    success: true,
+    message: 'IndiaMART configuration saved',
+    error: null,
+  });
+});
+
+// GET /indiamart/config - Retrieve current IndiaMART config with masked CRM key
+integrationsRouter.get('/indiamart/config', requireRoles('ADMIN', 'SUPER_ADMIN'), async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+
+  const workspace = await prisma.aicloserWorkspace.findUnique({
+    where: { id: tenantId },
+    select: { settings: true },
+  });
+  const wsSettings = (workspace?.settings as Record<string, any>) || {};
+  const imConfig = wsSettings.integrations?.indiamart;
+
+  if (!imConfig) {
+    res.json({
+      success: true,
+      data: null,
+      error: null,
+    });
+    return;
+  }
+
+  const rawKey = String(imConfig.crmKey || '');
+  const maskedKey = rawKey.length > 4 ? `***${rawKey.slice(-4)}` : '****';
+
+  res.json({
+    success: true,
+    data: {
+      crmKey: maskedKey,
+      mobileNumber: imConfig.mobileNumber || null,
+      syncIntervalMinutes: imConfig.syncIntervalMinutes || 15,
+      distributionMode: imConfig.distributionMode || 'ROUND_ROBIN',
+      updatedAt: imConfig.updatedAt || null,
+      configured: true,
+    },
+    error: null,
+  });
+});
+
+// POST /indiamart/sync - Trigger IndiaMART lead sync
+integrationsRouter.post('/indiamart/sync', requireRoles('ADMIN', 'SUPER_ADMIN'), async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+
+  const workspace = await prisma.aicloserWorkspace.findUnique({
+    where: { id: tenantId },
+    select: { settings: true },
+  });
+  const wsSettings = (workspace?.settings as Record<string, any>) || {};
+  const imConfig = wsSettings.integrations?.indiamart;
+
+  const payloadLeads = Array.isArray(req.body?.leads) ? req.body.leads : [];
+  let fetchedLeads: any[] = payloadLeads;
+
+  if (fetchedLeads.length === 0 && imConfig?.crmKey) {
+    try {
+      const url = `https://mapi.indiamart.com/wservce/enquiry/crm/v2/?glusr_crm_key=${encodeURIComponent(imConfig.crmKey)}`;
+      const response = await fetch(url, { signal: AbortSignal.timeout(10000) });
+      if (response.ok) {
+        const json = (await response.json()) as any;
+        if (Array.isArray(json?.RESPONSE)) {
+          fetchedLeads = json.RESPONSE;
+        }
+      }
+    } catch (fetchErr) {
+      logger.warn('Failed to fetch from IndiaMART live API, falling back to body payload', { error: String(fetchErr) });
+    }
+  }
+
+  let createdCount = 0;
+  let updatedCount = 0;
+
+  for (const row of fetchedLeads) {
+    const customerName = String(row.SENDER_NAME || row.sender_name || row.customerName || row.name || 'IndiaMART Buyer').trim();
+    const customerPhone = String(row.SENDER_MOBILE || row.sender_mobile || row.customerPhone || row.phone || row.mobile || '').trim();
+    const customerEmail = row.SENDER_EMAIL || row.sender_email || row.customerEmail || row.email ? String(row.SENDER_EMAIL || row.sender_email || row.customerEmail || row.email).trim() : null;
+    const notes = String(row.QUERY_MESSAGE || row.query_message || row.SUBJECT || row.subject || row.notes || 'IndiaMART Inquiry').trim();
+    const serviceInterest = row.PRODUCT_NAME || row.product_name || row.serviceInterest ? String(row.PRODUCT_NAME || row.product_name || row.serviceInterest).trim() : null;
+    const rawBudget = row.ENQ_ORDER_VALUE || row.budgetAmount;
+    const budgetAmount = rawBudget ? Number(rawBudget) : null;
+
+    if (!customerPhone && !customerEmail) continue;
+
+    const result = await upsertCompanyLead({
+      tenantId,
+      customerName,
+      customerPhone: customerPhone || null,
+      customerEmail,
+      source: 'INDIAMART',
+      serviceInterest,
+      budgetAmount,
+      notes,
+      customFields: { rawIndiaMartRow: row },
+    }).catch(() => null);
+
+    if (result?.wasCreated) createdCount++;
+    else if (result?.wasUpdated) updatedCount++;
+  }
+
+  res.json({
+    success: true,
+    createdCount,
+    updatedCount,
+    totalProcessed: fetchedLeads.length,
+    message: `Synced ${createdCount} new leads from IndiaMART`,
+    error: null,
+  });
+});
 
 // ==========================================
 // 1. WhatsApp Official Business API Channels

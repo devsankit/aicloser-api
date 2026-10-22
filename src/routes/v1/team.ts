@@ -562,6 +562,197 @@ const handleInvite = async (req: Request, res: Response) => {
 teamRouter.post('/invite', requirePermissions(PERM_TEAM_MANAGE), validateBody(inviteMemberSchema), handleInvite);
 teamRouter.post('/', requirePermissions(PERM_TEAM_MANAGE), validateBody(inviteMemberSchema), handleInvite);
 
+const breakStartSchema = z.object({
+  durationMinutes: z.number().int().positive().max(240).optional(),
+});
+
+// POST /break/start - Start agent break mode
+teamRouter.post('/break/start', validateBody(breakStartSchema), async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const user = req.user!;
+  const body = req.body as z.infer<typeof breakStartSchema>;
+
+  const workspace = await prisma.aicloserWorkspace.findUnique({
+    where: { id: tenantId },
+    select: { settings: true },
+  });
+  const wsSettings = (workspace?.settings as Record<string, any>) || {};
+  const breakSettings = wsSettings.breakSettings || {};
+  const allowedMinutes = Number(breakSettings.durationMinutes) || 30;
+  const durationMinutes = body.durationMinutes || allowedMinutes;
+
+  const now = Date.now();
+  const breakExpiresAt = new Date(now + durationMinutes * 60 * 1000).toISOString();
+  const breakStartedAt = new Date(now).toISOString();
+
+  // Find agent profile if exists
+  const profile = await prisma.salesAgentProfile.findFirst({
+    where: { userId: user.userId, tenantId },
+  });
+
+  const breakState = {
+    isOnBreak: true,
+    breakStartedAt,
+    breakExpiresAt,
+    durationMinutes,
+  };
+
+  // 1. Update in workspace.settings.activeBreaks
+  const activeBreaks = { ...(wsSettings.activeBreaks || {}) };
+  activeBreaks[user.userId] = breakState;
+  if (profile) {
+    activeBreaks[profile.id] = breakState;
+  }
+
+  await prisma.aicloserWorkspace.update({
+    where: { id: tenantId },
+    data: {
+      settings: {
+        ...wsSettings,
+        activeBreaks,
+      } as any,
+      updatedAt: new Date(),
+    },
+  });
+
+  // 2. Also record in profile permissions if profile exists
+  if (profile) {
+    const perms = (profile.permissions && typeof profile.permissions === 'object' && !Array.isArray(profile.permissions))
+      ? { ...(profile.permissions as Record<string, any>) }
+      : {};
+    perms.activeBreak = breakState;
+    await prisma.salesAgentProfile.update({
+      where: { id: profile.id },
+      data: { permissions: perms as any, updatedAt: new Date() },
+    }).catch(() => undefined);
+  }
+
+  res.json({
+    success: true,
+    isOnBreak: true,
+    breakStartedAt,
+    breakExpiresAt,
+    durationMinutes,
+    remainingSeconds: durationMinutes * 60,
+    message: `Break started for ${durationMinutes} minutes`,
+    error: null,
+  });
+});
+
+// POST /break/end - End active break early
+teamRouter.post('/break/end', async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const user = req.user!;
+
+  const workspace = await prisma.aicloserWorkspace.findUnique({
+    where: { id: tenantId },
+    select: { settings: true },
+  });
+  const wsSettings = (workspace?.settings as Record<string, any>) || {};
+  const activeBreaks = { ...(wsSettings.activeBreaks || {}) };
+
+  const profile = await prisma.salesAgentProfile.findFirst({
+    where: { userId: user.userId, tenantId },
+  });
+
+  delete activeBreaks[user.userId];
+  if (profile) {
+    delete activeBreaks[profile.id];
+  }
+
+  await prisma.aicloserWorkspace.update({
+    where: { id: tenantId },
+    data: {
+      settings: {
+        ...wsSettings,
+        activeBreaks,
+      } as any,
+      updatedAt: new Date(),
+    },
+  });
+
+  if (profile) {
+    const perms = (profile.permissions && typeof profile.permissions === 'object' && !Array.isArray(profile.permissions))
+      ? { ...(profile.permissions as Record<string, any>) }
+      : {};
+    delete perms.activeBreak;
+    await prisma.salesAgentProfile.update({
+      where: { id: profile.id },
+      data: { permissions: perms as any, updatedAt: new Date() },
+    }).catch(() => undefined);
+  }
+
+  res.json({
+    success: true,
+    isOnBreak: false,
+    message: 'Break ended successfully',
+    error: null,
+  });
+});
+
+// GET /break/status - Check current break status (auto-resumes if expired)
+teamRouter.get('/break/status', async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const user = req.user!;
+
+  const workspace = await prisma.aicloserWorkspace.findUnique({
+    where: { id: tenantId },
+    select: { settings: true },
+  });
+  const wsSettings = (workspace?.settings as Record<string, any>) || {};
+  const breakSettings = wsSettings.breakSettings || {};
+  const allowedMinutes = Number(breakSettings.durationMinutes) || 30;
+
+  const activeBreaks = wsSettings.activeBreaks || {};
+  const profile = await prisma.salesAgentProfile.findFirst({
+    where: { userId: user.userId, tenantId },
+  });
+
+  const breakData = activeBreaks[user.userId] || (profile ? activeBreaks[profile.id] : null);
+  const now = Date.now();
+
+  if (breakData && breakData.isOnBreak) {
+    const expTime = breakData.breakExpiresAt ? new Date(breakData.breakExpiresAt).getTime() : 0;
+    if (expTime > now) {
+      const remainingSeconds = Math.max(0, Math.round((expTime - now) / 1000));
+      res.json({
+        success: true,
+        isOnBreak: true,
+        remainingSeconds,
+        breakStartedAt: breakData.breakStartedAt,
+        breakExpiresAt: breakData.breakExpiresAt,
+        allowedMinutes,
+        error: null,
+      });
+      return;
+    } else {
+      // Auto-resume: break expired!
+      const updatedActiveBreaks = { ...activeBreaks };
+      delete updatedActiveBreaks[user.userId];
+      if (profile) delete updatedActiveBreaks[profile.id];
+
+      await prisma.aicloserWorkspace.update({
+        where: { id: tenantId },
+        data: {
+          settings: {
+            ...wsSettings,
+            activeBreaks: updatedActiveBreaks,
+          } as any,
+          updatedAt: new Date(),
+        },
+      }).catch(() => undefined);
+    }
+  }
+
+  res.json({
+    success: true,
+    isOnBreak: false,
+    remainingSeconds: 0,
+    allowedMinutes,
+    error: null,
+  });
+});
+
 // PATCH /:id - Update team member settings (Strictly restricted to team:manage permission)
 teamRouter.patch('/:id', requirePermissions(PERM_TEAM_MANAGE), validateBody(updateAgentSchema), async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;

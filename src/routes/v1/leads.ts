@@ -6,6 +6,7 @@ import { assignLeadToNextCloser } from '../../lib/lead-assignment-engine.js';
 import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import { prisma } from '../../lib/prisma.js';
+import { Prisma } from '@prisma/client';
 import { authenticate } from '../../middlewares/auth.js';
 import { enforceTenantIsolation } from '../../middlewares/tenant-isolation.js';
 import { validateBody, validateQuery } from '../../middlewares/validate.js';
@@ -15,6 +16,7 @@ import { persistApiRealtimeEvent } from '../../lib/realtime.js';
 import { syncMarketingContactForLead, normalizeLeadPhone, deleteContactsAndLinkedLeadsTransactional } from '../../lib/lead-contact-sync.js';
 import { getWorkspaceScope, checkSameReportingTeam } from '../../lib/workspace-scope.js';
 import { getWorkspaceStages } from './stages.js';
+import { syncAndRotatePoolSlots, type MissedLeadRecord } from '../../lib/grab-pool-rotation.js';
 
 export const leadsRouter = Router();
 
@@ -815,16 +817,11 @@ leadsRouter.get('/dashboard-summary', async (req: Request, res: Response) => {
 });
 
 
-// GET /pool - Unassigned leads in the Grab Pool
+// GET /pool - Unassigned leads in the Grab Pool with 10-minute rotation & dynamic capacity
 leadsRouter.get('/pool', async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
-
-  const maxVisibleParam = req.query.maxVisibleToCloser || req.query.limit;
-  const maxVisibleToCloser = maxVisibleParam
-    ? Math.min(50, Math.max(1, isNaN(Number(maxVisibleParam)) ? 5 : Number(maxVisibleParam)))
-    : (req.user?.role === 'SALES_AGENT' ? 5 : 50);
-
   const user = req.user;
+
   const profile = user && (user.role === 'SALES_AGENT' || (user.role as any) === 'CLOSER')
     ? await prisma.salesAgentProfile.findFirst({
         where: { userId: user.userId, tenantId, status: 'ACTIVE' },
@@ -832,22 +829,122 @@ leadsRouter.get('/pool', async (req: Request, res: Response) => {
       })
     : null;
 
-  if ((req.user?.role === 'SALES_AGENT' || (req.user?.role as any) === 'CLOSER') && !profile) {
+  if ((user?.role === 'SALES_AGENT' || (user?.role as any) === 'CLOSER') && !profile) {
     res.json({ success: true, data: [], error: null });
     return;
   }
 
+  // 1. Run slot rotation engine and detect expired / missed pool leads
+  const { slottedPoolLeads, wsSettings } = await syncAndRotatePoolSlots(tenantId, profile?.id);
+
+  // 2. Read dynamic capacity: workspace.settings.roundRobinSettings.maxVisibleToCloser || 5
+  const rrSettings = (wsSettings.roundRobinSettings as Record<string, any>) || {};
+  const configuredCapacity = Number(rrSettings.maxVisibleToCloser) || 5;
+
+  const maxVisibleParam = req.query.maxVisibleToCloser || req.query.limit;
+  const maxVisibleToCloser = maxVisibleParam
+    ? Math.min(50, Math.max(1, isNaN(Number(maxVisibleParam)) ? configuredCapacity : Number(maxVisibleParam)))
+    : (user?.role === 'SALES_AGENT' ? configuredCapacity : 50);
+
+  // 3. Query open pool items
   const poolLeads = await prisma.salesLeadPoolItem.findMany({
     where: {
       tenantId,
       status: 'OPEN',
-      ...(profile ? { OR: [{ assignedAgentId: null }, { assignedAgentId: profile.id }] } : {}),
+      ...(profile ? {
+        OR: [
+          { assignedAgentId: null },
+          { assignedAgentId: profile.id },
+        ],
+      } : {}),
     },
-    take: maxVisibleToCloser,
     orderBy: { createdAt: 'desc' },
   });
 
-  res.json({ success: true, data: poolLeads });
+  const now = Date.now();
+
+  // 4. Filter for sales agents to only show items slotted to them or unslotted
+  const filteredLeads = profile
+    ? poolLeads.filter((item) => {
+        const slot = slottedPoolLeads[item.id];
+        if (!slot) return true;
+        return slot.slottedAgentId === profile.id;
+      })
+    : poolLeads;
+
+  // 5. Clamp to maxVisibleToCloser and attach expiresInSeconds
+  const formattedLeads = filteredLeads.slice(0, maxVisibleToCloser).map((item) => {
+    const slot = slottedPoolLeads[item.id];
+    const slotExpiresAt = slot?.slotExpiresAt || new Date(now + 10 * 60 * 1000).toISOString();
+    const expiresInSeconds = Math.max(0, Math.round((new Date(slotExpiresAt).getTime() - now) / 1000));
+
+    return {
+      ...item,
+      slottedAgentId: slot?.slottedAgentId || null,
+      slotExpiresAt,
+      expiresInSeconds,
+    };
+  });
+
+  res.json({
+    success: true,
+    data: formattedLeads,
+    totalPoolCount: filteredLeads.length,
+    maxVisibleToCloser,
+    error: null,
+  });
+});
+
+// GET /missed - Query missed pool leads with role-based scoping (closer vs admin)
+leadsRouter.get('/missed', async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const user = req.user!;
+  const userRole = user.role;
+  const isSalesAgent = userRole === 'SALES_AGENT' || (userRole as string) === 'CLOSER';
+
+  const profile = isSalesAgent
+    ? await prisma.salesAgentProfile.findFirst({
+        where: { userId: user.userId, tenantId },
+        select: { id: true },
+      })
+    : null;
+
+  const workspace = await prisma.aicloserWorkspace.findUnique({
+    where: { id: tenantId },
+    select: { settings: true },
+  });
+  const wsSettings = (workspace?.settings as Record<string, any>) || {};
+  const allMissedLeads: MissedLeadRecord[] = Array.isArray(wsSettings.missedLeads) ? wsSettings.missedLeads : [];
+
+  if (isSalesAgent) {
+    const myMissed = profile
+      ? allMissedLeads.filter((m) => m.agentId === profile.id)
+      : [];
+
+    res.json({
+      success: true,
+      totalMissed: myMissed.length,
+      myMissed: myMissed.length,
+      items: myMissed,
+      error: null,
+    });
+    return;
+  }
+
+  // Admin / Manager: team-wide breakdown
+  const agentBreakdown: Record<string, number> = {};
+  for (const m of allMissedLeads) {
+    agentBreakdown[m.agentId] = (agentBreakdown[m.agentId] || 0) + 1;
+  }
+
+  res.json({
+    success: true,
+    totalMissed: allMissedLeads.length,
+    myMissed: 0,
+    items: allMissedLeads,
+    agentBreakdown,
+    error: null,
+  });
 });
 
 // POST /pool/auto-distribute - Distribute open pool leads sequentially to active closers with remaining capacity
@@ -2460,6 +2557,186 @@ async function handlePoolClaim(req: Request, res: Response) {
 // and both routes deliberately reuse the same handler/business transaction.
 leadsRouter.post('/pool/:poolItemId/claim', handlePoolClaim);
 leadsRouter.post('/:poolItemId/claim', handlePoolClaim);
+
+const transferLeadSchema = z.object({
+  targetAgentId: z.string().min(1, 'Target agent ID is required'),
+  note: z.string().optional(),
+});
+
+// POST /:id/transfer - Transfer & reassign lead with timeline tracking, activity logging, and conversation update
+leadsRouter.post('/:id/transfer', validateBody(transferLeadSchema), async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const id = String(req.params.id);
+  const { targetAgentId, note } = req.body as z.infer<typeof transferLeadSchema>;
+  const user = req.user!;
+  const userRole = user.role;
+  const isSalesAgent = userRole === 'SALES_AGENT' || (userRole as string) === 'CLOSER';
+
+  const check = await verifyLeadAccess(id, req);
+  if (!check.ok) {
+    res.status(check.status).json({ success: false, error: check.error, message: check.message });
+    return;
+  }
+  const lead = check.lead;
+
+  const workspace = await prisma.aicloserWorkspace.findUnique({
+    where: { id: tenantId },
+    select: { settings: true },
+  });
+  const wsSettings = (workspace?.settings as Record<string, any>) || {};
+
+  if (isSalesAgent && wsSettings.allowAgentLeadReassign === false) {
+    res.status(403).json({
+      success: false,
+      error: 'Lead reassignment is disabled for sales agents in workspace control settings.',
+      message: 'Lead reassignment is disabled for sales agents in workspace control settings.',
+    });
+    return;
+  }
+
+  const targetProfile = await prisma.salesAgentProfile.findFirst({
+    where: {
+      tenantId,
+      status: 'ACTIVE',
+      OR: [
+        { id: targetAgentId },
+        { userId: targetAgentId },
+        { agentCode: targetAgentId },
+      ],
+    },
+    include: {
+      user: { select: { id: true, displayName: true, email: true, phone: true } },
+    },
+  });
+
+  if (!targetProfile) {
+    res.status(400).json({
+      success: false,
+      error: 'InvalidAgent',
+      message: 'Target agent not found or inactive in this workspace',
+    });
+    return;
+  }
+
+  const roleUpper = String(userRole || '').toUpperCase();
+  if (wsSettings.leadAssignmentScope === 'REPORTING_TEAM_ONLY' && roleUpper !== 'ADMIN' && roleUpper !== 'SUPER_ADMIN') {
+    const isSameTeam = await checkSameReportingTeam(tenantId, user.userId, targetProfile.id);
+    if (!isSameTeam) {
+      res.status(403).json({
+        success: false,
+        error: 'Lead reassignment is restricted to your direct reporting team under workspace governance policy.',
+        message: 'Lead reassignment is restricted to your direct reporting team under workspace governance policy.',
+      });
+      return;
+    }
+  }
+
+  const updatedLead = await prisma.salesLeadAssignment.update({
+    where: { id: lead.id },
+    data: {
+      assignedAgentId: targetProfile.id,
+      updatedAt: new Date(),
+    },
+    include: {
+      assignedAgent: {
+        select: {
+          id: true,
+          agentCode: true,
+          userId: true,
+          user: { select: { id: true, displayName: true, email: true, phone: true } },
+        },
+      },
+    },
+  });
+
+  const conv = lead.conversationId
+    ? await prisma.appConversation.findFirst({
+        where: { id: lead.conversationId, tenantId },
+      })
+    : await prisma.appConversation.findFirst({
+        where: {
+          tenantId,
+          OR: [
+            ...(lead.customerPhone ? [{ customerPhone: lead.customerPhone }] : []),
+            ...(normalizeLeadPhone(lead.customerPhone) ? [{ customerPhone: normalizeLeadPhone(lead.customerPhone)! }] : []),
+            { payload: { path: ['leadId'], equals: lead.id } },
+          ],
+        },
+      });
+
+  if (conv) {
+    const payload = (conv.payload && typeof conv.payload === 'object' && !Array.isArray(conv.payload))
+      ? { ...(conv.payload as Record<string, any>) }
+      : {};
+    payload.assignedTo = targetProfile.user?.displayName || targetProfile.agentCode;
+    await prisma.appConversation.update({
+      where: { id: conv.id },
+      data: {
+        assignedFreelancerId: targetProfile.id,
+        assignedFreelancerName: targetProfile.user?.displayName || targetProfile.agentCode,
+        payload: payload as unknown as Prisma.InputJsonValue,
+        updatedAt: new Date(),
+      },
+    }).catch(() => undefined);
+  }
+
+  // Symmetrically synchronize MarketingContact
+  await syncMarketingContactForLead(updatedLead).catch(() => undefined);
+
+  const targetName = targetProfile.user?.displayName || targetProfile.agentCode || 'Teammate';
+  const reasonText = note ? ` Reason: ${note}` : ' Reason: Manual handoff';
+
+  await prisma.salesLeadTimelineEntry.create({
+    data: {
+      tenantId,
+      leadId: lead.id,
+      userId: user.userId,
+      agentId: targetProfile.id,
+      type: 'LEAD_TRANSFERRED',
+      body: `Lead transferred to ${targetName}.${reasonText}`,
+      metadata: { fromUserId: user.userId, toAgentId: targetProfile.id, note: note || null },
+    },
+  }).catch(() => undefined);
+
+  await prisma.salesActivityLog.create({
+    data: {
+      tenantId,
+      assignmentId: lead.id,
+      actorUserId: user.userId,
+      action: 'LEAD_REASSIGNED',
+      note: `Lead transferred to ${targetName}.${reasonText}`,
+      metadata: { fromUserId: user.userId, toAgentId: targetProfile.id, note: note || null },
+    },
+  }).catch(() => undefined);
+
+  await persistApiRealtimeEvent({
+    tenantId,
+    eventType: 'lead.transferred',
+    payload: {
+      leadId: lead.id,
+      fromAgentId: lead.assignedAgentId,
+      toAgentId: targetProfile.id,
+      targetAgentName: targetName,
+      note: note || null,
+    },
+    actorUserId: user.userId,
+  }).catch(() => undefined);
+
+  await persistApiRealtimeEvent({
+    tenantId,
+    eventType: 'lead.updated',
+    payload: { leadId: lead.id, assignedAgentId: targetProfile.id },
+    actorUserId: user.userId,
+  }).catch(() => undefined);
+
+  res.json({
+    success: true,
+    lead: updatedLead,
+    message: `Lead successfully transferred to ${targetName}`,
+    error: null,
+  });
+});
+
 
 // GET /:id/notes - Get internal notes for a lead
 leadsRouter.get('/:id/notes', async (req: Request, res: Response) => {
