@@ -87,7 +87,13 @@ export async function checkSameReportingTeam(
       tenantId,
       status: { not: 'SUSPENDED' },
     },
-    select: { id: true, userId: true, parentAgentId: true, groupId: true },
+    select: {
+      id: true,
+      userId: true,
+      parentAgentId: true,
+      groupId: true,
+      user: { select: { role: true } },
+    },
   });
 
   const requester = profiles.find(
@@ -99,6 +105,16 @@ export async function checkSameReportingTeam(
 
   if (!requester || !target) return false;
   if (requester.id === target.id) return true;
+
+  // Leadership (Admins and Managers) can always participate in conversation sharing
+  const targetRole = String(target.user?.role || '').toUpperCase();
+  if (targetRole === 'ADMIN' || targetRole === 'SUPER_ADMIN' || targetRole === 'MANAGER') {
+    return true;
+  }
+  const requesterRole = String(requester.user?.role || '').toUpperCase();
+  if (requesterRole === 'ADMIN' || requesterRole === 'SUPER_ADMIN' || requesterRole === 'MANAGER') {
+    return true;
+  }
 
   // 1. Same group
   if (requester.groupId && target.groupId && requester.groupId === target.groupId) {
@@ -112,6 +128,11 @@ export async function checkSameReportingTeam(
 
   // 3. Direct manager-subordinate relationship
   if (requester.id === target.parentAgentId || target.id === requester.parentAgentId) {
+    return true;
+  }
+
+  // 4. Default unassigned flat hierarchy fallback: if neither agent has a designated manager, they are peer closers in the same workspace
+  if (!requester.parentAgentId && !target.parentAgentId) {
     return true;
   }
 
