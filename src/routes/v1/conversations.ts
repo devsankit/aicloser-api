@@ -2015,11 +2015,16 @@ conversationsRouter.post('/:id/shares', validateBody(createShareSchema), async (
     return;
   }
 
-  // Resolve target user in this tenant (can be profile ID or user ID)
-  const targetAgentProfile = await prisma.salesAgentProfile.findFirst({
+  // Resolve target user in this tenant (can be profile ID, user ID, display name, or email)
+  let targetAgentProfile = await prisma.salesAgentProfile.findFirst({
     where: {
       tenantId,
-      OR: [{ id: targetUserParam }, { userId: targetUserParam }],
+      OR: [
+        { id: targetUserParam },
+        { userId: targetUserParam },
+        { user: { displayName: { equals: targetUserParam, mode: 'insensitive' } } },
+        { user: { email: { equals: targetUserParam, mode: 'insensitive' } } },
+      ],
     },
     include: {
       user: { select: { id: true, displayName: true, email: true, role: true } },
@@ -2033,7 +2038,14 @@ conversationsRouter.post('/:id/shares', validateBody(createShareSchema), async (
 
   if (!targetUserId) {
     const targetUser = await prisma.appAuthUser.findFirst({
-      where: { id: targetUserParam, tenantId },
+      where: {
+        tenantId,
+        OR: [
+          { id: targetUserParam },
+          { displayName: { equals: targetUserParam, mode: 'insensitive' } },
+          { email: { equals: targetUserParam, mode: 'insensitive' } },
+        ],
+      },
       select: { id: true, displayName: true, email: true, role: true },
     });
     if (!targetUser) {

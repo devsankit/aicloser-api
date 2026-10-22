@@ -4,7 +4,7 @@ import { z } from 'zod';
 import { prisma } from '../../lib/prisma.js';
 import { authenticate } from '../../middlewares/auth.js';
 import { enforceTenantIsolation } from '../../middlewares/tenant-isolation.js';
-import { requirePermissions, requireRoles, PERM_TEAM_VIEW, PERM_TEAM_MANAGE } from '../../middlewares/rbac.js';
+import { requirePermissions, requireRoles, hasPermission, PERM_TEAM_VIEW, PERM_TEAM_MANAGE } from '../../middlewares/rbac.js';
 import { validateBody } from '../../middlewares/validate.js';
 import { SalesAgentStatus } from '@prisma/client';
 
@@ -127,8 +127,8 @@ teamRouter.get('/me', async (req: Request, res: Response) => {
   });
 });
 
-// GET / - List team members (Restricted to team:view permission - ADMIN and MANAGER by default)
-teamRouter.get('/', requirePermissions(PERM_TEAM_VIEW), async (req: Request, res: Response) => {
+// GET / - List team members (Workspace roster open to all workspace members; detailed metrics restricted to team:view)
+teamRouter.get('/', async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const user = req.user!;
   const statusQuery = typeof req.query.status === 'string' ? req.query.status.trim().toUpperCase() : undefined;
@@ -145,7 +145,7 @@ teamRouter.get('/', requirePermissions(PERM_TEAM_VIEW), async (req: Request, res
     whereClause.user = { role: { notIn: ['SUPER_ADMIN', 'ADMIN'] } };
   }
 
-  const [workspace, profiles, paymentLinks] = await Promise.all([
+  const [workspace, profiles, paymentLinks, authUsers] = await Promise.all([
     prisma.aicloserWorkspace.findUnique({
       where: { id: tenantId },
       select: { id: true, name: true },
@@ -187,9 +187,24 @@ teamRouter.get('/', requirePermissions(PERM_TEAM_VIEW), async (req: Request, res
         totalAmount: true,
       },
     }),
+    prisma.appAuthUser.findMany({
+      where: {
+        tenantId,
+        role: { in: ['ADMIN', 'MANAGER'] },
+      },
+      select: {
+        id: true,
+        displayName: true,
+        email: true,
+        phone: true,
+        role: true,
+        createdAt: true,
+      },
+    }),
   ]);
 
   const canSeeCommissions = user.role === 'SUPER_ADMIN' || user.role === 'ADMIN';
+  const canSeeTeamMetrics = user.role === 'SUPER_ADMIN' || user.role === 'ADMIN' || await hasPermission(user.userId, tenantId, user.role, PERM_TEAM_VIEW);
 
   let filteredProfiles = profiles;
   if (assignableQuery) {
@@ -200,18 +215,25 @@ teamRouter.get('/', requirePermissions(PERM_TEAM_VIEW), async (req: Request, res
   }
 
   const team = filteredProfiles.map((p) => {
-    // Real Pipeline Value: sum of payment URLs shared with leads where payment is NOT received yet (PENDING / CUSTOMER_CONFIRMED)
-    const memberLinks = paymentLinks.filter(
-      (pl) => pl.createdByUserId === p.user.id || pl.createdByUserId === p.id
-    );
-    const pendingLinks = memberLinks.filter(
-      (pl) => pl.status === 'PENDING' || pl.status === 'CUSTOMER_CONFIRMED'
-    );
-    const paidLinks = memberLinks.filter((pl) => pl.status === 'PAID');
+    let pipelineValue = 0;
+    let dealsWon = 0;
+    let wonAmount = 0;
+    let pendingPaymentsCount = 0;
 
-    const pipelineValue = pendingLinks.reduce((sum, pl) => sum + Number(pl.totalAmount || 0), 0);
-    const dealsWon = paidLinks.length;
-    const wonAmount = paidLinks.reduce((sum, pl) => sum + Number(pl.totalAmount || 0), 0);
+    if (canSeeTeamMetrics || p.userId === user.userId) {
+      const memberLinks = paymentLinks.filter(
+        (pl) => pl.createdByUserId === p.user.id || pl.createdByUserId === p.id
+      );
+      const pendingLinks = memberLinks.filter(
+        (pl) => pl.status === 'PENDING' || pl.status === 'CUSTOMER_CONFIRMED'
+      );
+      const paidLinks = memberLinks.filter((pl) => pl.status === 'PAID');
+
+      pipelineValue = pendingLinks.reduce((sum, pl) => sum + Number(pl.totalAmount || 0), 0);
+      dealsWon = paidLinks.length;
+      wonAmount = paidLinks.reduce((sum, pl) => sum + Number(pl.totalAmount || 0), 0);
+      pendingPaymentsCount = pendingLinks.length;
+    }
 
     return {
       id: p.id,
@@ -235,14 +257,46 @@ teamRouter.get('/', requirePermissions(PERM_TEAM_VIEW), async (req: Request, res
       } : null,
       permissions: p.permissions,
       assignedLeadsCount: p._count.leadAssignments,
-      callsCount: p._count.mobileCalls,
+      callsCount: canSeeTeamMetrics ? p._count.mobileCalls : 0,
       pipelineValue,
       dealsWon,
       wonAmount,
-      pendingPaymentsCount: pendingLinks.length,
+      pendingPaymentsCount,
       createdAt: p.createdAt,
     };
   });
+
+  // Guarantee that Workspace Admins / Managers in AppAuthUser who may not have a SalesAgentProfile record yet are included in roster lookup
+  if (!assignableQuery) {
+    const existingUserIds = new Set(team.map((m) => m.userId));
+    for (const au of authUsers) {
+      if (!existingUserIds.has(au.id)) {
+        team.push({
+          id: au.id,
+          userId: au.id,
+          displayName: au.displayName,
+          email: au.email,
+          phone: au.phone,
+          role: au.role,
+          agentCode: 'ADMIN',
+          status: 'ACTIVE' as SalesAgentStatus,
+          commissionPercent: undefined,
+          canClaimLeads: false,
+          maxActiveLeads: 0,
+          parentAgentId: null,
+          reportingManager: null,
+          permissions: {},
+          assignedLeadsCount: 0,
+          callsCount: 0,
+          pipelineValue: 0,
+          dealsWon: 0,
+          wonAmount: 0,
+          pendingPaymentsCount: 0,
+          createdAt: au.createdAt,
+        });
+      }
+    }
+  }
 
   res.json({
     success: true,
