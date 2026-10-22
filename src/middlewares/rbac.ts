@@ -37,20 +37,24 @@ export async function hasPermission(
       const perms = profile.permissions && typeof profile.permissions === 'object'
         ? profile.permissions as Record<string, boolean>
         : {};
-      if (Object.prototype.hasOwnProperty.call(perms, permission)) {
-        return perms[permission] === true;
-      }
+      const altKey = permission.includes(':') ? permission.replace(/:/g, '_') : permission.replace(/_/g, ':');
+      if (Object.prototype.hasOwnProperty.call(perms, permission)) return perms[permission] === true;
+      if (Object.prototype.hasOwnProperty.call(perms, altKey)) return perms[altKey] === true;
 
       // Backward-compatible defaults for profiles created before the matrix
       // was persisted. The legacy claim flag remains a fallback only for the
       // lead-claim permission.
       const workspace = await prisma.aicloserWorkspace.findUnique({ where: { id: tenantId }, select: { settings: true } });
       const rolePermissions = (workspace?.settings as { rolePermissions?: Record<string, Record<string, boolean>> } | null)?.rolePermissions?.[role];
-      if (rolePermissions && Object.prototype.hasOwnProperty.call(rolePermissions, permission)) return rolePermissions[permission] === true;
+      if (rolePermissions) {
+        if (Object.prototype.hasOwnProperty.call(rolePermissions, permission)) return rolePermissions[permission] === true;
+        if (Object.prototype.hasOwnProperty.call(rolePermissions, altKey)) return rolePermissions[altKey] === true;
+      }
       if (permission === PERM_LEADS_CLAIM) return profile.canClaimLeads;
       if (permission === PERM_TEAM_MANAGE) return role === 'MANAGER';
       if (permission === PERM_LEADS_REASSIGN) return true;
-      if (permission === PERM_TEAM_VIEW || permission === 'payouts:approve') return role === 'MANAGER';
+      if (permission === 'payouts:approve') return role === 'MANAGER';
+      if (permission === PERM_TEAM_VIEW) return true;
       if (permission === PERM_CONTACTS_VIEW) return true;
       return true;
     }

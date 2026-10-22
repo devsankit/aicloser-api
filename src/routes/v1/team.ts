@@ -134,7 +134,10 @@ teamRouter.get('/', requirePermissions(PERM_TEAM_VIEW), async (req: Request, res
   const statusQuery = typeof req.query.status === 'string' ? req.query.status.trim().toUpperCase() : undefined;
   const assignableQuery = String(req.query.assignable ?? '').trim().toLowerCase() === 'true';
 
-  const whereClause: any = { tenantId };
+  const whereClause: any = {
+    tenantId,
+    user: { role: { notIn: ['SUPER_ADMIN'] } },
+  };
   if (statusQuery) {
     whereClause.status = statusQuery as SalesAgentStatus;
   } else if (assignableQuery) {
@@ -753,6 +756,69 @@ teamRouter.get('/break/status', async (req: Request, res: Response) => {
   });
 });
 
+// GET /break/team - List team members currently on break (for Admin / Manager monitoring)
+teamRouter.get('/break/team', async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  try {
+    const workspace = await prisma.aicloserWorkspace.findUnique({
+      where: { id: tenantId },
+      select: { settings: true },
+    });
+    const wsSettings = (workspace?.settings as any) || {};
+    const activeBreaks = wsSettings.activeBreaks || {};
+    const now = Date.now();
+    const onBreakList: Array<{
+      userId: string;
+      name: string;
+      remainingSeconds: number;
+      breakStartedAt?: string;
+      breakExpiresAt: string;
+    }> = [];
+
+    const userIds = Object.keys(activeBreaks);
+    if (userIds.length > 0) {
+      const users = await prisma.user.findMany({
+        where: { id: { in: userIds }, tenantId },
+        select: { id: true, displayName: true, email: true },
+      });
+      const userMap = new Map(users.map((u) => [u.id, u.displayName || u.email]));
+
+      for (const [uid, bData] of Object.entries<any>(activeBreaks)) {
+        if (bData && bData.isOnBreak) {
+          const expTime = bData.breakExpiresAt ? new Date(bData.breakExpiresAt).getTime() : 0;
+          if (expTime > now) {
+            const remainingSeconds = Math.max(0, Math.floor((expTime - now) / 1000));
+            const name = userMap.get(uid) || "Sales Agent";
+            if (!onBreakList.some((item) => item.userId === uid || item.name === name)) {
+              onBreakList.push({
+                userId: uid,
+                name,
+                remainingSeconds,
+                breakStartedAt: bData.breakStartedAt,
+                breakExpiresAt: bData.breakExpiresAt,
+              });
+            }
+          }
+        }
+      }
+    }
+
+    res.json({
+      success: true,
+      activeBreaks: onBreakList,
+      totalOnBreak: onBreakList.length,
+    });
+  } catch (err: any) {
+    res.status(500).json({
+      success: false,
+      error: 'TeamBreakFetchFailed',
+      message: err.message,
+      activeBreaks: [],
+      totalOnBreak: 0,
+    });
+  }
+});
+
 // PATCH /:id - Update team member settings (Strictly restricted to team:manage permission)
 teamRouter.patch('/:id', requirePermissions(PERM_TEAM_MANAGE), validateBody(updateAgentSchema), async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
@@ -907,20 +973,38 @@ teamRouter.patch('/:id', requirePermissions(PERM_TEAM_MANAGE), validateBody(upda
 // GET /permissions/matrix - Get system permissions catalog and default role templates
 teamRouter.get('/permissions/matrix', async (req: Request, res: Response) => {
   const permissionsCatalog = [
-    { key: 'leads:view', label: 'View Leads', category: 'CRM' },
-    { key: 'contacts:view', label: 'View Contacts', category: 'CRM' },
-    { key: 'leads:create', label: 'Create Leads', category: 'CRM' },
-    { key: 'leads:claim', label: 'Claim Pool Leads', category: 'CRM' },
-    { key: 'leads:reassign', label: 'Reassign Leads', category: 'CRM' },
-    { key: 'calls:view', label: 'View Calls & Logs', category: 'Calls' },
-    { key: 'calls:playback', label: 'Play Audio Recordings', category: 'Calls' },
-    { key: 'chat:view', label: 'View Conversations', category: 'Chat' },
-    { key: 'chat:send', label: 'Send WhatsApp Messages', category: 'Chat' },
-    { key: 'payouts:view', label: 'View Own Payouts', category: 'Finance' },
-    { key: 'payouts:approve', label: 'Approve Team Payouts', category: 'Finance' },
-    { key: 'team:view', label: 'View Team Members', category: 'Team' },
-    { key: 'team:manage', label: 'Manage Closers & Hierarchy', category: 'Team' },
-    { key: 'customer:unmask_phone', label: 'Unmask Customer Phone Numbers', category: 'Security' },
+    // CRM & Leads
+    { key: 'leads:view', label: 'View Leads & Pipeline', category: 'Leads & Pipeline', description: 'Access workspace leads and Kanban stages' },
+    { key: 'contacts:view', label: 'View Contacts Directory', category: 'Leads & Pipeline', description: 'Access contacts list with deduplication' },
+    { key: 'leads:create', label: 'Create Manual Leads', category: 'Leads & Pipeline', description: 'Add new prospective leads into pipeline' },
+    { key: 'leads:claim', label: 'Claim Pool Leads', category: 'Leads & Pipeline', description: 'Grab unassigned leads within 10-minute rotation slot' },
+    { key: 'leads:reassign', label: 'Reassign & Transfer Leads', category: 'Leads & Pipeline', description: 'Transfer lead ownership and thread context' },
+    { key: 'leads:export', label: 'Export Leads (.xlsx)', category: 'Leads & Pipeline', description: 'Download client contact spreadsheets' },
+    { key: 'leads:delete', label: 'Soft-Delete to Recycle Bin', category: 'Leads & Pipeline', description: 'Move inactive leads into recycle bin' },
+    { key: 'leads:permanent_delete', label: 'Permanently Purge Leads', category: 'Leads & Pipeline', description: 'Permanently remove leads from database' },
+
+    // Telephony & SIM Relays
+    { key: 'calls:view', label: 'View Calls & Logs', category: 'Telephony & SIM', description: 'Inspect telephony call duration and timestamps' },
+    { key: 'calls:playback', label: 'Play Audio Recordings', category: 'Telephony & SIM', description: 'Stream recorded phone calls and AI transcripts' },
+    { key: 'telephony:make_call', label: 'Trigger SIM Phone Calls', category: 'Telephony & SIM', description: 'Initiate outbound calls via Android companion relay' },
+
+    // Omnichannel Chat & WhatsApp
+    { key: 'chat:view', label: 'View Conversations', category: 'Omnichannel Chat', description: 'Read live customer WhatsApp and Instagram threads' },
+    { key: 'chat:send', label: 'Send WhatsApp Messages', category: 'Omnichannel Chat', description: 'Reply to client messages and send attachments' },
+    { key: 'chat:share', label: 'Share Chat with Teammates', category: 'Omnichannel Chat', description: 'Grant internal chat visibility to teammates' },
+    { key: 'whatsapp:marketing', label: 'Broadcast Bulk Campaigns', category: 'Omnichannel Chat', description: 'Send approved WhatsApp marketing templates' },
+
+    // Finance & Payments
+    { key: 'payments:create', label: 'Generate UPI Payment Links', category: 'Payments & Revenue', description: 'Create dynamic QR payment links for leads' },
+    { key: 'payments:settle', label: 'Approve & Settle Payments', category: 'Payments & Revenue', description: 'Verify payment proofs and close deals won' },
+    { key: 'payouts:view', label: 'View Own Commissions', category: 'Payments & Revenue', description: 'Inspect earned commissions and payout status' },
+    { key: 'payouts:approve', label: 'Approve Team Payouts', category: 'Payments & Revenue', description: 'Authorize sales commission payouts' },
+
+    // Workspace Governance & Integrations
+    { key: 'team:view', label: 'View Team Directory', category: 'Workspace Governance', description: 'View teammates, online status and availability' },
+    { key: 'team:manage', label: 'Manage Team & Roles', category: 'Workspace Governance', description: 'Invite team members and adjust permissions' },
+    { key: 'integrations:manage', label: 'Manage Ingestion Gateways', category: 'Workspace Governance', description: 'Configure IndiaMART, JustDial and webhooks' },
+    { key: 'customer:unmask_phone', label: 'Unmask Customer Numbers', category: 'Workspace Governance', description: 'View raw unmasked customer phone numbers' },
   ];
 
   const roleDefaults = {
@@ -931,14 +1015,23 @@ teamRouter.get('/permissions/matrix', async (req: Request, res: Response) => {
       'leads:create': true,
       'leads:claim': true,
       'leads:reassign': true,
+      'leads:export': true,
+      'leads:delete': true,
+      'leads:permanent_delete': false,
       'calls:view': true,
       'calls:playback': true,
+      'telephony:make_call': true,
       'chat:view': true,
       'chat:send': true,
+      'chat:share': true,
+      'whatsapp:marketing': true,
+      'payments:create': true,
+      'payments:settle': true,
       'payouts:view': true,
       'payouts:approve': true,
       'team:view': true,
-      'team:manage': true,
+      'team:manage': false,
+      'integrations:manage': false,
       'customer:unmask_phone': true,
     },
     SALES_AGENT: {
@@ -947,14 +1040,23 @@ teamRouter.get('/permissions/matrix', async (req: Request, res: Response) => {
       'leads:create': true,
       'leads:claim': true,
       'leads:reassign': false,
+      'leads:export': false,
+      'leads:delete': false,
+      'leads:permanent_delete': false,
       'calls:view': true,
-      'calls:playback': true,
+      'calls:playback': false,
+      'telephony:make_call': true,
       'chat:view': true,
       'chat:send': true,
+      'chat:share': true,
+      'whatsapp:marketing': false,
+      'payments:create': true,
+      'payments:settle': false,
       'payouts:view': true,
       'payouts:approve': false,
-      'team:view': false,
+      'team:view': true,
       'team:manage': false,
+      'integrations:manage': false,
       'customer:unmask_phone': false,
     },
   };
@@ -981,7 +1083,11 @@ const matrixBodySchema = z.union([
 teamRouter.put('/permissions/matrix', requireRoles('ADMIN', 'SUPER_ADMIN'), validateBody(matrixBodySchema), async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const rawBody = req.body as any;
-  const roles: Record<string, Record<string, any>> = (rawBody && 'roles' in rawBody && rawBody.roles) ? rawBody.roles : rawBody;
+  let roles: Record<string, Record<string, any>> = (rawBody && 'roles' in rawBody && rawBody.roles) ? rawBody.roles : rawBody;
+  // Handle double wrapping if passed as { roles: { roles: ... } }
+  if (roles && 'roles' in roles && typeof (roles as any).roles === 'object') {
+    roles = (roles as any).roles;
+  }
   await prisma.$transaction(async (tx) => {
     const workspace = await tx.aicloserWorkspace.findUniqueOrThrow({ where: { id: tenantId }, select: { settings: true } });
     const settings = (workspace.settings as Record<string, unknown>) || {};

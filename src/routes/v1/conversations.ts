@@ -1452,22 +1452,30 @@ const handleAssignConversation = async (req: Request, res: Response) => {
     return;
   }
 
-  // Personal QR line isolation check:
-  // Personal WhatsApp QR scanned chats are isolated to the closer.
-  // Sales agents cannot reassign them. Only ADMIN or SUPER_ADMIN can rotate / reassign QR chats.
   const convPayload = (conversation.payload as Record<string, unknown>) || {};
-  const isConvQr =
-    conversation.serviceSlug === 'manual-chat' ||
-    String(convPayload.externalSourceType || '').includes('whatsapp_personal') ||
-    String(convPayload.externalSourceType || '').includes('whatsapp_business') ||
-    Boolean(convPayload.scannedByUserId || convPayload.scannedByName || convPayload.deviceSessionId);
 
-  if (isConvQr && user.role !== 'ADMIN' && user.role !== 'SUPER_ADMIN') {
+  // Find calling user's agent profile to verify ownership/assignment
+  const agentProfileSelf = await prisma.salesAgentProfile.findFirst({
+    where: { tenantId, userId: user.userId },
+    select: { id: true },
+  });
+
+  const isOwnerOrAssigned =
+    user.role === 'ADMIN' ||
+    user.role === 'SUPER_ADMIN' ||
+    conversation.assignedFreelancerId === user.userId ||
+    (agentProfileSelf && conversation.assignedFreelancerId === agentProfileSelf.id) ||
+    convPayload.scannedByUserId === user.userId ||
+    (convPayload.scannedByName && convPayload.scannedByName === user.displayName) ||
+    !conversation.assignedFreelancerId ||
+    conversation.assignedFreelancerId === 'Unassigned';
+
+  if (!isOwnerOrAssigned) {
     res.status(403).json({
       success: false,
       code: 'PERMISSION_DENIED',
       error: 'PermissionDenied',
-      message: 'Personal WhatsApp QR scanned chats are strictly isolated to the closer and cannot be reassigned by sales agents. Only workspace Admins have authority to rotate or reassign QR chats.',
+      message: 'You can only reassign conversations assigned to you or acquired through your line.',
     });
     return;
   }
@@ -1543,7 +1551,19 @@ const handleAssignConversation = async (req: Request, res: Response) => {
     return;
   }
 
-  // 4. Verify agent status is ACTIVE (auto-activate if needed)
+  // 4. Verify target agent role: Super Admin and Company Admin are executive/platform roles and cannot be assigned front-line customer conversations
+  const targetUserRole = String(agentProfile.user?.role || '').toUpperCase();
+  if (targetUserRole === 'SUPER_ADMIN' || targetUserRole.includes('SUPER') || targetUserRole === 'ADMIN') {
+    res.status(403).json({
+      success: false,
+      code: 'ADMIN_ASSIGNMENT_FORBIDDEN',
+      error: 'AdminAssignmentForbidden',
+      message: 'Super Admin and Company Admin are executive/platform roles and cannot be assigned front-line customer conversations.',
+    });
+    return;
+  }
+
+  // 5. Verify agent status is ACTIVE (auto-activate if needed)
   if (agentProfile.status !== 'ACTIVE') {
     await prisma.salesAgentProfile.update({
       where: { id: agentProfile.id },
@@ -1555,7 +1575,23 @@ const handleAssignConversation = async (req: Request, res: Response) => {
   const assignedFreelancerId = agentProfile.id;
   const assignedFreelancerName = agentProfile.user?.displayName || agentProfile.agentCode || 'Team Closer';
 
-  // Update conversation
+  // Persist assignment note as a permanent system message in the conversation thread
+  const actorName = user.displayName || user.email || 'Admin';
+  const handoverNote = (req.body as any)?.note ? ` (${(req.body as any).note})` : '';
+  const nowIso = new Date().toISOString();
+  const assignSysMessage = {
+    id: `msg-sys-assign-${randomUUID()}`,
+    body: `Chat assigned to ${assignedFreelancerName} by ${actorName}${handoverNote}`,
+    senderRole: 'system',
+    senderLabel: 'System',
+    senderType: 'SYSTEM',
+    status: 'delivered',
+    createdAt: nowIso,
+  };
+
+  const rawMessages = Array.isArray(convPayload.messages) ? (convPayload.messages as any[]) : [];
+  rawMessages.push(assignSysMessage);
+  convPayload.messages = rawMessages;
   convPayload.assignedTo = assignedFreelancerName;
   convPayload.assignedFreelancerId = assignedFreelancerId;
   convPayload.assignedAgentId = assignedFreelancerId;
@@ -1570,37 +1606,62 @@ const handleAssignConversation = async (req: Request, res: Response) => {
     },
   });
 
-  // Also update linked lead
+  // Also update linked lead & create timeline entry for Command History
+  const leadIdFromPayload = (convPayload as any)?.leadId;
   const linkedLead = await prisma.salesLeadAssignment.findFirst({
     where: {
       tenantId,
       OR: [
+        ...(leadIdFromPayload ? [{ id: leadIdFromPayload }] : []),
         { conversationId: id },
         ...phoneMatchConditions([conversation.customerPhone]),
       ],
     },
-    select: { id: true, assignedAgentId: true },
-  });
-
-  await prisma.salesLeadAssignment.updateMany({
-    where: {
-      tenantId,
-      OR: [
-        { conversationId: id },
-        ...phoneMatchConditions([conversation.customerPhone]),
-      ],
-    },
-    data: { assignedAgentId: assignedFreelancerId },
+    select: { id: true, assignedAgentId: true, customFields: true },
   });
 
   if (linkedLead) {
+    const updatedCustomFields = {
+      ...((linkedLead.customFields as Record<string, any>) || {}),
+      owner: assignedFreelancerName,
+      assignedAgentName: assignedFreelancerName,
+    };
+
+    await prisma.salesLeadAssignment.update({
+      where: { id: linkedLead.id },
+      data: {
+        assignedAgentId: assignedFreelancerId,
+        conversationId: id,
+        customFields: updatedCustomFields,
+      },
+    });
+
+    // Create salesLeadTimelineEntry so it appears in Command History & Notes!
+    await prisma.salesLeadTimelineEntry.create({
+      data: {
+        tenantId,
+        leadId: linkedLead.id,
+        userId: user.userId,
+        agentId: assignedFreelancerId,
+        type: 'LEAD_REASSIGNED',
+        body: `Lead transferred to ${assignedFreelancerName} by ${actorName}${handoverNote}`,
+        metadata: {
+          fromUserId: user.userId,
+          toAgentId: assignedFreelancerId,
+          conversationId: id,
+          note: (req.body as any)?.note || null,
+        },
+      },
+    }).catch((e) => console.error('Failed to create timeline entry:', e));
+
+    // Create salesActivityLog for audit trail
     await prisma.salesActivityLog.create({
       data: {
         tenantId,
         assignmentId: linkedLead.id,
         actorUserId: user.userId,
         action: 'LEAD_REASSIGNED',
-        note: `Lead assigned to ${assignedFreelancerName}`,
+        note: `Lead transferred to ${assignedFreelancerName} by ${actorName}${handoverNote}`,
         metadata: { previousAgentId: linkedLead.assignedAgentId, newAgentId: assignedFreelancerId, conversationId: id },
       },
     }).catch(() => undefined);

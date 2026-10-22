@@ -267,10 +267,30 @@ webhooksRouter.post(['/meta', '/whatsapp', '/whatsapp-marketing'], verifyWebhook
           });
 
           if (campRecip) {
-            await prisma.whatsAppCampaign.update({
-              where: { id: campRecip.campaignId },
-              data: {
-                repliedCount: { increment: 1 },
+            await prisma.$transaction([
+              prisma.whatsAppCampaign.update({
+                where: { id: campRecip.campaignId },
+                data: { repliedCount: { increment: 1 } },
+              }),
+              prisma.whatsAppCampaignRecipient.update({
+                where: { id: campRecip.id },
+                data: { status: 'READ' },
+              }),
+            ]).catch(() => undefined);
+
+            // Hook point for future AI Automation on campaign replies
+            await persistApiRealtimeEvent({
+              tenantId,
+              eventType: 'campaign.replied',
+              payload: {
+                campaignId: campRecip.campaignId,
+                recipientId: campRecip.id,
+                customerPhone: normalizedPhone,
+                customerName: profileName,
+                conversationId: conversation.id,
+                leadId: lead?.id,
+                replyText: messageText,
+                repliedAt: new Date().toISOString(),
               },
             }).catch(() => undefined);
           }

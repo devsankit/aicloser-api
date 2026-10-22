@@ -1954,9 +1954,22 @@ leadsRouter.patch('/:id', validateBody(updateLeadSchema), async (req: Request, r
           { userId: body.assignedAgentId },
         ],
       },
+      include: {
+        user: { select: { id: true, role: true } },
+      },
     });
     if (!targetAgent) {
       res.status(400).json({ success: false, error: 'InvalidAgent', message: 'Target agent not in workspace' });
+      return;
+    }
+
+    const targetUserRole = String(targetAgent.user?.role || '').toUpperCase();
+    if (targetUserRole === 'SUPER_ADMIN' || targetUserRole.includes('SUPER') || targetUserRole === 'ADMIN') {
+      res.status(403).json({
+        success: false,
+        error: 'AdminAssignmentForbidden',
+        message: 'Super Admin and Company Admin are executive/platform roles and cannot be assigned leads.',
+      });
       return;
     }
     targetAgentId = targetAgent.id;
@@ -2605,7 +2618,7 @@ leadsRouter.post('/:id/transfer', validateBody(transferLeadSchema), async (req: 
       ],
     },
     include: {
-      user: { select: { id: true, displayName: true, email: true, phone: true } },
+      user: { select: { id: true, displayName: true, email: true, phone: true, role: true } },
     },
   });
 
@@ -2614,6 +2627,16 @@ leadsRouter.post('/:id/transfer', validateBody(transferLeadSchema), async (req: 
       success: false,
       error: 'InvalidAgent',
       message: 'Target agent not found or inactive in this workspace',
+    });
+    return;
+  }
+
+  const targetRole = String(targetProfile.user?.role || '').toUpperCase();
+  if (targetRole === 'SUPER_ADMIN' || targetRole.includes('SUPER') || targetRole === 'ADMIN') {
+    res.status(403).json({
+      success: false,
+      error: 'AdminAssignmentForbidden',
+      message: 'Super Admin and Company Admin are executive/platform roles and cannot be assigned leads.',
     });
     return;
   }

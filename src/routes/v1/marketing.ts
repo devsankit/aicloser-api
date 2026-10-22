@@ -493,6 +493,56 @@ async function executeCampaignDispatch(campaignId: string, tenantId: string, for
     campaign.template?.status === 'APPROVED'
   );
 
+  async function linkCampaignMessageToConversation(tenantId: string, phone: string, campaignTitle: string, templateName?: string, contactName?: string, wamid?: string) {
+    try {
+      const norm = phone.replace(/\D/g, '');
+      const e164 = norm.startsWith('+') ? norm : (norm.length === 10 ? `+91${norm}` : `+${norm}`);
+      let conv = await prisma.appConversation.findFirst({
+        where: { tenantId, customerPhone: e164 },
+      });
+      const campMsg = {
+        id: wamid || `camp-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        conversationId: conv?.id || '',
+        sender: 'user',
+        senderName: 'Campaign Broadcast',
+        body: `📢 [Campaign: ${campaignTitle}]` + (templateName ? `\nTemplate: ${templateName}` : ''),
+        createdAt: new Date().toISOString(),
+        status: 'SENT',
+        externalMessageId: wamid,
+        isCampaign: true,
+      };
+      if (conv) {
+        const p = (conv.payload as Record<string, any>) || {};
+        const msgs = Array.isArray(p.messages) ? p.messages : [];
+        msgs.push(campMsg);
+        p.messages = msgs.slice(-100);
+        await prisma.appConversation.update({
+          where: { id: conv.id },
+          data: { payload: p, updatedAt: new Date() },
+        });
+      } else {
+        await prisma.appConversation.create({
+          data: {
+            id: `conv-${Math.random().toString(36).slice(2, 10)}`,
+            tenantId,
+            serviceId: 'svc-whatsapp',
+            leadStatusId: 'new',
+            customerName: contactName || phone,
+            customerPhone: e164,
+            status: 'Open',
+            serviceSlug: 'whatsapp',
+            payload: {
+              messages: [campMsg],
+              sourceChannel: 'whatsapp',
+              customerName: contactName || phone,
+              customerPhone: e164,
+            },
+          },
+        });
+      }
+    } catch {}
+  }
+
   for (const recipient of campaign.recipients) {
     const variableValues: Record<string, unknown> = {};
     for (const [key, rawMapping] of Object.entries(mappings)) {
@@ -533,6 +583,7 @@ async function executeCampaignDispatch(campaignId: string, tenantId: string, for
               },
             }),
           ]);
+          await linkCampaignMessageToConversation(campaign.tenantId, recipient.e164Phone, campaign.name, campaign.template?.name, (recipient.contact as any)?.fullName, sendResult.messageId || `wamid-${campaign.id}-${recipient.id}`);
         } else {
           failedCount++;
           await prisma.whatsAppCampaignRecipient.update({
@@ -559,6 +610,7 @@ async function executeCampaignDispatch(campaignId: string, tenantId: string, for
             },
           }),
         ]);
+        await linkCampaignMessageToConversation(campaign.tenantId, recipient.e164Phone, campaign.name, campaign.template?.name, (recipient.contact as any)?.fullName, `wamid-${campaign.id}-${recipient.id}`);
       }
     } catch (error: unknown) {
       failedCount++;
