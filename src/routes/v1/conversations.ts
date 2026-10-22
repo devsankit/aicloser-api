@@ -521,7 +521,6 @@ conversationsRouter.get('/', validateQuery(listConversationsQuerySchema), async 
           // 3. Official API & company channels (strictly NOT manual-chat of other agents) assigned to THIS agent
           {
             serviceSlug: { not: 'manual-chat' },
-            payload: { path: ['isPersonalQr'], not: true },
             OR: [
               { assignedFreelancerId: profile?.id ?? '__NO_ACCESS__' },
               ...(convIds.length > 0 ? [{ id: { in: convIds } }] : []),
@@ -545,7 +544,6 @@ conversationsRouter.get('/', validateQuery(listConversationsQuerySchema), async 
           ...(profile ? [{ payload: { path: ['sharedUserIds'], array_contains: profile.id } }] : []),
           {
             serviceSlug: { not: 'manual-chat' },
-            payload: { path: ['isPersonalQr'], not: true },
           },
         ],
       });
@@ -642,8 +640,20 @@ conversationsRouter.get('/', validateQuery(listConversationsQuerySchema), async 
   const leadByConvId = new Map<string, (typeof matchingLeads)[0]>();
   const leadByPhone = new Map<string, (typeof matchingLeads)[0]>();
   for (const lead of matchingLeads) {
-    if (lead.conversationId) leadByConvId.set(lead.conversationId, lead);
-    if (lead.customerPhone) leadByPhone.set(normalizePhone(lead.customerPhone), lead);
+    if (lead.conversationId) {
+      const existing = leadByConvId.get(lead.conversationId);
+      // Prefer real lead over shadow lead (id starting with sales-conversation-)
+      if (!existing || (existing.id.startsWith('sales-conversation-') && !lead.id.startsWith('sales-conversation-'))) {
+        leadByConvId.set(lead.conversationId, lead);
+      }
+    }
+    if (lead.customerPhone) {
+      const norm = normalizePhone(lead.customerPhone);
+      const existing = leadByPhone.get(norm);
+      if (!existing || (existing.id.startsWith('sales-conversation-') && !lead.id.startsWith('sales-conversation-'))) {
+        leadByPhone.set(norm, lead);
+      }
+    }
   }
 
   const wsSettingsForConv = await prisma.aicloserWorkspace.findUnique({
@@ -784,20 +794,30 @@ conversationsRouter.get('/', validateQuery(listConversationsQuerySchema), async 
       leadStage: lead?.stage || 'NEW',
       leadId: lead?.id || null,
       assignmentId: lead?.id || null,
-      assignedAgent: lead?.assignedAgent
+      assignedAgent: c.assignedFreelancerId && c.assignedFreelancerName
         ? {
-            id: lead.assignedAgent.id,
-            agentCode: lead.assignedAgent.agentCode,
-            displayName: lead.assignedAgent.user?.displayName || 'Unknown Closer',
-            email: lead.assignedAgent.user?.email,
-            phone: lead.assignedAgent.user?.phone,
+            id: c.assignedFreelancerId,
+            agentCode: lead?.assignedAgent?.agentCode,
+            displayName: c.assignedFreelancerName,
+            email: lead?.assignedAgent?.user?.email,
+            phone: lead?.assignedAgent?.user?.phone,
           }
-        : c.assignedFreelancerId
+        : lead?.assignedAgent
           ? {
-              id: c.assignedFreelancerId,
-              displayName: c.assignedFreelancerName || 'Assigned team member',
+              id: lead.assignedAgent.id,
+              agentCode: lead.assignedAgent.agentCode,
+              displayName: lead.assignedAgent.user?.displayName || 'Unknown Closer',
+              email: lead.assignedAgent.user?.email,
+              phone: lead.assignedAgent.user?.phone,
             }
-          : null,
+          : c.assignedFreelancerId
+            ? {
+                id: c.assignedFreelancerId,
+                displayName: c.assignedFreelancerName || 'Assigned team member',
+              }
+            : null,
+      assignedFreelancerId: c.assignedFreelancerId,
+      assignedFreelancerName: c.assignedFreelancerName,
       adMetadata: (payload.adMetadata as any) || (lead?.customFields as any)?.adMetadata || null,
       isSharedWithMe: Boolean(
         Array.isArray(payload.shares) &&
@@ -1606,21 +1626,22 @@ const handleAssignConversation = async (req: Request, res: Response) => {
     },
   });
 
-  // Also update linked lead & create timeline entry for Command History
+  // Also update linked leads & create timeline entries for Command History
   const leadIdFromPayload = (convPayload as any)?.leadId;
-  const linkedLead = await prisma.salesLeadAssignment.findFirst({
+  const linkedLeads = await prisma.salesLeadAssignment.findMany({
     where: {
       tenantId,
       OR: [
         ...(leadIdFromPayload ? [{ id: leadIdFromPayload }] : []),
         { conversationId: id },
+        { id: `sales-conversation-${id}` },
         ...phoneMatchConditions([conversation.customerPhone]),
       ],
     },
     select: { id: true, assignedAgentId: true, customFields: true },
   });
 
-  if (linkedLead) {
+  for (const linkedLead of linkedLeads) {
     const updatedCustomFields = {
       ...((linkedLead.customFields as Record<string, any>) || {}),
       owner: assignedFreelancerName,

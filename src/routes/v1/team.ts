@@ -142,6 +142,7 @@ teamRouter.get('/', requirePermissions(PERM_TEAM_VIEW), async (req: Request, res
     whereClause.status = statusQuery as SalesAgentStatus;
   } else if (assignableQuery) {
     whereClause.status = 'ACTIVE';
+    whereClause.user = { role: { notIn: ['SUPER_ADMIN', 'ADMIN'] } };
   }
 
   const [workspace, profiles, paymentLinks] = await Promise.all([
