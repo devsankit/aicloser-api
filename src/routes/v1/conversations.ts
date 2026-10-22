@@ -176,6 +176,11 @@ async function checkConversationAccess(
     };
   }
 
+  // 0. Personal QR scanner ownership: the user who connected this companion line is unconditionally the primary owner
+  if (scannedByUserId && scannedByUserId === user.userId) {
+    return { hasAccess: true, isOwnerOrAssigned: true, isShared: false, permission: 'REPLY' };
+  }
+
   const mode = (roleUpper === 'SALES_AGENT' || roleUpper === 'CLOSER') ? await getChatVisibilityMode(tenantId) : 'COMPANY_WIDE';
   if (mode === 'COMPANY_WIDE') {
     return { hasAccess: true, isOwnerOrAssigned: true, isShared: false, permission: 'REPLY' };
@@ -183,8 +188,11 @@ async function checkConversationAccess(
 
   const scope = await getWorkspaceScope(tenantId, user);
 
-  // 1. Check if directly assigned to current user's profile
-  if (conversation.assignedFreelancerId && scope.profileIds.includes(conversation.assignedFreelancerId)) {
+  // 1. Check if directly assigned to current user's profile, userId, or displayName
+  if (
+    (conversation.assignedFreelancerId && (scope.profileIds.includes(conversation.assignedFreelancerId) || conversation.assignedFreelancerId === user.userId)) ||
+    ((conversation as any).assignedFreelancerName && user.displayName && (conversation as any).assignedFreelancerName.toLowerCase() === user.displayName.toLowerCase())
+  ) {
     return { hasAccess: true, isOwnerOrAssigned: true, isShared: false, permission: 'REPLY' };
   }
 
