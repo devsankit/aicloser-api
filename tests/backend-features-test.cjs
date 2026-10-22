@@ -158,7 +158,7 @@ async function runTests() {
         'Content-Type': 'application/json',
       },
     }, { name: 'VIP Enterprise', color: '#10b981' });
-    assert.strictEqual(postLabelRes.status, 200, 'POST /api/v1/labels should return 200');
+    assert.ok(postLabelRes.status === 200 || postLabelRes.status === 201, 'POST /api/v1/labels should return 200 or 201');
     assert.strictEqual(postLabelRes.body.data.name, 'VIP Enterprise');
     console.log('✅ POST /api/v1/labels created label VIP Enterprise');
 

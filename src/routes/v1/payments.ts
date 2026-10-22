@@ -231,6 +231,8 @@ const listPaymentsQuerySchema = z.object({
   status: z.string().optional(),
   search: z.string().optional(),
   leadId: z.string().optional(),
+  phone: z.string().optional(),
+  customerPhone: z.string().optional(),
 });
 
 const createPaymentSchema = z.object({
@@ -334,17 +336,21 @@ paymentsRouter.put('/settings', requireRoles('ADMIN', 'SUPER_ADMIN'), validateBo
 
 // GET / - List tenant payments with pagination, filters, and search
 paymentsRouter.get('/', validateQuery(listPaymentsQuerySchema), async (req: Request, res: Response) => {
-  const { page, limit, status, search, leadId } = req.query as unknown as {
+  const { page, limit, status, search, leadId, phone, customerPhone } = req.query as unknown as {
     page: number;
     limit: number;
     status?: string;
     search?: string;
     leadId?: string;
+    phone?: string;
+    customerPhone?: string;
   };
 
   const tenantId = req.tenantId!;
   const scope = await getPaymentScope(req);
   const where: Record<string, unknown> = { tenantId };
+
+  const targetPhone = (phone || customerPhone)?.trim();
 
   if (leadId) {
     // Lead-specific payments are scoped to the lead itself, visible across assigned and shared closers
@@ -357,6 +363,10 @@ paymentsRouter.get('/', validateQuery(listPaymentsQuerySchema), async (req: Requ
       { customFields: { path: ['leadId'], equals: leadId } },
       ...(last10 ? [{ customerPhone: { contains: last10 } }] : []),
     ];
+  } else if (targetPhone) {
+    const rawDigits = targetPhone.replace(/\D/g, '');
+    const phoneFilter = rawDigits.length >= 10 ? rawDigits.slice(-10) : targetPhone;
+    where.customerPhone = { contains: phoneFilter };
   } else if (!scope.all) {
     where.createdByUserId = { in: scope.userIds.length ? scope.userIds : ['__NO_ACCESS__'] };
   }
@@ -746,6 +756,16 @@ const handlePaymentSettle = async (req: Request, res: Response) => {
     return;
   }
 
+  // Anti-fraud self-settle restriction (ITEM-57): Sales agents cannot settle payments
+  if (req.user?.role === 'SALES_AGENT' || (req.user?.role as string) === 'CLOSER') {
+    res.status(403).json({
+      success: false,
+      error: 'SelfSettleForbidden',
+      message: 'Sales agents are not permitted to settle payment links. Only an Admin or Manager can verify and settle payments.',
+    });
+    return;
+  }
+
   const scope = await getPaymentScope(req);
   if (!canAccessPayment(scope, payment.createdByUserId)) {
     res.status(403).json({ success: false, error: 'Forbidden', message: 'You do not have permission to settle this payment' });
@@ -926,16 +946,43 @@ paymentsRouter.post('/:id/reject', async (req: Request, res: Response) => {
     return;
   }
 
+  const reason = String(req.body?.reason || req.body?.rejectionReason || req.body?.note || 'Payment rejected').trim();
+
   const updated = await prisma.upiPaymentLink.update({
     where: { id: payment.id },
     data: {
-      status: UpiPaymentLinkStatus.CANCELLED,
+      status: UpiPaymentLinkStatus.REJECTED,
       rejectedAt: new Date(),
       rejectedByUserId: req.user?.userId,
+      confirmationNote: reason,
     },
   });
 
-  res.json({ success: true, data: updated, payment: updated, message: 'Payment link rejected/cancelled' });
+  await prisma.salesActivityLog.create({
+    data: {
+      tenantId,
+      actorUserId: req.user?.userId,
+      action: 'PAYMENT_REJECTED',
+      note: `Payment ${payment.id} (₹${payment.totalAmount}) rejected: ${reason}`,
+      metadata: { paymentId: payment.id, previousStatus: payment.status, reason },
+    },
+  }).catch(() => undefined);
+
+  await persistApiRealtimeEvent({
+    tenantId,
+    eventType: 'payment.rejected',
+    payload: {
+      paymentId: updated.id,
+      amount: updated.totalAmount,
+      customerName: updated.customerName,
+      leadId: (payment.customFields as any)?.leadId,
+      status: 'REJECTED',
+      reason,
+    },
+    actorUserId: req.user?.userId,
+  }).catch(() => undefined);
+
+  res.json({ success: true, data: updated, payment: updated, message: 'Payment link rejected successfully' });
 });
 
 // POST /:id/proof - Attach payment screenshot proof

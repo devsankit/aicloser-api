@@ -13,6 +13,7 @@ import { Prisma } from '@prisma/client';
 import { persistApiRealtimeEvent } from '../../lib/realtime.js';
 import { getRecordingPlayback } from '../../lib/recording-storage.js';
 import { hasPermission, PERM_RECORDINGS_PLAY_ALL } from '../../middlewares/rbac.js';
+import { touchClientSession } from '../../lib/client-sessions.js';
 
 export const callsRouter = Router();
 
@@ -569,5 +570,59 @@ callsRouter.post('/:id/resolve-missed', async (req: Request, res: Response) => {
   }).catch(() => undefined);
 
   res.json({ success: true, data: updated, message: 'Missed call resolved', error: null });
+});
+
+// ==========================================
+// Telephony Device Heartbeat & Status Ingestion (ITEM-64)
+// ==========================================
+const deviceHeartbeatSchema = z.object({
+  deviceId: z.string().optional(),
+  appVersion: z.string().optional(),
+  batteryLevel: z.number().min(0).max(100).optional(),
+  isCharging: z.boolean().optional(),
+  networkType: z.string().optional(),
+  storageAvailableMb: z.number().optional(),
+  simLabel: z.string().optional(),
+  officeSimNumber: z.string().optional(),
+});
+
+callsRouter.post(['/devices/:deviceId/heartbeat', '/devices/heartbeat', '/heartbeat'], validateBody(deviceHeartbeatSchema), async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const deviceId = String(req.params.deviceId || req.body?.deviceId || '').trim();
+
+  if (!deviceId) {
+    res.status(400).json({ success: false, error: 'DeviceIdRequired', message: 'deviceId is required' });
+    return;
+  }
+
+  const device = await prisma.salesMobileDevice.findFirst({
+    where: {
+      deviceId,
+      tenantId,
+      agent: { userId: req.user!.userId },
+    },
+  });
+
+  if (!device || !device.isActive) {
+    res.status(404).json({ success: false, error: 'NotFound', message: 'Active telephony device not found in this workspace' });
+    return;
+  }
+
+  const body = req.body as z.infer<typeof deviceHeartbeatSchema>;
+  const deviceUpdated = await prisma.salesMobileDevice.update({
+    where: { id: device.id },
+    data: {
+      lastSeenAt: new Date(),
+      appVersion: body.appVersion || device.appVersion,
+      simLabel: body.simLabel || device.simLabel,
+      officeSimNumber: body.officeSimNumber || device.officeSimNumber,
+    },
+  });
+
+  if (req.user?.sessionId) {
+    await touchClientSession(req.user.sessionId).catch(() => undefined);
+  }
+
+  res.json({ success: true, data: deviceUpdated, message: 'Telephony device heartbeat acknowledged' });
 });
 

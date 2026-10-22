@@ -63,7 +63,7 @@ async function runTests() {
     adminUserId = admin.id;
 
     const agentProfiles = await db.query(
-      'SELECT sap.id, sap."userId", u."displayName" FROM "SalesAgentProfile" sap JOIN "AppAuthUser" u ON sap."userId" = u.id WHERE sap."tenantId" = $1 AND sap.status = \'ACTIVE\'',
+      'SELECT sap.id, sap."userId", u."displayName" FROM "SalesAgentProfile" sap JOIN "AppAuthUser" u ON sap."userId" = u.id WHERE sap."tenantId" = $1 AND sap.status = \'ACTIVE\' AND u.role NOT IN (\'ADMIN\', \'SUPER_ADMIN\')',
       [tenantId]
     );
 

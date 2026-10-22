@@ -2,6 +2,7 @@ import { Router, Request, Response } from 'express';
 import { Readable } from 'node:stream';
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { z } from 'zod';
 import { prisma } from '../../lib/prisma.js';
 import { decryptWhatsAppToken, encryptSecret } from '../../lib/crypto-vault.js';
@@ -36,10 +37,36 @@ integrationsRouter.post('/justdial/webhook', async (req: Request, res: Response)
 
     const workspace = await prisma.aicloserWorkspace.findUnique({
       where: { id: tenantId },
-      select: { id: true },
+      select: { id: true, settings: true },
     });
     if (!workspace) {
       res.status(404).json({ status: 'ERROR', message: 'Workspace not found' });
+      return;
+    }
+
+    // HMAC SHA-256 Signature Verification (ITEM-04)
+    const wsSettings = (workspace.settings as Record<string, any>) || {};
+    const jdSecret = wsSettings.integrations?.justdial?.secret || (process.env as any).JUSTDIAL_WEBHOOK_SECRET || env.WEBHOOK_APP_SECRET;
+    const justdialSig = (
+      req.headers['x-justdial-signature'] ||
+      req.headers['x-signature'] ||
+      req.headers['x-hub-signature-256']
+    ) as string | undefined;
+
+    if (jdSecret && justdialSig) {
+      const cleanSig = justdialSig.startsWith('sha256=') ? justdialSig.slice(7) : justdialSig;
+      const rawBody = (req as unknown as { rawBody?: Buffer }).rawBody || Buffer.from(JSON.stringify(req.body || {}));
+      const expected = crypto.createHmac('sha256', jdSecret).update(rawBody).digest('hex');
+      const sigBuffer = Buffer.from(cleanSig);
+      const expBuffer = Buffer.from(expected);
+      if (sigBuffer.length !== expBuffer.length || !crypto.timingSafeEqual(sigBuffer, expBuffer)) {
+        logger.warn('JustDial webhook HMAC signature mismatch', { tenantId, ip: req.ip });
+        res.status(403).json({ status: 'ERROR', message: 'Invalid webhook signature' });
+        return;
+      }
+    } else if (wsSettings.integrations?.justdial?.requireSignature && !justdialSig) {
+      logger.warn('JustDial webhook missing required signature', { tenantId, ip: req.ip });
+      res.status(401).json({ status: 'ERROR', message: 'Webhook signature required' });
       return;
     }
 
