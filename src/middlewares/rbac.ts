@@ -1,4 +1,4 @@
-﻿import { Request, Response, NextFunction } from 'express';
+import { Request, Response, NextFunction } from 'express';
 import { UserRole } from '../types/auth.js';
 import { prisma } from '../lib/prisma.js';
 
@@ -49,7 +49,8 @@ export async function hasPermission(
       if (rolePermissions && Object.prototype.hasOwnProperty.call(rolePermissions, permission)) return rolePermissions[permission] === true;
       if (permission === PERM_LEADS_CLAIM) return profile.canClaimLeads;
       if (permission === PERM_TEAM_MANAGE) return role === 'MANAGER';
-      if (permission === PERM_LEADS_REASSIGN || permission === PERM_TEAM_VIEW || permission === 'payouts:approve') return role === 'MANAGER';
+      if (permission === PERM_LEADS_REASSIGN) return true;
+      if (permission === PERM_TEAM_VIEW || permission === 'payouts:approve') return role === 'MANAGER';
       if (permission === PERM_CONTACTS_VIEW) return true;
       return true;
     }
