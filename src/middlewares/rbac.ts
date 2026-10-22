@@ -87,6 +87,12 @@ export function requireRoles(...allowedRoles: UserRole[]) {
       return;
     }
 
+    // SUPER_ADMIN has global master privileges across all workspaces
+    if (user.role === 'SUPER_ADMIN') {
+      next();
+      return;
+    }
+
     if (!allowedRoles.includes(user.role)) {
       res.status(403).json({
         success: false,

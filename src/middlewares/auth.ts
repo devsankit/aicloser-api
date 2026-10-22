@@ -165,9 +165,12 @@ export async function authenticate(req: Request, res: Response, next: NextFuncti
           }
         }
 
-        // Canonical server authority takes precedence over client token claims
+        // Canonical server authority takes precedence over client token claims for regular tenants.
+        // For SUPER_ADMIN impersonating a workspace, preserve the token's target tenantId.
         authenticatedUser.role = (dbUser.role as any) || authenticatedUser.role;
-        if (dbUser.tenantId) {
+        if (dbUser.role !== 'SUPER_ADMIN' && dbUser.tenantId) {
+          authenticatedUser.tenantId = dbUser.tenantId;
+        } else if (!authenticatedUser.tenantId && dbUser.tenantId) {
           authenticatedUser.tenantId = dbUser.tenantId;
         }
       }

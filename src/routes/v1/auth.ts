@@ -185,7 +185,12 @@ authRouter.get('/me', authenticate, async (req: Request, res: Response) => {
     },
   }) : null;
 
-  const rolePermissions = (dbUser?.AicloserWorkspace?.settings as { rolePermissions?: Record<string, Record<string, boolean>> } | null)?.rolePermissions?.[dbUser?.role || 'SALES_AGENT'] || {};
+  const activeTenantId = req.user?.tenantId || dbUser?.tenantId;
+  const activeWorkspace = activeTenantId && activeTenantId !== dbUser?.AicloserWorkspace?.id
+    ? await prisma.aicloserWorkspace.findUnique({ where: { id: activeTenantId } })
+    : dbUser?.AicloserWorkspace;
+
+  const rolePermissions = ((activeWorkspace?.settings || dbUser?.AicloserWorkspace?.settings) as { rolePermissions?: Record<string, Record<string, boolean>> } | null)?.rolePermissions?.[dbUser?.role || 'SALES_AGENT'] || {};
   const freshPermissions = { ...rolePermissions, ...((dbUser?.salesAgentProfile?.permissions as Record<string, boolean>) || {}) };
 
   res.json({
@@ -193,6 +198,7 @@ authRouter.get('/me', authenticate, async (req: Request, res: Response) => {
     data: {
       user: {
         ...req.user,
+        tenantId: activeTenantId,
         role: (dbUser?.role as AuthenticatedUser['role']) || req.user?.role,
         displayName: dbUser?.displayName || req.user?.displayName,
         email: dbUser?.email || req.user?.email,
@@ -202,12 +208,12 @@ authRouter.get('/me', authenticate, async (req: Request, res: Response) => {
         permissions: freshPermissions,
         themePreference: dbUser?.themePreference || 'light',
       },
-      tenantId: dbUser?.tenantId || req.user?.tenantId,
-      workspace: dbUser?.AicloserWorkspace ? {
-        id: dbUser.AicloserWorkspace.id,
-        name: dbUser.AicloserWorkspace.name,
-        slug: dbUser.AicloserWorkspace.slug,
-        planTier: dbUser.AicloserWorkspace.planTier,
+      tenantId: activeTenantId,
+      workspace: activeWorkspace ? {
+        id: activeWorkspace.id,
+        name: activeWorkspace.name,
+        slug: activeWorkspace.slug,
+        planTier: activeWorkspace.planTier,
       } : null,
     },
   });

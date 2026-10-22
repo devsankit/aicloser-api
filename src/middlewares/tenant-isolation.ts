@@ -65,6 +65,7 @@ export async function enforceTenantIsolation(req: Request, res: Response, next: 
 
     if (user.tenantId) {
       req.tenantId = user.tenantId;
+      req.isSuperAdminOverride = true;
       if (req.body && typeof req.body === 'object') {
         req.body.tenantId = user.tenantId;
       }
