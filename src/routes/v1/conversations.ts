@@ -159,17 +159,21 @@ async function checkConversationAccess(
   const scannedByUserId = (payload.scannedByUserId as string | undefined) || undefined;
 
   // Personal companion WhatsApp chats belong strictly to the closer who scanned them and Admin/SuperAdmin.
-  // Even under COMPANY_WIDE visibility, Closer B cannot see Anshita's personal WhatsApp chats unless
-  // explicitly assigned to Closer B or shared.
+  // Other closers CANNOT see or access another closer's personal WhatsApp chats unless explicitly shared!
   if (isPersonalQr && scannedByUserId && scannedByUserId !== user.userId) {
     const scope = await getWorkspaceScope(tenantId, user);
-    const isAssigned = conversation.assignedFreelancerId && scope.profileIds.includes(conversation.assignedFreelancerId);
     const shares = Array.isArray(payload.shares) ? (payload.shares as ConversationShareRecord[]) : [];
     const activeShare = shares.find((s) => !s.revokedAt && (s.userId === user.userId || (s.agentProfileId && scope.profileIds.includes(s.agentProfileId))));
     
-    if (!isAssigned && !activeShare) {
+    if (!activeShare) {
       return { hasAccess: false, isOwnerOrAssigned: false, isShared: false, permission: 'VIEW' };
     }
+    return {
+      hasAccess: true,
+      isOwnerOrAssigned: false,
+      isShared: true,
+      permission: activeShare.permission || 'REPLY',
+    };
   }
 
   const mode = (roleUpper === 'SALES_AGENT' || roleUpper === 'CLOSER') ? await getChatVisibilityMode(tenantId) : 'COMPANY_WIDE';
@@ -380,7 +384,15 @@ conversationsRouter.get('/:id/360', async (req: Request, res: Response) => {
   const conversation = await resolveAppConversation(tenantId, String(req.params.id), false);
   if (!conversation) return void res.status(404).json({ success: false, error: 'NotFound', message: 'Conversation not found' });
   if (!(await verifyCloserAccess(req, conversation))) return void res.status(403).json({ success: false, error: 'Forbidden', message: 'Conversation access denied' });
-  const lead = await prisma.salesLeadAssignment.findFirst({
+  const profile = req.user?.userId ? await prisma.salesAgentProfile.findFirst({ where: { userId: req.user.userId, tenantId }, select: { id: true } }) : null;
+  const lead = (profile ? await prisma.salesLeadAssignment.findFirst({
+    where: {
+      tenantId,
+      assignedAgentId: profile.id,
+      OR: [{ conversationId: conversation.id }, ...phoneMatchConditions([conversation.customerPhone])],
+    },
+    select: { id: true },
+  }) : null) || await prisma.salesLeadAssignment.findFirst({
     where: { tenantId, OR: [{ conversationId: conversation.id }, ...phoneMatchConditions([conversation.customerPhone])] },
     select: { id: true },
   });
@@ -475,40 +487,66 @@ conversationsRouter.get('/', validateQuery(listConversationsQuerySchema), async 
   const authUser = req.user;
   if (authUser && (authUser.role === 'SALES_AGENT' || (authUser.role as any) === 'CLOSER')) {
     const mode = await getChatVisibilityMode(tenantId);
+    const profile = await prisma.salesAgentProfile.findFirst({
+      where: { userId: authUser.userId, tenantId },
+      select: { id: true },
+    });
+
     if (mode !== 'COMPANY_WIDE') {
-      const profile = await prisma.salesAgentProfile.findFirst({
-        where: { userId: authUser.userId, tenantId },
-        select: { id: true },
-      });
+      const assignedLeads = profile
+        ? await prisma.salesLeadAssignment.findMany({
+            where: { assignedAgentId: profile.id, tenantId },
+            select: { id: true, customerPhone: true, conversationId: true },
+          })
+        : [];
 
-    const assignedLeads = profile
-      ? await prisma.salesLeadAssignment.findMany({
-          where: { assignedAgentId: profile.id, tenantId },
-          select: { id: true, customerPhone: true, conversationId: true },
-        })
-      : [];
+      const phones = assignedLeads.map((l) => l.customerPhone).filter(Boolean) as string[];
+      const convIds = assignedLeads.map((l) => l.conversationId).filter(Boolean) as string[];
 
-    const phones = assignedLeads.map((l) => l.customerPhone).filter(Boolean) as string[];
-    const convIds = assignedLeads.map((l) => l.conversationId).filter(Boolean) as string[];
-
+      // STRICT PERSONAL QR PARTITIONING:
+      // Personal QR WhatsApp chats (manual-chat) belong EXCLUSIVELY to the scanning agent.
+      // Another agent can NEVER see them through lead/phone matches unless explicitly shared!
       andConditions.push({
         OR: [
-          { assignedFreelancerId: profile?.id ?? '__NO_ACCESS__' },
-          ...(convIds.length > 0 ? [{ id: { in: convIds } }] : []),
-          ...phoneMatchConditions(phones),
-          { payload: { path: ['sharedUserIds'], array_contains: authUser.userId } },
-          { payload: { path: ['scannedByUserId'], equals: authUser.userId } },
+          // 1. Personal QR chats scanned by THIS agent
+          {
+            serviceSlug: 'manual-chat',
+            payload: { path: ['scannedByUserId'], equals: authUser.userId },
+          },
+          // 2. Explicitly shared with THIS agent
+          {
+            payload: { path: ['sharedUserIds'], array_contains: authUser.userId },
+          },
           ...(profile ? [{ payload: { path: ['sharedUserIds'], array_contains: profile.id } }] : []),
+          // 3. Official API & company channels (strictly NOT manual-chat of other agents) assigned to THIS agent
+          {
+            serviceSlug: { not: 'manual-chat' },
+            payload: { path: ['isPersonalQr'], not: true },
+            OR: [
+              { assignedFreelancerId: profile?.id ?? '__NO_ACCESS__' },
+              ...(convIds.length > 0 ? [{ id: { in: convIds } }] : []),
+              ...phoneMatchConditions(phones),
+            ],
+          },
         ],
       });
     } else {
       // In COMPANY_WIDE mode, sales reps see all general/API channels,
-      // but personal companion QR chats remain isolated to the scanning closer.
+      // but personal companion QR chats remain strictly isolated to the scanning closer.
       andConditions.push({
         OR: [
-          { payload: { path: ['isPersonalQr'], not: true } },
-          { payload: { path: ['scannedByUserId'], equals: authUser.userId } },
-          { payload: { path: ['sharedUserIds'], array_contains: authUser.userId } },
+          {
+            serviceSlug: 'manual-chat',
+            payload: { path: ['scannedByUserId'], equals: authUser.userId },
+          },
+          {
+            payload: { path: ['sharedUserIds'], array_contains: authUser.userId },
+          },
+          ...(profile ? [{ payload: { path: ['sharedUserIds'], array_contains: profile.id } }] : []),
+          {
+            serviceSlug: { not: 'manual-chat' },
+            payload: { path: ['isPersonalQr'], not: true },
+          },
         ],
       });
     }
