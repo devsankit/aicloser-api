@@ -1,4 +1,5 @@
 import { assignLeadToNextCloser } from '../../lib/lead-assignment-engine.js';
+import { upsertCompanyLead } from '../../lib/lead-upsert-pipeline.js';
 import { generateAiCloserReply } from '../../lib/ai-provider-engine.js';
 import { decryptWhatsAppToken } from '../../lib/crypto-vault.js';
 import { Router, Request, Response } from 'express';
@@ -176,71 +177,33 @@ webhooksRouter.post(['/meta', '/whatsapp', '/whatsapp-marketing'], verifyWebhook
           });
         }
 
-        // Deduplicated Lead Check: link or touch lead without creating duplicates
-        const last10 = normalizedPhone.replace(/\D/g, '').slice(-10);
-        let lead = await prisma.salesLeadAssignment.findFirst({
-          where: { tenantId, customerPhone: { contains: last10 } },
-          orderBy: [
-            { stage: 'desc' },
-            { createdAt: 'asc' },
-          ],
-        });
-
-        if (lead) {
-          await prisma.salesLeadAssignment.update({
-            where: { id: lead.id },
-            data: {
-              lastContactedAt: new Date(),
-              conversationId: conversation.id,
+        // Inbound Lead Upsert Pipeline: Guarantee SalesLeadAssignment creation and conversation linkage
+        let lead: any = null;
+        try {
+          const upsertRes = await upsertCompanyLead({
+            tenantId,
+            customerName: profileName,
+            customerPhone: normalizedPhone,
+            source: 'WHATSAPP',
+            conversationId: conversation.id,
+            notes: `Inbound message from WhatsApp: "${messageText.slice(0, 100)}"`,
+            customFields: {
+              channelSource: 'WHATSAPP_OFFICIAL_API',
+              metaCloudConversationId: conversation.id,
             },
           });
-        } else {
-          // Strictly fetch non-admin active sales agent profile as initial holder
-          const agent = await prisma.salesAgentProfile.findFirst({
-            where: {
-              tenantId,
-              status: 'ACTIVE',
-              user: { role: 'SALES_AGENT', packageStatus: 'ACTIVE' },
-            },
-          });
-
-          if (agent) {
-            lead = await prisma.salesLeadAssignment.create({
+          lead = upsertRes.lead;
+          if (lead && lead.conversationId !== conversation.id) {
+            await prisma.salesLeadAssignment.update({
+              where: { id: lead.id },
               data: {
-                tenantId,
-                assignedAgentId: agent.id,
-                customerName: profileName,
-                customerPhone: normalizedPhone,
                 conversationId: conversation.id,
-                source: 'WHATSAPP',
-                stage: 'NEW',
-                notes: `Inbound message from WhatsApp: "${messageText.slice(0, 100)}"`,
-              },
-            });
-
-            // Execute strict round-robin & source rule distribution
-            try {
-              await assignLeadToNextCloser({
-                tenantId,
-                leadId: lead.id,
-                source: 'WHATSAPP',
-              });
-            } catch (rrErr) {
-              logger.warn('Inbound WhatsApp lead assignment engine failed, keeping fallback', { error: String(rrErr) });
-            }
-          } else {
-            // Admins are NEVER auto-assigned: when no active SALES_AGENT closer is available, send to unassigned Grab Pool
-            await prisma.salesLeadPoolItem.create({
-              data: {
-                tenantId,
-                customerName: profileName,
-                customerPhone: normalizedPhone,
-                source: 'WHATSAPP',
-                notes: `Inbound WhatsApp conversation: "${messageText.slice(0, 100)}"`,
-                status: 'OPEN',
+                lastContactedAt: new Date(),
               },
             }).catch(() => undefined);
           }
+        } catch (leadUpsertErr) {
+          logger.error('Failed to upsert company lead for incoming WhatsApp message', { error: String(leadUpsertErr) });
         }
 
         // Broadcast Realtime Event to Closer UI

@@ -430,16 +430,23 @@ conversationsRouter.get('/', validateQuery(listConversationsQuerySchema), async 
 
   // Dedicated API vs QR Scanner filtering
   if (scannerName) {
-    // Strictly personal scanned QR WhatsApp chats for this specific team member
+    // Strictly personal scanned QR WhatsApp chats for this specific team member or shared with them
     andConditions.push({
       serviceSlug: 'manual-chat',
-      payload: { path: ['scannedByName'], string_contains: scannerName },
+      OR: [
+        { payload: { path: ['scannedByName'], string_contains: scannerName } },
+        { payload: { path: ['sharedUserIds'], array_contains: scannerName } },
+        ...(req.user?.userId ? [{ payload: { path: ['sharedUserIds'], array_contains: req.user.userId } }] : []),
+      ],
     });
   } else if (scannerUserId) {
-    // Strictly personal scanned QR WhatsApp chats for this specific user ID
+    // Strictly personal scanned QR WhatsApp chats for this specific user ID or shared with them
     andConditions.push({
       serviceSlug: 'manual-chat',
-      payload: { path: ['scannedByUserId'], equals: scannerUserId },
+      OR: [
+        { payload: { path: ['scannedByUserId'], equals: scannerUserId } },
+        { payload: { path: ['sharedUserIds'], array_contains: scannerUserId } },
+      ],
     });
   } else {
     if (sourceType === 'OFFICIAL_API') {
@@ -1938,8 +1945,30 @@ conversationsRouter.post('/:id/share', validateBody(directShareBodySchema), asyn
     ? [...payload.sharedUserIds]
     : [];
 
-  if (!currentSharedUserIds.includes(targetUserId)) {
-    currentSharedUserIds.push(targetUserId);
+  const targetProfile = await prisma.salesAgentProfile.findFirst({
+    where: {
+      tenantId,
+      OR: [
+        { id: targetUserId },
+        { userId: targetUserId },
+        { user: { displayName: { equals: targetUserId, mode: 'insensitive' } } },
+        { user: { email: { equals: targetUserId, mode: 'insensitive' } } },
+      ],
+    },
+    include: { user: { select: { id: true, displayName: true, email: true } } },
+  });
+
+  const idsToAdd = new Set<string>([targetUserId]);
+  if (targetProfile) {
+    idsToAdd.add(targetProfile.id);
+    idsToAdd.add(targetProfile.userId);
+    if (targetProfile.user?.displayName) idsToAdd.add(targetProfile.user.displayName);
+  }
+
+  for (const id of idsToAdd) {
+    if (!currentSharedUserIds.includes(id)) {
+      currentSharedUserIds.push(id);
+    }
   }
 
   payload.sharedUserIds = currentSharedUserIds;

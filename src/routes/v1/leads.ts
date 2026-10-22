@@ -1357,25 +1357,67 @@ export async function getLead360(req: Request, res: Response) {
     };
   });
 
-  // 3. Conversation & message history
+  // 3. Dual WhatsApp Conversation & message history (Official API vs Personal QR Companion)
+  const customFieldsObj = (lead.customFields && typeof lead.customFields === 'object' && !Array.isArray(lead.customFields))
+    ? { ...(lead.customFields as Record<string, any>) }
+    : {};
+  let metaCloudConversationId: string | null = customFieldsObj.metaCloudConversationId || null;
+  let personalQrConversationId: string | null = customFieldsObj.personalQrConversationId || null;
+
   let conversation = null;
   if (lead.conversationId) {
     conversation = await prisma.appConversation.findFirst({
       where: { id: lead.conversationId, tenantId },
-      select: { id: true, status: true, updatedAt: true, payload: true },
-    });
-  }
-  if (!conversation && lead.customerPhone) {
-    conversation = await prisma.appConversation.findFirst({
-      where: { tenantId, customerPhone: lead.customerPhone },
-      select: { id: true, status: true, updatedAt: true, payload: true },
+      select: { id: true, status: true, updatedAt: true, payload: true, serviceSlug: true },
     });
     if (conversation) {
-      await prisma.salesLeadAssignment.update({
-        where: { id: lead.id },
-        data: { conversationId: conversation.id },
-      }).catch(() => undefined);
+      if (conversation.serviceSlug === 'manual-chat') {
+        personalQrConversationId = conversation.id;
+      } else {
+        metaCloudConversationId = conversation.id;
+      }
     }
+  }
+
+  // Look up official WhatsApp API conversation if not resolved
+  if (!metaCloudConversationId && last10) {
+    const official = await prisma.appConversation.findFirst({
+      where: {
+        tenantId,
+        serviceSlug: { not: 'manual-chat' },
+        customerPhone: { contains: last10 },
+      },
+      select: { id: true, status: true, updatedAt: true, payload: true, serviceSlug: true },
+      orderBy: { updatedAt: 'desc' },
+    });
+    if (official) {
+      metaCloudConversationId = official.id;
+      if (!conversation) conversation = official;
+    }
+  }
+
+  // Look up personal QR companion conversation if not resolved
+  if (!personalQrConversationId && last10) {
+    const personal = await prisma.appConversation.findFirst({
+      where: {
+        tenantId,
+        serviceSlug: 'manual-chat',
+        customerPhone: { contains: last10 },
+      },
+      select: { id: true, status: true, updatedAt: true, payload: true, serviceSlug: true },
+      orderBy: { updatedAt: 'desc' },
+    });
+    if (personal) {
+      personalQrConversationId = personal.id;
+      if (!conversation) conversation = personal;
+    }
+  }
+
+  if (conversation && !lead.conversationId) {
+    await prisma.salesLeadAssignment.update({
+      where: { id: lead.id },
+      data: { conversationId: conversation.id },
+    }).catch(() => undefined);
   }
 
   // 4. Payments directly linked or by phone
@@ -1555,11 +1597,19 @@ export async function getLead360(req: Request, res: Response) {
   const raw360Data = {
     lead: {
       ...lead,
+      metaCloudConversationId,
+      personalQrConversationId,
       aiScore: lead.aiScore ?? 50,
       aiSentiment: lead.aiSentiment || 'NEUTRAL',
       aiSummary: lead.aiSummary || null,
-      customFields: lead.customFields || {},
+      customFields: {
+        ...customFieldsObj,
+        metaCloudConversationId,
+        personalQrConversationId,
+      },
     },
+    metaCloudConversationId,
+    personalQrConversationId,
     assignedAgent: lead.assignedAgent ? {
       id: lead.assignedAgent.id,
       agentCode: lead.assignedAgent.agentCode,
@@ -3468,7 +3518,8 @@ leadsRouter.post('/import', requirePermissions(PERM_LEADS_REASSIGN), validateBod
   // Fetch a fallback profile for required assignedAgentId field
   const fallbackAgent = await prisma.salesAgentProfile.findFirst({
     where: { tenantId, status: 'ACTIVE', user: { role: 'SALES_AGENT', packageStatus: 'ACTIVE' } },
-  }) || await prisma.salesAgentProfile.findFirst({ where: { tenantId, user: { role: 'SALES_AGENT' } } });
+  }) || await prisma.salesAgentProfile.findFirst({ where: { tenantId, user: { role: 'SALES_AGENT' } } })
+  || await prisma.salesAgentProfile.findFirst({ where: { tenantId } });
 
   if (!fallbackAgent) {
     res.status(409).json({ success: false, error: 'NoAgentProfiles', message: 'No agent profile found in workspace to attach leads' });

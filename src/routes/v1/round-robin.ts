@@ -31,12 +31,16 @@ export interface RoundRobinSettings {
   closerWeights: Record<string, number>;
   lastAssignedAgentId: string | null;
   batchSize: number;
+  maxVisibleToCloser?: number;
+  breakDurationMinutes?: number;
 }
 
 const DEFAULT_ROUND_ROBIN_SETTINGS: RoundRobinSettings = {
   enabled: true,
   mode: 'STRICT_ROUND_ROBIN',
   maxActiveLeadsPerCloser: 50,
+  maxVisibleToCloser: 5,
+  breakDurationMinutes: 30,
   allowNonAdminModifyLeads: true,
   allowNonAdminDeleteLeads: false,
   allowNonAdminImportData: true,
@@ -77,6 +81,10 @@ async function saveRoundRobinSettings(tenantId: string, rr: Partial<RoundRobinSe
   const currentSettings = (workspace?.settings as Record<string, any>) || {};
   const currentRR = (currentSettings.roundRobinSettings as Record<string, any>) || DEFAULT_ROUND_ROBIN_SETTINGS;
   const mergedRR = { ...currentRR, ...rr };
+  const currentBreaks = (currentSettings.breakSettings as Record<string, any>) || {};
+  const updatedBreaks = (rr as any).breakDurationMinutes !== undefined
+    ? { ...currentBreaks, durationMinutes: (rr as any).breakDurationMinutes }
+    : currentBreaks;
 
   await prisma.aicloserWorkspace.update({
     where: { id: tenantId },
@@ -84,6 +92,7 @@ async function saveRoundRobinSettings(tenantId: string, rr: Partial<RoundRobinSe
       settings: {
         ...currentSettings,
         roundRobinSettings: mergedRR,
+        breakSettings: updatedBreaks,
       },
       updatedAt: new Date(),
     },
@@ -166,6 +175,8 @@ const updateSettingsSchema = z.object({
   excludeInactiveClosers: z.boolean().optional(),
   closerWeights: z.record(z.number().min(0).max(100)).optional(),
   batchSize: z.number().int().min(1).max(100).optional(),
+  maxVisibleToCloser: z.number().int().min(1).max(100).optional(),
+  breakDurationMinutes: z.number().int().min(5).max(240).optional(),
 });
 
 // 2. PUT/PATCH / - Update round robin settings (Admin / Manager only)

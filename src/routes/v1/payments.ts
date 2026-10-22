@@ -346,7 +346,18 @@ paymentsRouter.get('/', validateQuery(listPaymentsQuerySchema), async (req: Requ
   const scope = await getPaymentScope(req);
   const where: Record<string, unknown> = { tenantId };
 
-  if (!scope.all) {
+  if (leadId) {
+    // Lead-specific payments are scoped to the lead itself, visible across assigned and shared closers
+    const lead = await prisma.salesLeadAssignment.findFirst({
+      where: { id: leadId, tenantId },
+      select: { id: true, customerPhone: true },
+    });
+    const last10 = lead?.customerPhone ? lead.customerPhone.replace(/\D/g, '').slice(-10) : null;
+    where.OR = [
+      { customFields: { path: ['leadId'], equals: leadId } },
+      ...(last10 ? [{ customerPhone: { contains: last10 } }] : []),
+    ];
+  } else if (!scope.all) {
     where.createdByUserId = { in: scope.userIds.length ? scope.userIds : ['__NO_ACCESS__'] };
   }
 
@@ -358,14 +369,6 @@ paymentsRouter.get('/', validateQuery(listPaymentsQuerySchema), async (req: Requ
     } else if (Object.values(UpiPaymentLinkStatus).includes(normalizedStatus as any)) {
       where.status = normalizedStatus as UpiPaymentLinkStatus;
     }
-  }
-
-  // Filter by leadId in customFields
-  if (leadId) {
-    where.customFields = {
-      path: ['leadId'],
-      equals: leadId,
-    };
   }
 
   if (search) {

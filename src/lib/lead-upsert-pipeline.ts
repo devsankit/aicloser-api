@@ -179,6 +179,12 @@ export async function upsertCompanyLead(params: UpsertLeadParams): Promise<Upser
   }
 
   if (!fallbackAgent) {
+    fallbackAgent = await prisma.salesAgentProfile.findFirst({
+      where: { tenantId },
+    });
+  }
+
+  if (!fallbackAgent) {
     throw new Error(`No agent profile found in workspace ${tenantId} to hold initial lead`);
   }
 
