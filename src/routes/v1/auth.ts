@@ -185,7 +185,8 @@ authRouter.get('/me', authenticate, async (req: Request, res: Response) => {
     },
   }) : null;
 
-  const activeTenantId = req.user?.tenantId || dbUser?.tenantId;
+  const targetTenantHeader = typeof req.headers['x-target-tenant-id'] === 'string' ? req.headers['x-target-tenant-id'].trim() : undefined;
+  const activeTenantId = targetTenantHeader || req.user?.tenantId || dbUser?.tenantId;
   const activeWorkspace = activeTenantId && activeTenantId !== dbUser?.AicloserWorkspace?.id
     ? await prisma.aicloserWorkspace.findUnique({ where: { id: activeTenantId } })
     : dbUser?.AicloserWorkspace;

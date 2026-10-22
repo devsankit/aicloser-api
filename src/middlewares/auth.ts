@@ -137,7 +137,8 @@ export async function authenticate(req: Request, res: Response, next: NextFuncti
             decoded.impersonatedBy ||
             req.cookies?.gx_super_admin_return ||
             req.cookies?.gx_impersonating_name ||
-            req.headers['x-impersonating-super-admin']
+            req.headers['x-impersonating-super-admin'] ||
+            req.headers['x-target-tenant-id']
           );
 
           if (!isImpersonating) {

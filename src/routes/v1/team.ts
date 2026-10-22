@@ -296,6 +296,38 @@ teamRouter.get('/', async (req: Request, res: Response) => {
         });
       }
     }
+
+    if (team.length === 0 && !assignableQuery && user.userId) {
+      const activeAdmin = await prisma.appAuthUser.findUnique({
+        where: { id: user.userId },
+        select: { id: true, displayName: true, email: true, phone: true, role: true, createdAt: true },
+      });
+      if (activeAdmin) {
+        team.push({
+          id: activeAdmin.id,
+          userId: activeAdmin.id,
+          displayName: activeAdmin.displayName,
+          email: activeAdmin.email,
+          phone: activeAdmin.phone,
+          role: activeAdmin.role,
+          agentCode: 'ADMIN',
+          status: 'ACTIVE' as SalesAgentStatus,
+          commissionPercent: undefined,
+          canClaimLeads: false,
+          maxActiveLeads: 0,
+          parentAgentId: null,
+          reportingManager: null,
+          permissions: {},
+          assignedLeadsCount: 0,
+          callsCount: 0,
+          pipelineValue: 0,
+          dealsWon: 0,
+          wonAmount: 0,
+          pendingPaymentsCount: 0,
+          createdAt: activeAdmin.createdAt,
+        });
+      }
+    }
   }
 
   res.json({
