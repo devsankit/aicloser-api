@@ -128,18 +128,11 @@ async function getChatVisibilityMode(tenantId: string): Promise<'ASSIGNED_ONLY' 
     select: { settings: true },
   });
   const settings = (workspace?.settings as Record<string, any>) || {};
-  if (settings.chatVisibility === 'ASSIGNED_ONLY' || settings.chatVisibility === 'COMPANY_WIDE') {
-    return settings.chatVisibility;
+  if (settings.chatVisibility === 'COMPANY_WIDE') {
+    return 'COMPANY_WIDE';
   }
-
-  // Keep the old workspace setting as a read fallback while all callers move
-  // to the central chat-visibility API. This prevents an existing tenant from
-  // silently reverting to ASSIGNED_ONLY after the API migration.
-  const legacySettings = await prisma.salesSettings.findUnique({
-    where: { tenantId },
-    select: { showOnlyAssignedChats: true },
-  });
-  return legacySettings?.showOnlyAssignedChats === false ? 'COMPANY_WIDE' : 'ASSIGNED_ONLY';
+  // Default to strict ASSIGNED_ONLY to prevent cross-agent lead leakage
+  return 'ASSIGNED_ONLY';
 }
 
 // Helper: Check detailed user access and permission (VIEW vs REPLY, Assigned vs Shared)
@@ -478,11 +471,12 @@ conversationsRouter.get('/', validateQuery(listConversationsQuerySchema), async 
 
   // Closers see their assigned conversations. Managers see their reporting
   // team. Admins retain the tenant-wide inbox.
-  if (req.user?.role === 'SALES_AGENT') {
+  const authUser = req.user;
+  if (authUser && (authUser.role === 'SALES_AGENT' || (authUser.role as any) === 'CLOSER')) {
     const mode = await getChatVisibilityMode(tenantId);
     if (mode !== 'COMPANY_WIDE') {
       const profile = await prisma.salesAgentProfile.findFirst({
-        where: { userId: req.user.userId, tenantId },
+        where: { userId: authUser.userId, tenantId },
         select: { id: true },
       });
 
@@ -501,8 +495,8 @@ conversationsRouter.get('/', validateQuery(listConversationsQuerySchema), async 
           { assignedFreelancerId: profile?.id ?? '__NO_ACCESS__' },
           ...(convIds.length > 0 ? [{ id: { in: convIds } }] : []),
           ...phoneMatchConditions(phones),
-          { payload: { path: ['sharedUserIds'], array_contains: req.user.userId } },
-          { payload: { path: ['scannedByUserId'], equals: req.user.userId } },
+          { payload: { path: ['sharedUserIds'], array_contains: authUser.userId } },
+          { payload: { path: ['scannedByUserId'], equals: authUser.userId } },
           ...(profile ? [{ payload: { path: ['sharedUserIds'], array_contains: profile.id } }] : []),
         ],
       });
@@ -512,13 +506,13 @@ conversationsRouter.get('/', validateQuery(listConversationsQuerySchema), async 
       andConditions.push({
         OR: [
           { payload: { path: ['isPersonalQr'], not: true } },
-          { payload: { path: ['scannedByUserId'], equals: req.user.userId } },
-          { payload: { path: ['sharedUserIds'], array_contains: req.user.userId } },
+          { payload: { path: ['scannedByUserId'], equals: authUser.userId } },
+          { payload: { path: ['sharedUserIds'], array_contains: authUser.userId } },
         ],
       });
     }
-  } else if (req.user?.role === 'MANAGER') {
-    const scope = await getWorkspaceScope(tenantId, req.user);
+  } else if (authUser && authUser.role === 'MANAGER') {
+    const scope = await getWorkspaceScope(tenantId, authUser);
     const assignedLeads = scope.profileIds.length
       ? await prisma.salesLeadAssignment.findMany({
           where: { tenantId, assignedAgentId: { in: scope.profileIds } },
@@ -532,7 +526,7 @@ conversationsRouter.get('/', validateQuery(listConversationsQuerySchema), async 
         ...(scope.profileIds.length ? [{ assignedFreelancerId: { in: scope.profileIds } }] : []),
         ...(convIds.length ? [{ id: { in: convIds } }] : []),
         ...phoneMatchConditions(phones),
-        { payload: { path: ['sharedUserIds'], array_contains: req.user.userId } },
+        { payload: { path: ['sharedUserIds'], array_contains: authUser.userId } },
         ...(scope.userIds.length > 0 ? scope.userIds.map((uid) => ({ payload: { path: ['sharedUserIds'], array_contains: uid } })) : []),
       ],
     });
@@ -1748,6 +1742,90 @@ conversationsRouter.get('/:id/shares', async (req: Request, res: Response) => {
       },
       sharesCount: enrichedShares.length,
       shares: enrichedShares,
+    },
+    error: null,
+  });
+});
+
+const directShareBodySchema = z.object({
+  targetUserId: z.string().optional(),
+  userId: z.string().optional(),
+}).refine((data) => Boolean(data.targetUserId || data.userId), {
+  message: 'targetUserId or userId is required',
+});
+
+// POST /:id/share - Direct conversation sharing by user ID
+conversationsRouter.post('/:id/share', validateBody(directShareBodySchema), async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const id = String(req.params.id);
+  const targetUserId = String(req.body.targetUserId || req.body.userId || '').trim();
+
+  const conversation = await prisma.appConversation.findFirst({
+    where: { id, tenantId },
+  });
+
+  if (!conversation) {
+    res.status(404).json({ success: false, error: 'NotFound', message: 'Conversation not found' });
+    return;
+  }
+
+  const payload = (conversation.payload && typeof conversation.payload === 'object' && !Array.isArray(conversation.payload))
+    ? { ...(conversation.payload as Record<string, any>) }
+    : {};
+
+  const currentSharedUserIds: string[] = Array.isArray(payload.sharedUserIds)
+    ? [...payload.sharedUserIds]
+    : [];
+
+  if (!currentSharedUserIds.includes(targetUserId)) {
+    currentSharedUserIds.push(targetUserId);
+  }
+
+  payload.sharedUserIds = currentSharedUserIds;
+
+  // Maintain structured shares array for backwards compatibility
+  const shares: ConversationShareRecord[] = Array.isArray(payload.shares) ? [...payload.shares] : [];
+  const existingShareIndex = shares.findIndex((s) => s.userId === targetUserId && !s.revokedAt);
+  if (existingShareIndex === -1) {
+    shares.push({
+      id: `share-${randomUUID()}`,
+      conversationId: conversation.id,
+      userId: targetUserId,
+      sharedByUserId: req.user!.userId,
+      sharedByUserName: req.user!.displayName || req.user!.email,
+      permission: 'REPLY',
+      createdAt: new Date().toISOString(),
+      revokedAt: null,
+    });
+    payload.shares = shares;
+  }
+
+  await prisma.appConversation.update({
+    where: { id: conversation.id },
+    data: {
+      payload: payload as unknown as Prisma.InputJsonValue,
+      updatedAt: new Date(),
+    },
+  });
+
+  await persistApiRealtimeEvent({
+    tenantId,
+    eventType: 'conversation.shared',
+    payload: {
+      conversationId: conversation.id,
+      targetUserId,
+      sharedUserIds: currentSharedUserIds,
+    },
+    actorUserId: req.user?.userId,
+  }).catch(() => undefined);
+
+  res.json({
+    success: true,
+    sharedWith: targetUserId,
+    data: {
+      conversationId: conversation.id,
+      sharedWith: targetUserId,
+      sharedUserIds: currentSharedUserIds,
     },
     error: null,
   });

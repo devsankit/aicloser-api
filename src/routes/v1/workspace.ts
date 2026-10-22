@@ -2,6 +2,7 @@ import { Router, Request, Response } from 'express';
 import { prisma } from '../../lib/prisma.js';
 import { authenticate } from '../../middlewares/auth.js';
 import { enforceTenantIsolation } from '../../middlewares/tenant-isolation.js';
+import { requireRoles } from '../../middlewares/rbac.js';
 
 export const workspaceRouter = Router();
 
@@ -159,3 +160,92 @@ workspaceRouter.get('/usage', async (req: Request, res: Response) => {
     error: null,
   });
 });
+
+// GET /api/v1/workspace/settings - Retrieve workspace settings
+workspaceRouter.get('/settings', async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+
+  const workspace = await prisma.aicloserWorkspace.findUnique({
+    where: { id: tenantId },
+    select: { settings: true },
+  });
+
+  const settings = (workspace?.settings as Record<string, any>) || {};
+
+  res.json({
+    success: true,
+    data: settings,
+    settings,
+    allowManagerLeadDeletion: Boolean(settings.allowManagerLeadDeletion),
+    error: null,
+  });
+});
+
+// PATCH /api/v1/workspace/settings - Update workspace settings (Admin / Super Admin)
+workspaceRouter.patch('/settings', requireRoles('ADMIN', 'SUPER_ADMIN'), async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const body = req.body || {};
+
+  const workspace = await prisma.aicloserWorkspace.findUnique({
+    where: { id: tenantId },
+    select: { settings: true },
+  });
+
+  const currentSettings = (workspace?.settings as Record<string, any>) || {};
+  const updatedSettings = {
+    ...currentSettings,
+    ...body,
+  };
+
+  const updated = await prisma.aicloserWorkspace.update({
+    where: { id: tenantId },
+    data: {
+      settings: updatedSettings,
+      updatedAt: new Date(),
+    },
+  });
+
+  res.json({
+    success: true,
+    message: 'Workspace settings updated successfully',
+    data: updated.settings,
+    settings: updated.settings,
+    allowManagerLeadDeletion: Boolean((updated.settings as Record<string, any>)?.allowManagerLeadDeletion),
+    error: null,
+  });
+});
+
+// PUT /api/v1/workspace/settings - Alias for PATCH
+workspaceRouter.put('/settings', requireRoles('ADMIN', 'SUPER_ADMIN'), async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const body = req.body || {};
+
+  const workspace = await prisma.aicloserWorkspace.findUnique({
+    where: { id: tenantId },
+    select: { settings: true },
+  });
+
+  const currentSettings = (workspace?.settings as Record<string, any>) || {};
+  const updatedSettings = {
+    ...currentSettings,
+    ...body,
+  };
+
+  const updated = await prisma.aicloserWorkspace.update({
+    where: { id: tenantId },
+    data: {
+      settings: updatedSettings,
+      updatedAt: new Date(),
+    },
+  });
+
+  res.json({
+    success: true,
+    message: 'Workspace settings updated successfully',
+    data: updated.settings,
+    settings: updated.settings,
+    allowManagerLeadDeletion: Boolean((updated.settings as Record<string, any>)?.allowManagerLeadDeletion),
+    error: null,
+  });
+});
+

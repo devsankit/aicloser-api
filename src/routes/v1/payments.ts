@@ -458,6 +458,32 @@ paymentsRouter.post('/', validateBody(createPaymentSchema), async (req: Request,
       });
     }
 
+    if (!lead && body.customerPhone) {
+      const trimmedPhone = body.customerPhone.trim();
+      const digitsOnly = trimmedPhone.replace(/\D/g, '');
+      const orPhones = [trimmedPhone];
+      if (digitsOnly.length >= 10) {
+        orPhones.push(`+91${digitsOnly.slice(-10)}`, digitsOnly.slice(-10));
+      }
+      lead = await prisma.salesLeadAssignment.findFirst({
+        where: {
+          tenantId,
+          customerPhone: { in: orPhones },
+        },
+      });
+    }
+
+    // Sync budgetAmount to SalesLeadAssignment so deal value reflects payment link amount
+    if (lead) {
+      await prisma.salesLeadAssignment.update({
+        where: { id: lead.id },
+        data: {
+          budgetAmount: body.amount,
+          updatedAt: new Date(),
+        },
+      }).catch(() => undefined);
+    }
+
     const customerName = (body.customerName || lead?.customerName || 'Valued Customer').trim();
     const customerPhone = (body.customerPhone || lead?.customerPhone || '').trim();
     const customerEmail = body.customerEmail || lead?.customerEmail || null;
@@ -500,7 +526,7 @@ paymentsRouter.post('/', validateBody(createPaymentSchema), async (req: Request,
         customerEmail,
         productName,
         customerNote,
-        customFields: body.leadId ? { leadId: body.leadId } : undefined,
+        customFields: (lead?.id || body.leadId) ? { ...(typeof (body as any).customFields === 'object' && (body as any).customFields ? (body as any).customFields : {}), leadId: lead?.id || body.leadId } : ((body as any).customFields || undefined),
         status: UpiPaymentLinkStatus.PENDING,
       },
     });
@@ -761,22 +787,41 @@ const handlePaymentSettle = async (req: Request, res: Response) => {
       },
     });
 
-    // 3. Auto-advance associated lead deal stage to CLOSED_WON in Prisma!
+    // 3. Auto-advance associated lead deal stage to CLOSED_WON and sync budgetAmount!
     const leadId = (payment.customFields as any)?.leadId;
     let updatedLead = null;
+    let existingLead = null;
     if (leadId) {
-      const existingLead = await tx.salesLeadAssignment.findFirst({
+      existingLead = await tx.salesLeadAssignment.findFirst({
         where: { id: leadId, tenantId },
       });
+    }
 
-      if (existingLead) {
-        updatedLead = await tx.salesLeadAssignment.update({
-          where: { id: existingLead.id },
-          data: {
-            stage: 'CLOSED_WON',
-            stageChangedAt: now,
-          },
-        });
+    if (!existingLead && payment.customerPhone) {
+      const trimmedPhone = payment.customerPhone.trim();
+      const digitsOnly = trimmedPhone.replace(/\D/g, '');
+      const orPhones = [trimmedPhone];
+      if (digitsOnly.length >= 10) {
+        orPhones.push(`+91${digitsOnly.slice(-10)}`, digitsOnly.slice(-10));
+      }
+      existingLead = await tx.salesLeadAssignment.findFirst({
+        where: {
+          tenantId,
+          customerPhone: { in: orPhones },
+        },
+      });
+    }
+
+    if (existingLead) {
+      updatedLead = await tx.salesLeadAssignment.update({
+        where: { id: existingLead.id },
+        data: {
+          stage: 'CLOSED_WON',
+          budgetAmount: updatedPayment.totalAmount,
+          stageChangedAt: now,
+          updatedAt: now,
+        },
+      });
 
         // Add lead audit log
         await tx.salesActivityLog.create({
@@ -811,7 +856,6 @@ const handlePaymentSettle = async (req: Request, res: Response) => {
           },
         }).catch(() => undefined);
       }
-    }
 
     return { payment: updatedPayment, lead: updatedLead };
   });

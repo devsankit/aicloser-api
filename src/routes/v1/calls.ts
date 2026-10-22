@@ -520,3 +520,54 @@ callsRouter.post('/:id/discard', async (req: Request, res: Response) => {
 
   res.json({ success: true, message: 'Call marked as discarded from CRM metrics', data: updatedCall, error: null });
 });
+
+// POST /:id/resolve-missed - Dedicated endpoint for resolving missed calls
+callsRouter.post('/:id/resolve-missed', async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const id = String(req.params.id);
+  const user = req.user!;
+
+  const call = await prisma.salesMobileCall.findFirst({
+    where: {
+      tenantId,
+      OR: [{ id }, { clientCallId: id }],
+    },
+  });
+
+  if (!call) {
+    res.status(404).json({ success: false, error: 'NotFound', message: 'Call not found in this workspace' });
+    return;
+  }
+
+  // Ownership verification: SALES_AGENT can only resolve their own calls
+  if (user.role === 'SALES_AGENT' || (user.role as any) === 'CLOSER') {
+    const profile = await prisma.salesAgentProfile.findFirst({
+      where: { userId: user.userId, tenantId },
+      select: { id: true },
+    });
+    if (!profile || call.agentId !== profile.id) {
+      res.status(403).json({ success: false, error: 'Forbidden', message: 'You are not authorized to update this call' });
+      return;
+    }
+  }
+
+  const updated = await prisma.salesMobileCall.update({
+    where: { id: call.id },
+    data: {
+      status: 'COMPLETED',
+      outcome: 'Callback Completed',
+      noteSubmitted: true,
+      updatedAt: new Date(),
+    },
+  });
+
+  await persistApiRealtimeEvent({
+    tenantId,
+    eventType: 'call.missed_resolved',
+    payload: { callId: call.id, leadId: call.assignmentId, outcome: 'Callback Completed' },
+    actorUserId: req.user?.userId,
+  }).catch(() => undefined);
+
+  res.json({ success: true, data: updated, message: 'Missed call resolved', error: null });
+});
+

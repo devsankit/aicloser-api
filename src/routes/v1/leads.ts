@@ -1,4 +1,5 @@
 import { upsertCompanyLead, normalizePhoneNumber } from '../../lib/lead-upsert-pipeline.js';
+import * as XLSX from 'xlsx';
 import { logger } from '../../lib/logger.js';
 import { maskPhoneNumber, isPhoneMaskingRequired } from '../../lib/phone-mask.js';
 import { assignLeadToNextCloser } from '../../lib/lead-assignment-engine.js';
@@ -47,7 +48,11 @@ leadsRouter.get('/', validateQuery(listLeadsQuerySchema), async (req: Request, r
     tenantId,
   };
 
-  if (stage) where.stage = stage;
+  if (stage) {
+    where.stage = stage;
+  } else {
+    where.stage = { not: 'RECYCLED' };
+  }
 
   // Admins see the tenant; managers see their reporting team; closers see
   // strictly only their own assigned leads.
@@ -99,6 +104,36 @@ leadsRouter.get('/', validateQuery(listLeadsQuerySchema), async (req: Request, r
     }),
   ]);
 
+  // Fetch active UpiPaymentLink records for returned leads to sync payment amounts and status
+  const leadIds = leads.map((l) => l.id);
+  const phoneList = Array.from(new Set(leads.map((l) => l.customerPhone).filter(Boolean))) as string[];
+
+  const paymentLinks = (leadIds.length > 0 || phoneList.length > 0)
+    ? await prisma.upiPaymentLink.findMany({
+        where: {
+          tenantId,
+          OR: [
+            ...(phoneList.length > 0 ? [{ customerPhone: { in: phoneList } }] : []),
+            ...(leadIds.map((lid) => ({ customFields: { path: ['leadId'], equals: lid } }))),
+          ],
+        },
+        orderBy: { createdAt: 'desc' },
+      })
+    : [];
+
+  const paymentByLeadId = new Map<string, (typeof paymentLinks)[0]>();
+  const paymentByPhone = new Map<string, (typeof paymentLinks)[0]>();
+
+  for (const pl of paymentLinks) {
+    const linkedLeadId = (pl.customFields as any)?.leadId;
+    if (linkedLeadId && !paymentByLeadId.has(linkedLeadId)) {
+      paymentByLeadId.set(linkedLeadId, pl);
+    }
+    if (pl.customerPhone && !paymentByPhone.has(pl.customerPhone)) {
+      paymentByPhone.set(pl.customerPhone, pl);
+    }
+  }
+
   // Check workspace security setting for phone masking
   const wsForMask = await prisma.aicloserWorkspace.findUnique({
     where: { id: tenantId },
@@ -106,12 +141,20 @@ leadsRouter.get('/', validateQuery(listLeadsQuerySchema), async (req: Request, r
   });
   const shouldMask = isPhoneMaskingRequired(req.user, wsForMask?.settings as Record<string, any>);
 
-  const sanitizedLeads = shouldMask
-    ? leads.map((l) => ({
-        ...l,
-        customerPhone: maskPhoneNumber(l.customerPhone, true),
-      }))
-    : leads;
+  const sanitizedLeads = leads.map((l) => {
+    const pl = paymentByLeadId.get(l.id) || (l.customerPhone ? paymentByPhone.get(l.customerPhone) : null);
+    const rawBudget = Number(l.budgetAmount || 0);
+    const effectiveBudget = (rawBudget === 0 && pl) ? Number(pl.totalAmount) : rawBudget;
+
+    return {
+      ...l,
+      budgetAmount: effectiveBudget,
+      paymentStatus: pl?.status || null,
+      paymentAmount: pl ? Number(pl.totalAmount) : null,
+      paymentLink: pl?.publicToken ? `/pay/${pl.publicToken}` : null,
+      customerPhone: shouldMask ? maskPhoneNumber(l.customerPhone, true) : l.customerPhone,
+    };
+  });
 
   res.json({
     success: true,
@@ -363,6 +406,8 @@ leadsRouter.get('/pipeline-bootstrap', async (req: Request, res: Response) => {
 
   if (req.query.stage) {
     where.stage = String(req.query.stage);
+  } else {
+    where.stage = { not: 'RECYCLED' };
   }
 
   const limitParam = req.query.limit ? Number(req.query.limit) : 250;
@@ -401,7 +446,11 @@ leadsRouter.get('/pipeline-bootstrap', async (req: Request, res: Response) => {
     // B. Stages aggregation (Count & Total Value)
     prisma.salesLeadAssignment.groupBy({
       by: ['stage'],
-      where: { tenantId, ...(scopeProfileIds ? { assignedAgentId: { in: scopeProfileIds.length ? scopeProfileIds : ['__NO_ACCESS__'] } } : {}) },
+      where: {
+        tenantId,
+        stage: { not: 'RECYCLED' },
+        ...(scopeProfileIds ? { assignedAgentId: { in: scopeProfileIds.length ? scopeProfileIds : ['__NO_ACCESS__'] } } : {}),
+      },
       _count: { id: true },
       _sum: { budgetAmount: true },
     }),
@@ -423,7 +472,7 @@ leadsRouter.get('/pipeline-bootstrap', async (req: Request, res: Response) => {
       by: ['assignedAgentId'],
       where: {
         tenantId,
-        stage: { notIn: ['CLOSED_WON', 'CLOSED_LOST'] },
+        stage: { notIn: ['CLOSED_WON', 'CLOSED_LOST', 'RECYCLED'] },
       },
       _count: { id: true },
     }),
@@ -447,7 +496,37 @@ leadsRouter.get('/pipeline-bootstrap', async (req: Request, res: Response) => {
     }),
   ]);
 
-  // 3. Format Leads (with optional phone masking)
+  // Fetch active UpiPaymentLink records for returned leads
+  const leadIds = rawLeads.map((l) => l.id);
+  const phoneList = Array.from(new Set(rawLeads.map((l) => l.customerPhone).filter(Boolean))) as string[];
+
+  const paymentLinks = (leadIds.length > 0 || phoneList.length > 0)
+    ? await prisma.upiPaymentLink.findMany({
+        where: {
+          tenantId,
+          OR: [
+            ...(phoneList.length > 0 ? [{ customerPhone: { in: phoneList } }] : []),
+            ...(leadIds.map((lid) => ({ customFields: { path: ['leadId'], equals: lid } }))),
+          ],
+        },
+        orderBy: { createdAt: 'desc' },
+      })
+    : [];
+
+  const paymentByLeadId = new Map<string, (typeof paymentLinks)[0]>();
+  const paymentByPhone = new Map<string, (typeof paymentLinks)[0]>();
+
+  for (const pl of paymentLinks) {
+    const linkedLeadId = (pl.customFields as any)?.leadId;
+    if (linkedLeadId && !paymentByLeadId.has(linkedLeadId)) {
+      paymentByLeadId.set(linkedLeadId, pl);
+    }
+    if (pl.customerPhone && !paymentByPhone.has(pl.customerPhone)) {
+      paymentByPhone.set(pl.customerPhone, pl);
+    }
+  }
+
+  // 3. Format Leads (with optional phone masking and synchronized payment/deal values)
   const shouldMask = isPhoneMaskingRequired(user, workspaceInfo?.settings as Record<string, any>);
   const leads = rawLeads.map((l) => {
     const customFields = (l.customFields && typeof l.customFields === 'object' && !Array.isArray(l.customFields))
@@ -455,6 +534,10 @@ leadsRouter.get('/pipeline-bootstrap', async (req: Request, res: Response) => {
       : {};
     const company = customFields.company || customFields.organization || customFields.businessName || '';
     const code = customFields.code || l.leadId || `LD-${l.id.slice(-6).toUpperCase()}`;
+
+    const pl = paymentByLeadId.get(l.id) || (l.customerPhone ? paymentByPhone.get(l.customerPhone) : null);
+    const rawBudget = Number(l.budgetAmount || 0);
+    const effectiveBudget = (rawBudget === 0 && pl) ? Number(pl.totalAmount) : rawBudget;
 
     return {
       id: l.id,
@@ -465,7 +548,10 @@ leadsRouter.get('/pipeline-bootstrap', async (req: Request, res: Response) => {
       company,
       stage: l.stage,
       priority: l.priority || 'MEDIUM',
-      budgetAmount: Number(l.budgetAmount || 0),
+      budgetAmount: effectiveBudget,
+      paymentStatus: pl?.status || null,
+      paymentAmount: pl ? Number(pl.totalAmount) : null,
+      paymentLink: pl?.publicToken ? `/pay/${pl.publicToken}` : null,
       source: l.source || 'MANUAL',
       tags: l.tags || [],
       followUpAt: l.followUpAt ? l.followUpAt.toISOString() : null,
@@ -490,6 +576,17 @@ leadsRouter.get('/pipeline-bootstrap', async (req: Request, res: Response) => {
       count: agg._count?.id ?? 0,
       totalValue: Number(agg._sum?.budgetAmount ?? 0),
     });
+  }
+
+  // Adjust stage totals if leads had 0 DB budget but have active payment links
+  for (const l of leads) {
+    const dbBudget = Number(rawLeads.find((rl) => rl.id === l.id)?.budgetAmount || 0);
+    if (dbBudget === 0 && l.budgetAmount > 0) {
+      const stats = stageStatsMap.get(l.stage);
+      if (stats) {
+        stats.totalValue += l.budgetAmount;
+      }
+    }
   }
 
   const stages = workspaceStages.map((s) => {
@@ -1397,6 +1494,170 @@ export async function getLead360(req: Request, res: Response) {
   });
 }
 
+// GET /api/v1/leads/recycle-bin - View soft-deleted leads (Admin / Authorized Manager)
+leadsRouter.get('/recycle-bin', async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const user = req.user!;
+
+  if (user.role !== 'ADMIN' && user.role !== 'SUPER_ADMIN') {
+    if (user.role === 'MANAGER') {
+      const ws = await prisma.aicloserWorkspace.findUnique({
+        where: { id: tenantId },
+        select: { settings: true },
+      });
+      const wsSettings = (ws?.settings as Record<string, any>) || {};
+      if (!wsSettings.allowManagerLeadDeletion) {
+        res.status(403).json({
+          success: false,
+          error: 'Manager recycle bin access is not enabled for this workspace.',
+          message: 'Manager recycle bin access is not enabled for this workspace.',
+        });
+        return;
+      }
+    } else {
+      res.status(403).json({
+        success: false,
+        error: 'Forbidden',
+        message: 'Only workspace administrators and authorized managers can view the recycle bin.',
+      });
+      return;
+    }
+  }
+
+  const page = Math.max(1, Number(req.query.page) || 1);
+  const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 50));
+  const search = req.query.search ? String(req.query.search).trim() : '';
+
+  const where: any = {
+    tenantId,
+    OR: [
+      { stage: 'RECYCLED' },
+      { customFields: { path: ['recycled'], equals: true } },
+    ],
+  };
+
+  if (search) {
+    const trimmed = search.trim();
+    where.AND = [
+      {
+        OR: [
+          { customerName: { contains: trimmed, mode: 'insensitive' } },
+          { customerPhone: { contains: trimmed } },
+          { customerEmail: { contains: trimmed, mode: 'insensitive' } },
+        ],
+      },
+    ];
+  }
+
+  const [total, leads] = await Promise.all([
+    prisma.salesLeadAssignment.count({ where }),
+    prisma.salesLeadAssignment.findMany({
+      where,
+      skip: (page - 1) * limit,
+      take: limit,
+      orderBy: { updatedAt: 'desc' },
+      include: {
+        assignedAgent: {
+          select: {
+            id: true,
+            agentCode: true,
+            user: { select: { displayName: true, email: true, phone: true } },
+          },
+        },
+      },
+    }),
+  ]);
+
+  res.json({
+    success: true,
+    data: leads,
+    leads,
+    pagination: {
+      total,
+      page,
+      limit,
+      totalPages: Math.ceil(total / limit),
+    },
+    error: null,
+  });
+});
+
+// GET /api/v1/leads/export - Role-restricted Excel workbook export (.xlsx)
+leadsRouter.get('/export', async (req: Request, res: Response) => {
+  const user = req.user!;
+  const tenantId = req.tenantId!;
+
+  if (user.role === 'SALES_AGENT' || (user.role as any) === 'CLOSER') {
+    res.status(403).json({ success: false, error: 'Export is restricted to Admin only.' });
+    return;
+  }
+
+  if (user.role !== 'ADMIN' && user.role !== 'SUPER_ADMIN') {
+    res.status(403).json({ success: false, error: 'Export is restricted to Admin only.' });
+    return;
+  }
+
+  const where: any = {
+    tenantId,
+    stage: { not: 'RECYCLED' },
+  };
+
+  if (req.query.stage) {
+    where.stage = String(req.query.stage);
+  }
+  if (req.query.assignedAgentId) {
+    where.assignedAgentId = String(req.query.assignedAgentId);
+  }
+
+  const leads = await prisma.salesLeadAssignment.findMany({
+    where,
+    orderBy: { createdAt: 'desc' },
+    include: {
+      assignedAgent: {
+        select: {
+          id: true,
+          agentCode: true,
+          user: { select: { displayName: true, email: true, phone: true } },
+        },
+      },
+    },
+  });
+
+  const rows = leads.map((l) => {
+    const custom = (l.customFields && typeof l.customFields === 'object' && !Array.isArray(l.customFields))
+      ? (l.customFields as Record<string, any>)
+      : {};
+    const code = custom.code || l.leadId || `LD-${l.id.slice(-6).toUpperCase()}`;
+    const company = custom.company || custom.organization || custom.businessName || '';
+    const owner = l.assignedAgent?.user?.displayName || l.assignedAgent?.agentCode || 'Unassigned';
+    const val = Number(l.budgetAmount || 0);
+
+    return {
+      'Lead Code': code,
+      'Name': l.customerName || '',
+      'Phone': l.customerPhone || '',
+      'Email': l.customerEmail || '',
+      'Company': company,
+      'Stage': l.stage || '',
+      'Priority': l.priority || 'NORMAL',
+      'Owner': owner,
+      'Value': val,
+      'Source': l.source || 'MANUAL',
+      'Created Date': l.createdAt ? new Date(l.createdAt).toLocaleDateString() : '',
+    };
+  });
+
+  const worksheet = XLSX.utils.json_to_sheet(rows);
+  const workbook = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(workbook, worksheet, 'Leads');
+  const buffer = XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' });
+
+  const dateStr = new Date().toISOString().slice(0, 10);
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', `attachment; filename="leads-export-${dateStr}.xlsx"`);
+  res.send(buffer);
+});
+
 leadsRouter.get('/:id/360', getLead360);
 
 leadsRouter.get('/:id', async (req: Request, res: Response) => {
@@ -1643,13 +1904,18 @@ leadsRouter.patch('/:id', validateBody(updateLeadSchema), async (req: Request, r
   res.json({ success: true, data: { ...updated, status: updated.stage }, error: null });
 });
 
-leadsRouter.delete('/:id', async (req: Request, res: Response) => {
+// DELETE /:id/permanent - Permanent hard delete (Admin strictly only)
+leadsRouter.delete('/:id/permanent', async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const id = String(req.params.id);
+  const user = req.user!;
 
-  // Closers cannot delete leads
-  if (req.user?.role === 'SALES_AGENT') {
-    res.status(403).json({ success: false, error: 'Forbidden', message: 'Only workspace administrators can delete leads' });
+  if (user.role !== 'ADMIN' && user.role !== 'SUPER_ADMIN') {
+    res.status(403).json({
+      success: false,
+      error: 'Permanent lead deletion is restricted to Admin strictly.',
+      message: 'Permanent lead deletion is restricted to Admin strictly.',
+    });
     return;
   }
 
@@ -1666,15 +1932,229 @@ leadsRouter.delete('/:id', async (req: Request, res: Response) => {
     leadIds: [existing.id],
   });
 
+  await prisma.salesActivityLog.create({
+    data: {
+      tenantId,
+      assignmentId: existing.id,
+      actorUserId: user.userId,
+      action: 'LEAD_PERMANENTLY_DELETED',
+      note: `Lead permanently deleted by Admin ${user.displayName || user.role}`,
+    },
+  }).catch(() => undefined);
+
+  await persistApiRealtimeEvent({
+    tenantId,
+    eventType: 'lead.permanently_deleted',
+    payload: { leadId: existing.id },
+    actorUserId: user.userId,
+  }).catch(() => undefined);
+
   res.json({
     success: true,
-    message: 'Lead and linked contact deleted successfully',
-    deletedLeadId: existing.id,
-    deletedContactId: result.deletedContactId,
+    message: 'Lead permanently deleted from database',
     data: {
       deletedLeadId: existing.id,
       deletedContactId: result.deletedContactId,
     },
+    error: null,
+  });
+});
+
+// DELETE /:id - Soft delete lead to Recycle Bin with strict role ownership & permissions
+leadsRouter.delete('/:id', async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const id = String(req.params.id);
+  const user = req.user!;
+  const userRole = user.role as string;
+
+  const lead = await prisma.salesLeadAssignment.findFirst({
+    where: { id, tenantId },
+    include: {
+      assignedAgent: {
+        include: {
+          user: { select: { id: true, displayName: true, email: true, phone: true } },
+        },
+      },
+    },
+  });
+
+  if (!lead) {
+    res.status(404).json({ success: false, error: 'NotFound', message: 'Lead not found in this workspace' });
+    return;
+  }
+
+  const customFields = (lead.customFields && typeof lead.customFields === 'object' && !Array.isArray(lead.customFields))
+    ? (lead.customFields as Record<string, any>)
+    : {};
+
+  if (userRole === 'SALES_AGENT' || userRole === 'CLOSER') {
+    const isCreatedByAgent = lead.createdById === user.userId;
+    const isPersonalScanner =
+      lead.source === 'WHATSAPP_PERSONAL_QR' ||
+      customFields.scannedByUserId === user.userId ||
+      customFields.scannerUserId === user.userId ||
+      (user.displayName && customFields.scannedByName === user.displayName);
+
+    if (!isCreatedByAgent && !isPersonalScanner) {
+      res.status(403).json({
+        success: false,
+        error: 'Sales agents can only delete leads they created or scanned via their personal WhatsApp.',
+        message: 'Sales agents can only delete leads they created or scanned via their personal WhatsApp.',
+      });
+      return;
+    }
+  } else if (userRole === 'MANAGER') {
+    const ws = await prisma.aicloserWorkspace.findUnique({
+      where: { id: tenantId },
+      select: { settings: true },
+    });
+    const wsSettings = (ws?.settings as Record<string, any>) || {};
+    if (!wsSettings.allowManagerLeadDeletion) {
+      res.status(403).json({
+        success: false,
+        error: 'Manager lead deletion is not enabled for this workspace.',
+        message: 'Manager lead deletion is not enabled for this workspace.',
+      });
+      return;
+    }
+  } else if (userRole !== 'ADMIN' && userRole !== 'SUPER_ADMIN') {
+    res.status(403).json({
+      success: false,
+      error: 'Forbidden',
+      message: 'You are not authorized to delete leads in this workspace.',
+    });
+    return;
+  }
+
+  const updated = await prisma.salesLeadAssignment.update({
+    where: { id: lead.id },
+    data: {
+      stage: 'RECYCLED',
+      customFields: {
+        ...customFields,
+        recycled: true,
+        deletedAt: new Date().toISOString(),
+        deletedByUserId: user.userId,
+        deletedByName: user.displayName,
+      },
+      stageChangedAt: new Date(),
+      updatedAt: new Date(),
+    },
+  });
+
+  await prisma.salesActivityLog.create({
+    data: {
+      tenantId,
+      assignmentId: lead.id,
+      actorUserId: user.userId,
+      action: 'LEAD_RECYCLED',
+      note: `Lead moved to Recycle Bin by ${user.displayName || userRole}`,
+      metadata: { deletedByUserId: user.userId, deletedByName: user.displayName },
+    },
+  }).catch(() => undefined);
+
+  await persistApiRealtimeEvent({
+    tenantId,
+    eventType: 'lead.recycled',
+    payload: { leadId: lead.id, deletedByUserId: user.userId },
+    actorUserId: user.userId,
+  }).catch(() => undefined);
+
+  res.json({
+    success: true,
+    message: 'Lead moved to recycle bin successfully',
+    data: {
+      deletedLeadId: lead.id,
+      id: lead.id,
+      stage: 'RECYCLED',
+      recycled: true,
+      deletedAt: new Date().toISOString(),
+    },
+    error: null,
+  });
+});
+
+// POST /:id/restore - Restore soft-deleted lead from Recycle Bin back to NEW stage
+leadsRouter.post('/:id/restore', async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const id = String(req.params.id);
+  const user = req.user!;
+  const userRole = user.role as string;
+
+  if (userRole !== 'ADMIN' && userRole !== 'SUPER_ADMIN') {
+    if (userRole === 'MANAGER') {
+      const ws = await prisma.aicloserWorkspace.findUnique({
+        where: { id: tenantId },
+        select: { settings: true },
+      });
+      const wsSettings = (ws?.settings as Record<string, any>) || {};
+      if (!wsSettings.allowManagerLeadDeletion) {
+        res.status(403).json({
+          success: false,
+          error: 'Manager lead restore is not enabled for this workspace.',
+          message: 'Manager lead restore is not enabled for this workspace.',
+        });
+        return;
+      }
+    } else {
+      res.status(403).json({
+        success: false,
+        error: 'Forbidden',
+        message: 'Only workspace administrators and authorized managers can restore leads from the recycle bin.',
+      });
+      return;
+    }
+  }
+
+  const lead = await prisma.salesLeadAssignment.findFirst({
+    where: { id, tenantId },
+  });
+
+  if (!lead) {
+    res.status(404).json({ success: false, error: 'NotFound', message: 'Lead not found in this workspace' });
+    return;
+  }
+
+  const customFields = (lead.customFields && typeof lead.customFields === 'object' && !Array.isArray(lead.customFields))
+    ? { ...(lead.customFields as Record<string, any>) }
+    : {};
+
+  delete customFields.recycled;
+  delete customFields.deletedAt;
+  delete customFields.deletedByUserId;
+  delete customFields.deletedByName;
+
+  const restored = await prisma.salesLeadAssignment.update({
+    where: { id: lead.id },
+    data: {
+      stage: 'NEW',
+      customFields,
+      stageChangedAt: new Date(),
+      updatedAt: new Date(),
+    },
+  });
+
+  await prisma.salesActivityLog.create({
+    data: {
+      tenantId,
+      assignmentId: lead.id,
+      actorUserId: user.userId,
+      action: 'LEAD_RESTORED',
+      note: `Lead restored from Recycle Bin by ${user.displayName || userRole}`,
+    },
+  }).catch(() => undefined);
+
+  await persistApiRealtimeEvent({
+    tenantId,
+    eventType: 'lead.restored',
+    payload: { leadId: lead.id },
+    actorUserId: user.userId,
+  }).catch(() => undefined);
+
+  res.json({
+    success: true,
+    message: 'Lead restored from recycle bin successfully',
+    data: restored,
     error: null,
   });
 });

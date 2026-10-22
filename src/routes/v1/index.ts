@@ -31,6 +31,8 @@ import { roundRobinRouter } from './round-robin.js';
 import { whatsappFlowsRouter } from './whatsapp-flows.js';
 import { usersRouter } from './users.js';
 import { developerRouter } from './developer.js';
+import { labelsRouter } from './labels.js';
+import { macrosRouter } from './macros.js';
 
 export const v1Router = Router();
 
@@ -51,6 +53,8 @@ v1Router.use('/notifications', notificationsRouter);
 v1Router.use('/me', meSessionsRouter);
 v1Router.use('/admin/users', adminUsersRouter);
 v1Router.use('/custom-fields', customFieldsRouter);
+v1Router.use('/labels', labelsRouter);
+v1Router.use('/macros', macrosRouter);
 v1Router.use('/payments', paymentsRouter);
 v1Router.use('/reports', reportsRouter);
 v1Router.use('/team', teamRouter);
