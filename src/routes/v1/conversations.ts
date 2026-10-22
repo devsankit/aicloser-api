@@ -85,6 +85,8 @@ const listConversationsQuerySchema = z.object({
   sourceType: z.enum(['ALL', 'OFFICIAL_API', 'QR_SCANNER']).optional(),
   agentId: z.string().optional(),
   agentName: z.string().optional(),
+  scannerName: z.string().optional(),
+  scannerUserId: z.string().optional(),
 });
 
 const sendMessageSchema = z.object({
@@ -395,7 +397,7 @@ conversationsRouter.get('/:id/360', async (req: Request, res: Response) => {
 
 // 1. GET / - List conversations with strict closer scoping and rich UI fields
 conversationsRouter.get('/', validateQuery(listConversationsQuerySchema), async (req: Request, res: Response) => {
-  const { page, limit, status, search, customerPhone, channel, sourceType, agentId, agentName } = req.query as unknown as {
+  const { page, limit, status, search, customerPhone, channel, sourceType, agentId, agentName, scannerName, scannerUserId } = req.query as unknown as {
     page: number;
     limit: number;
     status?: string;
@@ -405,33 +407,73 @@ conversationsRouter.get('/', validateQuery(listConversationsQuerySchema), async 
     sourceType?: 'ALL' | 'OFFICIAL_API' | 'QR_SCANNER';
     agentId?: string;
     agentName?: string;
+    scannerName?: string;
+    scannerUserId?: string;
   };
 
   const tenantId = req.tenantId!;
   const andConditions: any[] = [{ tenantId }];
 
   // Dedicated API vs QR Scanner filtering
-  if (sourceType === 'OFFICIAL_API') {
-    andConditions.push({ serviceSlug: { not: 'manual-chat' } });
-  } else if (sourceType === 'QR_SCANNER') {
-    andConditions.push({ serviceSlug: 'manual-chat' });
-  }
+  if (scannerName) {
+    // Strictly personal scanned QR WhatsApp chats for this specific team member
+    andConditions.push({
+      serviceSlug: 'manual-chat',
+      payload: { path: ['scannedByName'], string_contains: scannerName },
+    });
+  } else if (scannerUserId) {
+    // Strictly personal scanned QR WhatsApp chats for this specific user ID
+    andConditions.push({
+      serviceSlug: 'manual-chat',
+      payload: { path: ['scannedByUserId'], equals: scannerUserId },
+    });
+  } else {
+    if (sourceType === 'OFFICIAL_API') {
+      andConditions.push({ serviceSlug: { not: 'manual-chat' } });
+    } else if (sourceType === 'QR_SCANNER') {
+      andConditions.push({ serviceSlug: 'manual-chat' });
+    }
 
-  // Filter by specific closer/agent when requested (e.g. Admin selected agent in header)
-  if (agentId) {
-    andConditions.push({
-      OR: [
-        { assignedFreelancerId: agentId },
-        { payload: { path: ['scannedByUserId'], equals: agentId } },
-      ],
-    });
-  } else if (agentName) {
-    andConditions.push({
-      OR: [
-        { assignedFreelancerName: { contains: agentName, mode: 'insensitive' } },
-        { payload: { path: ['scannedByName'], string_contains: agentName } },
-      ],
-    });
+    // Filter by specific closer/agent when requested (e.g. Admin selected agent in header)
+    if (agentId) {
+      if (sourceType === 'QR_SCANNER') {
+        andConditions.push({
+          serviceSlug: 'manual-chat',
+          payload: { path: ['scannedByUserId'], equals: agentId },
+        });
+      } else if (sourceType === 'OFFICIAL_API') {
+        andConditions.push({
+          serviceSlug: { not: 'manual-chat' },
+          assignedFreelancerId: agentId,
+        });
+      } else {
+        andConditions.push({
+          OR: [
+            { assignedFreelancerId: agentId },
+            { payload: { path: ['scannedByUserId'], equals: agentId } },
+          ],
+        });
+      }
+    } else if (agentName) {
+      if (sourceType === 'QR_SCANNER') {
+        andConditions.push({
+          serviceSlug: 'manual-chat',
+          payload: { path: ['scannedByName'], string_contains: agentName },
+        });
+      } else if (sourceType === 'OFFICIAL_API') {
+        andConditions.push({
+          serviceSlug: { not: 'manual-chat' },
+          assignedFreelancerName: { contains: agentName, mode: 'insensitive' },
+        });
+      } else {
+        andConditions.push({
+          OR: [
+            { assignedFreelancerName: { contains: agentName, mode: 'insensitive' } },
+            { payload: { path: ['scannedByName'], string_contains: agentName } },
+          ],
+        });
+      }
+    }
   }
 
   // Closers see their assigned conversations. Managers see their reporting
@@ -669,12 +711,13 @@ conversationsRouter.get('/', validateQuery(listConversationsQuerySchema), async 
     }
 
     const scannedByName =
-      (typeof payload.scannedByName === 'string' && payload.scannedByName) ||
-      (typeof payload.scannedBy === 'string' && payload.scannedBy) ||
-      (typeof payload.scannerDeviceName === 'string' && payload.scannerDeviceName) ||
-      lead?.assignedAgent?.user?.displayName ||
-      c.assignedFreelancerName ||
-      null;
+      channelSource === 'QR_SCANNER'
+        ? (typeof payload.scannedByName === 'string' && payload.scannedByName) ||
+          (typeof payload.scannedBy === 'string' && payload.scannedBy) ||
+          (typeof payload.scannerDeviceName === 'string' && payload.scannerDeviceName) ||
+          c.assignedFreelancerName ||
+          null
+        : null;
 
     let channelSourceLabel = 'Official API';
     if (channelSource === 'OFFICIAL_API') {

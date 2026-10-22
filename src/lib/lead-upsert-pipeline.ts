@@ -171,7 +171,10 @@ export async function upsertCompanyLead(params: UpsertLeadParams): Promise<Upser
 
   if (!fallbackAgent) {
     fallbackAgent = await prisma.salesAgentProfile.findFirst({
-      where: { tenantId },
+      where: {
+        tenantId,
+        user: { role: 'SALES_AGENT' },
+      },
     });
   }
 

@@ -195,20 +195,14 @@ webhooksRouter.post(['/meta', '/whatsapp', '/whatsapp-marketing'], verifyWebhook
             },
           });
         } else {
-          // Strictly fetch non-admin active sales agent profile as fallback holder
-          let agent = await prisma.salesAgentProfile.findFirst({
+          // Strictly fetch non-admin active sales agent profile as initial holder
+          const agent = await prisma.salesAgentProfile.findFirst({
             where: {
               tenantId,
               status: 'ACTIVE',
               user: { role: 'SALES_AGENT', packageStatus: 'ACTIVE' },
             },
           });
-
-          if (!agent) {
-            agent = await prisma.salesAgentProfile.findFirst({
-              where: { tenantId },
-            });
-          }
 
           if (agent) {
             lead = await prisma.salesLeadAssignment.create({
@@ -234,6 +228,18 @@ webhooksRouter.post(['/meta', '/whatsapp', '/whatsapp-marketing'], verifyWebhook
             } catch (rrErr) {
               logger.warn('Inbound WhatsApp lead assignment engine failed, keeping fallback', { error: String(rrErr) });
             }
+          } else {
+            // Admins are NEVER auto-assigned: when no active SALES_AGENT closer is available, send to unassigned Grab Pool
+            await prisma.salesLeadPoolItem.create({
+              data: {
+                tenantId,
+                customerName: profileName,
+                customerPhone: normalizedPhone,
+                source: 'WHATSAPP',
+                notes: `Inbound WhatsApp conversation: "${messageText.slice(0, 100)}"`,
+                status: 'OPEN',
+              },
+            }).catch(() => undefined);
           }
         }
 

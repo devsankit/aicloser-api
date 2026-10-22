@@ -2613,7 +2613,7 @@ leadsRouter.post('/import', requirePermissions(PERM_LEADS_REASSIGN), validateBod
   // Fetch a fallback profile for required assignedAgentId field
   const fallbackAgent = await prisma.salesAgentProfile.findFirst({
     where: { tenantId, status: 'ACTIVE', user: { role: 'SALES_AGENT', packageStatus: 'ACTIVE' } },
-  }) || await prisma.salesAgentProfile.findFirst({ where: { tenantId } });
+  }) || await prisma.salesAgentProfile.findFirst({ where: { tenantId, user: { role: 'SALES_AGENT' } } });
 
   if (!fallbackAgent) {
     res.status(409).json({ success: false, error: 'NoAgentProfiles', message: 'No agent profile found in workspace to attach leads' });
@@ -2734,7 +2734,7 @@ leadsRouter.post('/import/google-sheets', requirePermissions(PERM_LEADS_REASSIGN
   // Forward to internal import processing
   const fallbackAgent = await prisma.salesAgentProfile.findFirst({
     where: { tenantId, status: 'ACTIVE', user: { role: 'SALES_AGENT' } },
-  }) || await prisma.salesAgentProfile.findFirst({ where: { tenantId } });
+  }) || await prisma.salesAgentProfile.findFirst({ where: { tenantId, user: { role: 'SALES_AGENT' } } });
 
   let createdCount = 0;
   for (const row of rowsToIngest) {
@@ -2789,7 +2789,7 @@ leadsRouter.post('/intake/email', validateBody(emailIntakeSchema), async (req: R
 
   const fallbackAgent = await prisma.salesAgentProfile.findFirst({
     where: { tenantId, status: 'ACTIVE', user: { role: 'SALES_AGENT' } },
-  }) || await prisma.salesAgentProfile.findFirst({ where: { tenantId } });
+  }) || await prisma.salesAgentProfile.findFirst({ where: { tenantId, user: { role: 'SALES_AGENT' } } });
 
   const rawPhone = String(extractedPhone || '').replace(/\D/g, '');
   const normalizedPhone = rawPhone.length === 10 ? `+91${rawPhone}` : (rawPhone ? `+${rawPhone}` : null);
@@ -2845,7 +2845,7 @@ leadsRouter.post('/intake/webhook/:sourceKey', async (req: Request, res: Respons
 
   const fallbackAgent = await prisma.salesAgentProfile.findFirst({
     where: { tenantId, status: 'ACTIVE', user: { role: 'SALES_AGENT' } },
-  }) || await prisma.salesAgentProfile.findFirst({ where: { tenantId } });
+  }) || await prisma.salesAgentProfile.findFirst({ where: { tenantId, user: { role: 'SALES_AGENT' } } });
 
   const lead = await prisma.salesLeadAssignment.create({
     data: {
