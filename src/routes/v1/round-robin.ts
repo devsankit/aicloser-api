@@ -20,6 +20,7 @@ export interface RoundRobinSettings {
   allowNonAdminImportData: boolean;
   allowNonAdminExportData: boolean;
   allowNonAdminBulkCampaigns: boolean;
+  allowQrLeadsRoundRobin: boolean;
   workingHoursOnly: boolean;
   workingHours: {
     start: string; // HH:mm
@@ -41,6 +42,7 @@ const DEFAULT_ROUND_ROBIN_SETTINGS: RoundRobinSettings = {
   allowNonAdminImportData: true,
   allowNonAdminExportData: false,
   allowNonAdminBulkCampaigns: false,
+  allowQrLeadsRoundRobin: false,
   workingHoursOnly: false,
   workingHours: {
     start: '09:00',
@@ -154,6 +156,7 @@ const updateSettingsSchema = z.object({
   allowNonAdminImportData: z.boolean().optional(),
   allowNonAdminExportData: z.boolean().optional(),
   allowNonAdminBulkCampaigns: z.boolean().optional(),
+  allowQrLeadsRoundRobin: z.boolean().optional(),
   workingHoursOnly: z.boolean().optional(),
   workingHours: z.object({
     start: z.string().regex(/^\d{2}:\d{2}$/),

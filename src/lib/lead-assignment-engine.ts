@@ -203,6 +203,39 @@ export async function assignLeadToNextCloser(params: {
     };
   }
 
+  // Personal WhatsApp Companion / QR lead handling:
+  // If allowQrLeadsRoundRobin is disabled (default), leads stay strictly with the scanning closer.
+  const isQrSource =
+    source.toUpperCase().includes('QR') ||
+    source.toUpperCase().includes('COMPANION') ||
+    Boolean(lead.notes && (lead.notes.toLowerCase().includes('wa business scanner') || lead.notes.toLowerCase().includes('qr scanner')));
+
+  if (isQrSource && !rrSettings.allowQrLeadsRoundRobin) {
+    let targetCloserId = preferredCloserId || lead.assignedAgentId;
+    if (targetCloserId) {
+      const prof = await prisma.salesAgentProfile.findUnique({
+        where: { id: targetCloserId },
+        include: { user: { select: { displayName: true } } },
+      }).catch(() => null);
+      if (prof) {
+        await prisma.salesLeadAssignment.update({
+          where: { id: lead.id },
+          data: { assignedAgentId: prof.id, updatedAt: new Date() },
+        });
+        return {
+          assigned: true,
+          leadId: lead.id,
+          assignedAgentId: prof.id,
+          agentName: prof.user.displayName || 'Closer',
+          stage: lead.stage,
+          distributionMode: 'SCANNER_DEDICATED',
+          source,
+          reason: 'Personal WhatsApp QR lead locked strictly to scanning team member (round-robin for scanned leads is OFF)',
+        };
+      }
+    }
+  }
+
   // Fetch strictly eligible non-admin closers
   const maxQuota = rrSettings.maxActiveLeadsPerCloser || 50;
   let allClosers = await getEligibleClosers(tenantId, maxQuota);

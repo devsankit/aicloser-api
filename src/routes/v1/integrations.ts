@@ -1,5 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { Readable } from 'node:stream';
+import fs from 'node:fs';
+import path from 'node:path';
 import { z } from 'zod';
 import { prisma } from '../../lib/prisma.js';
 import { decryptWhatsAppToken, encryptSecret } from '../../lib/crypto-vault.js';
@@ -686,8 +688,42 @@ export interface WhatsAppCompanionDevice {
 }
 
 const companionDevicesStore = new Map<string, WhatsAppCompanionDevice[]>();
+const DEVICES_STORAGE_PATH = path.join(process.cwd(), '.aicloser', 'whatsapp-companion-devices.json');
+
+function ensureDevicesLoaded() {
+  if (companionDevicesStore.size === 0) {
+    try {
+      if (fs.existsSync(DEVICES_STORAGE_PATH)) {
+        const raw = fs.readFileSync(DEVICES_STORAGE_PATH, 'utf-8');
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === 'object') {
+          for (const [k, v] of Object.entries(parsed)) {
+            if (Array.isArray(v)) companionDevicesStore.set(k, v as WhatsAppCompanionDevice[]);
+          }
+        }
+      }
+    } catch (e) {
+      logger.warn('Failed to read companion devices storage', { error: String(e) });
+    }
+  }
+}
+
+function persistDevicesToDisk() {
+  try {
+    const dir = path.dirname(DEVICES_STORAGE_PATH);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    const obj: Record<string, WhatsAppCompanionDevice[]> = {};
+    for (const [k, v] of companionDevicesStore.entries()) {
+      obj[k] = v;
+    }
+    fs.writeFileSync(DEVICES_STORAGE_PATH, JSON.stringify(obj, null, 2), 'utf-8');
+  } catch (e) {
+    logger.warn('Failed to persist companion devices to disk', { error: String(e) });
+  }
+}
 
 function getTenantDevices(tenantId: string): WhatsAppCompanionDevice[] {
+  ensureDevicesLoaded();
   let list = companionDevicesStore.get(tenantId);
   if (!list) {
     list = [];
@@ -699,7 +735,12 @@ function getTenantDevices(tenantId: string): WhatsAppCompanionDevice[] {
 // GET /whatsapp/devices - List all linked companion WhatsApp accounts
 integrationsRouter.get('/whatsapp/devices', async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
-  const devices = getTenantDevices(tenantId);
+  let devices = getTenantDevices(tenantId);
+
+  // If requester is a regular sales agent, show only their own scanned companion device
+  if (req.user?.role === 'SALES_AGENT') {
+    devices = devices.filter((d) => !d.scannedByUserId || d.scannedByUserId === req.user?.userId);
+  }
 
   const totalPendingLeads = devices.reduce((sum, d) => sum + (d.status === 'connected' ? d.pendingLeads : 0), 0);
   const totalActiveThreads = devices.reduce((sum, d) => sum + (d.status === 'connected' ? d.activeConversations : 0), 0);
@@ -778,6 +819,7 @@ integrationsRouter.post('/whatsapp/devices/confirm-pair', validateBody(confirmPa
 
   devices.unshift(newDevice);
   companionDevicesStore.set(tenantId, devices);
+  persistDevicesToDisk();
 
   res.status(201).json({
     success: true,
@@ -900,6 +942,7 @@ integrationsRouter.delete('/whatsapp/devices/:id', async (req: Request, res: Res
 
   devices = devices.filter((d) => d.id !== id);
   companionDevicesStore.set(tenantId, devices);
+  persistDevicesToDisk();
 
   res.json({
     success: true,

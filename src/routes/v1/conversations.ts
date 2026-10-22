@@ -154,6 +154,28 @@ async function checkConversationAccess(
   }
 
   const tenantId = req.tenantId!;
+  const payload = (conversation.payload as Record<string, unknown>) || {};
+  const isPersonalQr = Boolean(
+    payload.isPersonalQr ||
+    payload.scannedByUserId ||
+    (conversation as any).serviceSlug === 'manual-chat'
+  );
+  const scannedByUserId = (payload.scannedByUserId as string | undefined) || undefined;
+
+  // Personal companion WhatsApp chats belong strictly to the closer who scanned them and Admin/SuperAdmin.
+  // Even under COMPANY_WIDE visibility, Closer B cannot see Anshita's personal WhatsApp chats unless
+  // explicitly assigned to Closer B or shared.
+  if (isPersonalQr && scannedByUserId && scannedByUserId !== user.userId) {
+    const scope = await getWorkspaceScope(tenantId, user);
+    const isAssigned = conversation.assignedFreelancerId && scope.profileIds.includes(conversation.assignedFreelancerId);
+    const shares = Array.isArray(payload.shares) ? (payload.shares as ConversationShareRecord[]) : [];
+    const activeShare = shares.find((s) => !s.revokedAt && (s.userId === user.userId || (s.agentProfileId && scope.profileIds.includes(s.agentProfileId))));
+    
+    if (!isAssigned && !activeShare) {
+      return { hasAccess: false, isOwnerOrAssigned: false, isShared: false, permission: 'VIEW' };
+    }
+  }
+
   const mode = user.role === 'SALES_AGENT' ? await getChatVisibilityMode(tenantId) : 'ASSIGNED_ONLY';
   if (mode === 'COMPANY_WIDE') {
     return { hasAccess: true, isOwnerOrAssigned: true, isShared: false, permission: 'REPLY' };
@@ -183,7 +205,6 @@ async function checkConversationAccess(
   }
 
   // 3. Check if explicitly shared with this user (active share with no revokedAt)
-  const payload = (conversation.payload as Record<string, unknown>) || {};
   const shares = Array.isArray(payload.shares) ? (payload.shares as ConversationShareRecord[]) : [];
   const activeShare = shares.find((s) => {
     if (s.revokedAt) return false;
@@ -439,7 +460,18 @@ conversationsRouter.get('/', validateQuery(listConversationsQuerySchema), async 
           ...(convIds.length > 0 ? [{ id: { in: convIds } }] : []),
           ...phoneMatchConditions(phones),
           { payload: { path: ['sharedUserIds'], array_contains: req.user.userId } },
+          { payload: { path: ['scannedByUserId'], equals: req.user.userId } },
           ...(profile ? [{ payload: { path: ['sharedUserIds'], array_contains: profile.id } }] : []),
+        ],
+      });
+    } else {
+      // In COMPANY_WIDE mode, sales reps see all general/API channels,
+      // but personal companion QR chats remain isolated to the scanning closer.
+      andConditions.push({
+        OR: [
+          { payload: { path: ['isPersonalQr'], not: true } },
+          { payload: { path: ['scannedByUserId'], equals: req.user.userId } },
+          { payload: { path: ['sharedUserIds'], array_contains: req.user.userId } },
         ],
       });
     }
