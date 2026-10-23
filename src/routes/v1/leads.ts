@@ -16,7 +16,7 @@ import { persistApiRealtimeEvent } from '../../lib/realtime.js';
 import { syncMarketingContactForLead, normalizeLeadPhone, deleteContactsAndLinkedLeadsTransactional, syncLeadConversationAssignment } from '../../lib/lead-contact-sync.js';
 import { getWorkspaceScope, checkSameReportingTeam } from '../../lib/workspace-scope.js';
 import { getWorkspaceStages } from './stages.js';
-import { syncAndRotatePoolSlots, type MissedLeadRecord } from '../../lib/grab-pool-rotation.js';
+import { syncAndRotatePoolSlots, recordPoolLeadClaimedByPeer, type MissedLeadRecord } from '../../lib/grab-pool-rotation.js';
 
 export const leadsRouter = Router();
 
@@ -903,17 +903,43 @@ leadsRouter.get('/pool', async (req: Request, res: Response) => {
   // 1. Run slot rotation engine and detect expired / missed pool leads
   const { slottedPoolLeads, wsSettings } = await syncAndRotatePoolSlots(tenantId, profile?.id);
 
-  // 2. Read dynamic capacity: workspace.settings.roundRobinSettings.maxVisibleToCloser || 5
+  // 2. Read dynamic capacity: workspace.settings.roundRobinSettings.maxVisibleToCloser || 25
   const rrSettings = (wsSettings.roundRobinSettings as Record<string, any>) || {};
-  const configuredCapacity = Number(rrSettings.maxVisibleToCloser) || 5;
+  const grabCapacity = Number(rrSettings.maxVisibleToCloser) || Number(wsSettings.poolCapacity) || 25;
 
   const isSalesAgent = user?.role === 'SALES_AGENT' || (user?.role as any) === 'CLOSER';
+  const isAdmin = user?.role === 'ADMIN' || user?.role === 'SUPER_ADMIN' || user?.role === 'MANAGER';
   const maxVisibleParam = req.query.maxVisibleToCloser || req.query.limit;
   const maxVisibleToCloser = isSalesAgent
-    ? configuredCapacity
+    ? grabCapacity
     : (maxVisibleParam
         ? Math.min(50, Math.max(1, isNaN(Number(maxVisibleParam)) ? 50 : Number(maxVisibleParam)))
         : 50);
+
+  // Dynamically resolve entry stage of the Kanban board
+  const stages = await getWorkspaceStages(tenantId);
+  const initialStageKey = stages[0]?.key || 'NEW';
+  const initialStageLabel = stages[0]?.label || 'New Lead';
+
+  // Calculate closer's leads in initialStageKey
+  const initialStageCount = profile
+    ? await prisma.salesLeadAssignment.count({
+        where: {
+          tenantId,
+          assignedAgentId: profile.id,
+          stage: initialStageKey as any,
+          NOT: {
+            customFields: {
+              path: ['inGrabPool'],
+              equals: true,
+            },
+          },
+        },
+      })
+    : 0;
+
+  const availableSlots = Math.max(0, grabCapacity - initialStageCount);
+  const isAtQuota = !isAdmin && initialStageCount >= grabCapacity;
 
   // 3. Query open pool items
   const poolLeads = await prisma.salesLeadPoolItem.findMany({
@@ -961,6 +987,12 @@ leadsRouter.get('/pool', async (req: Request, res: Response) => {
     totalPoolCount: poolLeads.length,
     mySlottedCount: formattedLeads.length,
     maxVisibleToCloser,
+    initialStageKey,
+    initialStageLabel,
+    initialStageCount,
+    grabCapacity,
+    availableSlots,
+    isAtQuota,
     error: null,
   });
 });
@@ -975,7 +1007,7 @@ leadsRouter.get('/missed', async (req: Request, res: Response) => {
   const profile = isSalesAgent
     ? await prisma.salesAgentProfile.findFirst({
         where: { userId: user.userId, tenantId },
-        select: { id: true },
+        select: { id: true, agentCode: true, user: { select: { displayName: true } } },
       })
     : null;
 
@@ -986,13 +1018,33 @@ leadsRouter.get('/missed', async (req: Request, res: Response) => {
   const wsSettings = (workspace?.settings as Record<string, any>) || {};
   const allMissedLeads: MissedLeadRecord[] = Array.isArray(wsSettings.missedLeads) ? wsSettings.missedLeads : [];
 
+  // Query agent profiles to enrich agent display names
+  const agentIds = Array.from(new Set(allMissedLeads.map((m) => m.agentId).filter(Boolean)));
+  const profiles = agentIds.length > 0
+    ? await prisma.salesAgentProfile.findMany({
+        where: { tenantId, id: { in: agentIds } },
+        include: { user: { select: { displayName: true, email: true } } },
+      })
+    : [];
+  const profileMap = new Map(profiles.map((p) => [p.id, p.user?.displayName || p.agentCode]));
+
+  const enrichedMissedLeads = allMissedLeads.map((m) => ({
+    ...m,
+    agentName: m.agentName || profileMap.get(m.agentId) || 'Sales Closer',
+  }));
+
   if (isSalesAgent) {
     const myMissed = profile
-      ? allMissedLeads.filter((m) => m.agentId === profile.id)
+      ? enrichedMissedLeads.filter((m) => m.agentId === profile.id)
       : [];
 
     res.json({
       success: true,
+      data: {
+        totalMissed: myMissed.length,
+        myMissed: myMissed.length,
+        items: myMissed,
+      },
       totalMissed: myMissed.length,
       myMissed: myMissed.length,
       items: myMissed,
@@ -1004,14 +1056,21 @@ leadsRouter.get('/missed', async (req: Request, res: Response) => {
   // Admin / Manager: team-wide breakdown
   const agentBreakdown: Record<string, number> = {};
   for (const m of allMissedLeads) {
-    agentBreakdown[m.agentId] = (agentBreakdown[m.agentId] || 0) + 1;
+    const name = profileMap.get(m.agentId) || m.agentId;
+    agentBreakdown[name] = (agentBreakdown[name] || 0) + 1;
   }
 
   res.json({
     success: true,
-    totalMissed: allMissedLeads.length,
+    data: {
+      totalMissed: enrichedMissedLeads.length,
+      myMissed: 0,
+      items: enrichedMissedLeads,
+      agentBreakdown,
+    },
+    totalMissed: enrichedMissedLeads.length,
     myMissed: 0,
-    items: allMissedLeads,
+    items: enrichedMissedLeads,
     agentBreakdown,
     error: null,
   });
@@ -2606,11 +2665,24 @@ async function handlePoolClaim(req: Request, res: Response) {
     return;
   }
 
-  const activeLeadCount = await prisma.salesLeadAssignment.count({
+  // Dynamically resolve entry stage of the Kanban board
+  const stages = await getWorkspaceStages(tenantId);
+  const initialStageKey = stages[0]?.key || 'NEW';
+  const initialStageLabel = stages[0]?.label || 'New Lead';
+
+  const workspace = await prisma.aicloserWorkspace.findUnique({
+    where: { id: tenantId },
+    select: { settings: true },
+  });
+  const wsSettings = (workspace?.settings as Record<string, any>) || {};
+  const rrSettings = (wsSettings.roundRobinSettings as Record<string, any>) || {};
+  const grabCapacity = Number(rrSettings.maxVisibleToCloser) || Number(wsSettings.poolCapacity) || (profile.maxActiveLeads && profile.maxActiveLeads > 0 ? profile.maxActiveLeads : 25);
+
+  const initialStageCount = await prisma.salesLeadAssignment.count({
     where: {
       tenantId,
       assignedAgentId: profile.id,
-      stage: { notIn: inactiveLeadStages },
+      stage: initialStageKey as any,
       NOT: {
         customFields: {
           path: ['inGrabPool'],
@@ -2619,13 +2691,14 @@ async function handlePoolClaim(req: Request, res: Response) {
       },
     },
   });
-  const maxActiveLeads = profile.maxActiveLeads && profile.maxActiveLeads > 0 ? profile.maxActiveLeads : 10;
-  if (activeLeadCount >= maxActiveLeads) {
-    res.status(409).json({
+
+  const isAdmin = user.role === 'ADMIN' || user.role === 'SUPER_ADMIN' || user.role === 'MANAGER';
+  if (!isAdmin && initialStageCount >= grabCapacity) {
+    res.status(400).json({
       success: false,
-      error: 'LeadQuotaReached',
-      message: `This closer already has ${activeLeadCount} of ${maxActiveLeads} allowed active leads`,
-      data: { activeLeadCount, maxActiveLeads },
+      error: 'CapacityReached',
+      message: `You have reached your limit of ${grabCapacity} leads in ${initialStageLabel}. Advance existing leads to claim more.`,
+      data: { initialStageCount, grabCapacity, initialStageKey, initialStageLabel },
     });
     return;
   }
@@ -2677,6 +2750,7 @@ async function handlePoolClaim(req: Request, res: Response) {
             where: { id: existingLead.id },
             data: {
               assignedAgentId: profile.id,
+              stage: initialStageKey as any,
               customFields: { ...customFields, inGrabPool: false, claimedFromPoolAt: new Date().toISOString() },
             },
           });
@@ -2689,6 +2763,7 @@ async function handlePoolClaim(req: Request, res: Response) {
         await tx.salesLeadAssignment.update({
           where: { id: existingLead.id },
           data: {
+            stage: initialStageKey as any,
             customFields: { ...customFields, inGrabPool: false, claimedFromPoolAt: new Date().toISOString() },
           },
         });
@@ -2713,7 +2788,7 @@ async function handlePoolClaim(req: Request, res: Response) {
           segment: poolItem.segment,
           priority: poolItem.priority,
           budgetAmount: poolItem.budgetAmount,
-          stage: 'NEW',
+          stage: initialStageKey as any,
           notes: poolItem.notes,
           conversationId: poolItem.conversationId,
         },
@@ -2744,6 +2819,17 @@ async function handlePoolClaim(req: Request, res: Response) {
       const updatedPoolItem = await tx.salesLeadPoolItem.findUniqueOrThrow({ where: { id: poolItem.id } });
       return { poolItem: updatedPoolItem, lead, deduplicated: Boolean(existingLead), idempotent: false };
     });
+
+    // Call recordPoolLeadClaimedByPeer to record competitive miss for any peer who had this lead slotted
+    // and remove lead from slottedPoolLeads
+    await recordPoolLeadClaimedByPeer(
+      tenantId,
+      poolItemId,
+      profile.id,
+      result.poolItem.customerName,
+      result.poolItem.customerPhone || undefined,
+      result.lead.id
+    ).catch(() => undefined);
 
     await persistApiRealtimeEvent({
       tenantId,

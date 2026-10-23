@@ -1,5 +1,6 @@
 import { prisma } from './prisma.js';
 import { randomUUID } from 'crypto';
+import { getWorkspaceStages } from '../routes/v1/stages.js';
 
 export interface PoolLeadSlot {
   poolItemId: string;
@@ -13,6 +14,7 @@ export interface MissedLeadRecord {
   leadId: string;
   poolItemId: string;
   agentId: string;
+  agentName?: string;
   customerName?: string;
   customerPhone?: string;
   missedAt: string;
@@ -129,9 +131,34 @@ export async function syncAndRotatePoolSlots(
 
   let stateChanged = false;
 
-  // 4. Read configured capacity limit (default 5 leads visible per closer)
+  // 4. Read configured capacity limit (defaults to 25 or workspace round-robin setting)
   const rrSettings = (wsSettings.roundRobinSettings as Record<string, any>) || {};
-  const configuredCapacity = Math.max(1, Number(rrSettings.maxVisibleToCloser) || 5);
+  const configuredCapacity = Math.max(1, Number(rrSettings.maxVisibleToCloser) || Number(wsSettings.poolCapacity) || 25);
+
+  // Dynamically resolve entry stage of the Kanban board
+  const stages = await getWorkspaceStages(tenantId);
+  const initialStageKey = stages[0]?.key || 'NEW';
+
+  // Query closer's active leads strictly in initialStageKey
+  const closerInitialStageCounts: Record<string, number> = {};
+  await Promise.all(
+    activeClosers.map(async (c) => {
+      const count = await prisma.salesLeadAssignment.count({
+        where: {
+          tenantId,
+          assignedAgentId: c.id,
+          stage: initialStageKey as any,
+          NOT: {
+            customFields: {
+              path: ['inGrabPool'],
+              equals: true,
+            },
+          },
+        },
+      });
+      closerInitialStageCounts[c.id] = count;
+    })
+  );
 
   // Clean up slots for items that are no longer OPEN
   const openItemIds = new Set(openPoolItems.map((i) => i.id));
@@ -173,8 +200,13 @@ export async function syncAndRotatePoolSlots(
       } else if (onBreak) {
         // Break mode exemption: closer is on break, no missed lead penalty, rotate slot to next closer
         const currIdx = activeClosers.findIndex((c) => c.id === slot.slottedAgentId);
-        const nextIdx = (currIdx + 1) % activeClosers.length;
-        const nextCloser = activeClosers[nextIdx];
+        let nextCloser = activeClosers.find((c, idx) => idx > currIdx && (closerInitialStageCounts[c.id] || 0) < configuredCapacity);
+        if (!nextCloser) {
+          nextCloser = activeClosers.find((c) => (closerInitialStageCounts[c.id] || 0) < configuredCapacity);
+        }
+        if (!nextCloser) {
+          nextCloser = activeClosers[(currIdx + 1) % activeClosers.length];
+        }
 
         slottedPoolLeads[item.id] = {
           poolItemId: item.id,
@@ -190,6 +222,7 @@ export async function syncAndRotatePoolSlots(
           leadId: item.convertedAssignmentId || item.id,
           poolItemId: item.id,
           agentId: slot.slottedAgentId,
+          agentName: closer?.user?.displayName || closer?.agentCode || undefined,
           customerName: item.customerName,
           customerPhone: item.customerPhone || undefined,
           missedAt: new Date(now).toISOString(),
@@ -197,10 +230,15 @@ export async function syncAndRotatePoolSlots(
         };
         missedLeads.unshift(missedRecord);
 
-        // Find next closer index
+        // Find next closer with remaining initial stage capacity
         const currIdx = activeClosers.findIndex((c) => c.id === slot.slottedAgentId);
-        const nextIdx = (currIdx + 1) % activeClosers.length;
-        const nextCloser = activeClosers[nextIdx];
+        let nextCloser = activeClosers.find((c, idx) => idx > currIdx && (closerInitialStageCounts[c.id] || 0) < configuredCapacity);
+        if (!nextCloser) {
+          nextCloser = activeClosers.find((c) => (closerInitialStageCounts[c.id] || 0) < configuredCapacity);
+        }
+        if (!nextCloser) {
+          nextCloser = activeClosers[(currIdx + 1) % activeClosers.length];
+        }
 
         // Re-slot lead to next closer
         slottedPoolLeads[item.id] = {
@@ -220,7 +258,7 @@ export async function syncAndRotatePoolSlots(
               actorUserId: closer?.userId,
               action: 'POOL_LEAD_MISSED',
               note: `Grab pool lead ${item.customerName} expired without claim by closer ${closer?.user?.displayName || slot.slottedAgentId}. Rotated to ${nextCloser.user?.displayName || nextCloser.agentCode}.`,
-              metadata: { poolItemId: item.id, missedByAgentId: slot.slottedAgentId, rotatedToAgentId: nextCloser.id },
+              metadata: { poolItemId: item.id, missedByAgentId: slot.slottedAgentId, rotatedToAgentId: nextCloser.id, reason: '10-minute pool slot expired without claim' },
             },
           }).catch(() => undefined);
         }
@@ -242,12 +280,14 @@ export async function syncAndRotatePoolSlots(
   for (const item of openPoolItems) {
     if (slottedPoolLeads[item.id]) continue;
 
-    // Find closer with available capacity
-    const availableCloser = activeClosers.find(
-      (c) => (closerSlotCounts[c.id] || 0) < configuredCapacity
-    );
+    // Gate closer eligibility: closer is only eligible for new pool slot if initialStageCount < configuredCapacity
+    const availableCloser = activeClosers.find((c) => {
+      const initialCount = closerInitialStageCounts[c.id] || 0;
+      const slotCount = closerSlotCounts[c.id] || 0;
+      return initialCount < configuredCapacity && slotCount < configuredCapacity;
+    });
     if (!availableCloser) {
-      // All closers have reached their active grab pool capacity limit (e.g. 5 leads each)
+      // All closers have reached their active grab pool capacity limit in initial stage
       // Remaining open items stay in queue without generating slot expiration
       break;
     }
@@ -278,4 +318,99 @@ export async function syncAndRotatePoolSlots(
   }
 
   return { openPoolItems, slottedPoolLeads, missedLeads, wsSettings };
+}
+
+/**
+ * Record competitive miss when Closer B claims a pool lead that was slotted to Closer A
+ */
+export async function recordPoolLeadClaimedByPeer(
+  tenantId: string,
+  poolItemId: string,
+  claimedByAgentId: string,
+  customerName?: string,
+  customerPhone?: string,
+  convertedAssignmentId?: string
+) {
+  const workspace = await prisma.aicloserWorkspace.findUnique({
+    where: { id: tenantId },
+    select: { settings: true },
+  });
+  const wsSettings = (workspace?.settings as Record<string, any>) || {};
+  const slottedPoolLeads: Record<string, PoolLeadSlot> = { ...(wsSettings.slottedPoolLeads || {}) };
+  const missedLeads: MissedLeadRecord[] = [...(wsSettings.missedLeads || [])];
+
+  const slot = slottedPoolLeads[poolItemId];
+
+  // Remove lead from active slotted leads
+  if (slottedPoolLeads[poolItemId]) {
+    delete slottedPoolLeads[poolItemId];
+  }
+
+  // If this lead was slotted to a peer (Closer A) and claimed by Closer B
+  if (slot && slot.slottedAgentId !== claimedByAgentId) {
+    const [closerA, closerB] = await Promise.all([
+      prisma.salesAgentProfile.findUnique({
+        where: { id: slot.slottedAgentId },
+        include: { user: { select: { id: true, displayName: true } } },
+      }),
+      prisma.salesAgentProfile.findUnique({
+        where: { id: claimedByAgentId },
+        include: { user: { select: { id: true, displayName: true } } },
+      }),
+    ]);
+
+    const missedRecord: MissedLeadRecord = {
+      id: `missed-${randomUUID().slice(0, 8)}`,
+      leadId: convertedAssignmentId || poolItemId,
+      poolItemId,
+      agentId: slot.slottedAgentId,
+      agentName: closerA?.user?.displayName || closerA?.agentCode || undefined,
+      customerName: customerName || 'Customer',
+      customerPhone: customerPhone || undefined,
+      missedAt: new Date().toISOString(),
+      reason: 'Grabbed by another closer',
+    };
+
+    missedLeads.unshift(missedRecord);
+
+    await prisma.aicloserWorkspace.update({
+      where: { id: tenantId },
+      data: {
+        settings: {
+          ...wsSettings,
+          slottedPoolLeads,
+          missedLeads: missedLeads.slice(0, 200),
+        } as any,
+        updatedAt: new Date(),
+      },
+    });
+
+    await prisma.salesActivityLog.create({
+      data: {
+        tenantId,
+        assignmentId: convertedAssignmentId || null,
+        actorUserId: closerA?.userId || null,
+        action: 'POOL_LEAD_MISSED',
+        note: `Pool lead ${customerName || poolItemId} was claimed by peer ${closerB?.user?.displayName || claimedByAgentId} while slotted to ${closerA?.user?.displayName || slot.slottedAgentId}.`,
+        metadata: {
+          poolItemId,
+          missedByAgentId: slot.slottedAgentId,
+          claimedByAgentId,
+          reason: 'Grabbed by another closer',
+        },
+      },
+    }).catch(() => undefined);
+  } else {
+    // If it was claimed by the slotted agent or unslotted, clean up slottedPoolLeads
+    await prisma.aicloserWorkspace.update({
+      where: { id: tenantId },
+      data: {
+        settings: {
+          ...wsSettings,
+          slottedPoolLeads,
+        } as any,
+        updatedAt: new Date(),
+      },
+    });
+  }
 }
