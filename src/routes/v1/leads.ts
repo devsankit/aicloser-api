@@ -1224,6 +1224,58 @@ leadsRouter.post('/merge', async (req: Request, res: Response) => {
   res.json({ success: true, message: 'Leads merged successfully', primaryLeadId });
 });
 
+const reorderLeadsSchema = z.object({
+  stage: z.string().optional(),
+  items: z.array(z.object({
+    id: z.string().min(1),
+    kanbanPosition: z.number().int().min(0),
+    stage: z.string().optional(),
+  })).min(1),
+});
+
+// POST /reorder - Batch update kanban positions and stages
+leadsRouter.post('/reorder', validateBody(reorderLeadsSchema), async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const { stage: defaultStage, items } = req.body as z.infer<typeof reorderLeadsSchema>;
+
+  const now = new Date();
+
+  await prisma.$transaction(
+    items.map((item) => {
+      const targetStage = item.stage || defaultStage;
+      const data: Prisma.SalesLeadAssignmentUpdateManyMutationInput = {
+        kanbanPosition: item.kanbanPosition,
+        updatedAt: now,
+      };
+      if (targetStage && (SALES_LEAD_STAGES as readonly string[]).includes(targetStage)) {
+        data.stage = targetStage as SalesLeadStage;
+        data.stageChangedAt = now;
+      }
+      return prisma.salesLeadAssignment.updateMany({
+        where: {
+          id: item.id,
+          tenantId,
+        },
+        data,
+      });
+    })
+  );
+
+  await persistApiRealtimeEvent({
+    tenantId,
+    eventType: 'lead.reordered',
+    payload: {
+      count: items.length,
+      stage: defaultStage,
+      items: items.map((i) => ({ id: i.id, kanbanPosition: i.kanbanPosition, stage: i.stage || defaultStage })),
+      updatedAt: now.toISOString(),
+    },
+    actorUserId: req.user?.userId,
+  }).catch(() => undefined);
+
+  res.json({ success: true, count: items.length });
+});
+
 
 async function verifyLeadAccess(leadId: string, req: Request) {
   const tenantId = req.tenantId!;
