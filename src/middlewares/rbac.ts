@@ -52,11 +52,12 @@ export async function hasPermission(
       }
       if (permission === PERM_LEADS_CLAIM) return profile.canClaimLeads;
       if (permission === PERM_TEAM_MANAGE) return role === 'MANAGER';
-      if (permission === PERM_LEADS_REASSIGN) return true;
       if (permission === 'payouts:approve') return role === 'MANAGER';
-      if (permission === PERM_TEAM_VIEW) return true;
-      if (permission === PERM_CONTACTS_VIEW) return true;
-      return true;
+      if (permission === PERM_TEAM_VIEW) return role === 'MANAGER';
+
+      // No implicit grants. Anything not covered above must come from the
+      // profile map or the workspace role matrix.
+      return false;
     }
   }
 

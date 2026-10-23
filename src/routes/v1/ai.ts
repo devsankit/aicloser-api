@@ -510,7 +510,7 @@ aiRouter.delete('/bot-train/:id', requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN'
   });
 });
 
-aiRouter.get('/bot-train', async (req: Request, res: Response) => {
+aiRouter.get('/bot-train', requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN'), async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
 
   const workspace = await prisma.aicloserWorkspace.findUnique({
@@ -629,7 +629,7 @@ aiRouter.post('/bot-correct', requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN'), v
   });
 });
 
-aiRouter.get('/bot-corrections', async (req: Request, res: Response) => {
+aiRouter.get('/bot-corrections', requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN'), async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
 
   const workspace = await prisma.aicloserWorkspace.findUnique({
@@ -903,7 +903,7 @@ aiRouter.post('/call-summary', validateBody(callSummarySchema), async (req: Requ
 // ==========================================
 
 // GET /providers - List AI providers, active chain, status & models
-aiRouter.get('/providers', async (req: Request, res: Response) => {
+aiRouter.get('/providers', requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN'), async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
 
   const workspace = await prisma.aicloserWorkspace.findUnique({
@@ -1028,7 +1028,7 @@ const systemPromptSchema = z.object({
 });
 
 // GET /system-prompt - Retrieve saved closer AI system prompt
-aiRouter.get('/system-prompt', async (req: Request, res: Response) => {
+aiRouter.get('/system-prompt', requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN'), async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
 
   const workspace = await prisma.aicloserWorkspace.findUnique({

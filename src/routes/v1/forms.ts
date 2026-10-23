@@ -3,9 +3,12 @@ import { z } from 'zod';
 import { prisma } from '../../lib/prisma.js';
 import { authenticate } from '../../middlewares/auth.js';
 import { enforceTenantIsolation } from '../../middlewares/tenant-isolation.js';
+import { requireRoles } from '../../middlewares/rbac.js';
 import { logger } from '../../lib/logger.js';
 
 export const formsRouter = Router();
+
+const requireFormAdmin = requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN');
 
 // ==========================================
 // Public Form Retrieval & Submission (No Auth Required)
@@ -408,12 +411,12 @@ const upsertFormHandler = async (req: Request, res: Response) => {
 };
 
 // PUT & POST & PATCH /forms/:slug (upsert form configuration)
-formsRouter.put('/:slug', upsertFormHandler);
-formsRouter.post('/:slug', upsertFormHandler);
-formsRouter.patch('/:slug', upsertFormHandler);
+formsRouter.put('/:slug', requireFormAdmin, upsertFormHandler);
+formsRouter.post('/:slug', requireFormAdmin, upsertFormHandler);
+formsRouter.patch('/:slug', requireFormAdmin, upsertFormHandler);
 
 // POST /forms (create form with auto-generated or body slug)
-formsRouter.post('/', async (req: Request, res: Response) => {
+formsRouter.post('/', requireFormAdmin, async (req: Request, res: Response) => {
   const body = req.body || {};
   if (!body.slug && !body.title) {
     res.status(400).json({ ok: false, success: false, error: 'TitleOrSlugRequired', message: 'Title or slug is required' });
@@ -425,7 +428,7 @@ formsRouter.post('/', async (req: Request, res: Response) => {
 });
 
 // DELETE /forms/:slug (delete form)
-formsRouter.delete('/:slug', async (req: Request, res: Response) => {
+formsRouter.delete('/:slug', requireFormAdmin, async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const target = String(req.params.slug || '').trim().toLowerCase();
 

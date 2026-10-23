@@ -11,6 +11,27 @@ import { SalesAgentStatus } from '@prisma/client';
 export const teamRouter = Router();
 
 teamRouter.use(authenticate, enforceTenantIsolation);
+const PRIVILEGED_ROLES = ["ADMIN", "SUPER_ADMIN"] as const;
+
+const canMintRole = (actorRole: string, targetRole: string) => {
+  if (actorRole === "SUPER_ADMIN") return true;
+  if (actorRole === "ADMIN") return true;
+  return !PRIVILEGED_ROLES.includes(targetRole as any);
+};
+
+const maskEmail = (value?: string | null) => {
+  if (!value) return null;
+  const [local, domain] = value.split("@");
+  if (!domain) return "•••";
+  return `${local.slice(0, 1)}•••@${domain}`;
+};
+
+const maskPhone = (value?: string | null) => {
+  if (!value) return null;
+  const digits = value.replace(/\D/g, "");
+  return digits.length >= 4 ? `••••••${digits.slice(-4)}` : "••••••";
+};
+
 
 const updateAgentSchema = z.object({
   status: z.nativeEnum(SalesAgentStatus).optional(),
@@ -204,6 +225,7 @@ teamRouter.get('/', async (req: Request, res: Response) => {
   ]);
 
   const canSeeCommissions = user.role === 'SUPER_ADMIN' || user.role === 'ADMIN';
+  const canViewDirectory = user.role === 'SUPER_ADMIN' || user.role === 'ADMIN' || user.role === 'MANAGER';
   const canSeeTeamMetrics = user.role === 'SUPER_ADMIN' || user.role === 'ADMIN' || await hasPermission(user.userId, tenantId, user.role, PERM_TEAM_VIEW);
 
   let filteredProfiles = profiles;
@@ -239,8 +261,8 @@ teamRouter.get('/', async (req: Request, res: Response) => {
       id: p.id,
       userId: p.user.id,
       displayName: p.user.displayName,
-      email: p.user.email,
-      phone: p.user.phone,
+      email: canViewDirectory ? p.user.email : maskEmail(p.user.email),
+      phone: canViewDirectory ? p.user.phone : maskPhone(p.user.phone),
       role: p.user.role,
       agentCode: p.agentCode,
       status: p.status,
@@ -275,8 +297,8 @@ teamRouter.get('/', async (req: Request, res: Response) => {
           id: au.id,
           userId: au.id,
           displayName: au.displayName,
-          email: au.email,
-          phone: au.phone,
+          email: canViewDirectory ? au.email : maskEmail(au.email),
+          phone: canViewDirectory ? au.phone : maskPhone(au.phone),
           role: au.role,
           agentCode: 'ADMIN',
           status: 'ACTIVE' as SalesAgentStatus,
@@ -406,6 +428,14 @@ const handleInvite = async (req: Request, res: Response) => {
   const normalizedEmail = body.email.toLowerCase().trim();
   const rawRole = (body.role || 'SALES_AGENT').toUpperCase();
   const normalizedRole = rawRole === 'CLOSER' ? 'SALES_AGENT' : rawRole;
+
+  if (!canMintRole(req.user!.role, normalizedRole)) {
+    return res.status(403).json({
+      success: false,
+      error: "RoleEscalationBlocked",
+      message: "Only an admin can create admin accounts.",
+    });
+  }
 
   // Phone normalization
   let normalizedPhone: string | null = null;
@@ -920,6 +950,23 @@ teamRouter.patch('/:id', requirePermissions(PERM_TEAM_MANAGE), validateBody(upda
   delete (body as any).name;
   delete (body as any).maxCapacity;
 
+  if (body.role) {
+    if (!canMintRole(req.user!.role, body.role)) {
+      return res.status(403).json({
+        success: false,
+        error: "RoleEscalationBlocked",
+        message: "Only an admin can create admin accounts.",
+      });
+    }
+    if (req.user!.role === "MANAGER") {
+      return res.status(403).json({
+        success: false,
+        error: "RoleChangeForbidden",
+        message: "Managers cannot change workspace roles.",
+      });
+    }
+  }
+
   const profile = await prisma.salesAgentProfile.findFirst({
     where: {
       tenantId,
@@ -1058,7 +1105,7 @@ teamRouter.patch('/:id', requirePermissions(PERM_TEAM_MANAGE), validateBody(upda
 // ==========================================
 
 // GET /permissions/matrix - Get system permissions catalog and default role templates
-teamRouter.get('/permissions/matrix', async (req: Request, res: Response) => {
+teamRouter.get('/permissions/matrix', requireRoles('ADMIN', 'MANAGER', 'SUPER_ADMIN'), async (req: Request, res: Response) => {
   const permissionsCatalog = [
     // CRM & Leads
     { key: 'leads:view', label: 'View Leads & Pipeline', category: 'Leads & Pipeline', description: 'Access workspace leads and Kanban stages' },
@@ -1391,6 +1438,30 @@ const handleUpdatePermissions = async (req: Request, res: Response) => {
   if (!profile) {
     res.status(404).json({ success: false, error: 'NotFound', message: 'Team member profile not found' });
     return;
+  }
+
+  const ADMIN_ONLY_PERMISSIONS = new Set([
+    "payouts:approve",
+    "customer:unmask_phone",
+    "leads:delete",
+    "leads:permanent_delete",
+    "team:manage",
+    "integrations:manage",
+  ]);
+
+  if (req.user!.role !== "ADMIN" && req.user!.role !== "SUPER_ADMIN") {
+    const requested = Object.entries(permissions || {})
+      .filter(([, granted]) => Boolean(granted))
+      .map(([key]) => key);
+
+    const forbidden = requested.filter((key) => ADMIN_ONLY_PERMISSIONS.has(key));
+    if (forbidden.length > 0 || req.user!.userId === String(profile.userId)) {
+      return res.status(403).json({
+        success: false,
+        error: "PermissionEscalationBlocked",
+        message: `Managers cannot grant: ${forbidden.join(", ") || "permissions to themselves"}`,
+      });
+    }
   }
 
   const updated = await prisma.salesAgentProfile.update({
