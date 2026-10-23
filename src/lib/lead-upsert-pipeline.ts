@@ -19,6 +19,7 @@ export interface UpsertLeadParams {
   assignedAgentId?: string | null;
   createdById?: string | null;
   duplicateAction?: 'SKIP' | 'UPDATE' | 'OVERWRITE';
+  distributionMode?: 'AUTO' | 'ROUND_ROBIN' | 'POOL' | 'MANUAL';
   actorUserId?: string | null;
 }
 
@@ -55,6 +56,7 @@ export async function upsertCompanyLead(params: UpsertLeadParams): Promise<Upser
     conversationId,
     createdById,
     duplicateAction = 'UPDATE',
+    distributionMode,
     actorUserId,
   } = params;
 
@@ -229,6 +231,7 @@ export async function upsertCompanyLead(params: UpsertLeadParams): Promise<Upser
       leadId: newLead.id,
       source: upperSource,
       preferredCloserId: params.assignedAgentId || undefined,
+      distributionMode,
       actorUserId: actorUserId || undefined,
     });
   } catch (rrErr) {

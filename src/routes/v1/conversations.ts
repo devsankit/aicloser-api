@@ -2031,7 +2031,7 @@ conversationsRouter.post('/:id/share', validateBody(directShareBodySchema), asyn
       userId: targetUserId,
       sharedByUserId: req.user!.userId,
       sharedByUserName: req.user!.displayName || req.user!.email,
-      permission: 'REPLY',
+      permission: 'VIEW',
       createdAt: new Date().toISOString(),
       revokedAt: null,
     });
@@ -2071,7 +2071,7 @@ conversationsRouter.post('/:id/share', validateBody(directShareBodySchema), asyn
 
 const createShareSchema = z.object({
   userId: z.string().min(1, 'Target userId or agentProfileId is required'),
-  permission: z.enum(['VIEW', 'REPLY']).default('REPLY'),
+  permission: z.enum(['VIEW', 'REPLY']).default('VIEW'),
 });
 
 // POST /:id/shares - Share conversation with another agent/user
@@ -3025,6 +3025,28 @@ conversationsRouter.post('/:id/payment-request', async (req: Request, res: Respo
   const existingPayload = (conversation.payload as Record<string, unknown>) || {};
   const currentPayment = (existingPayload.latestPaymentRequest as Record<string, unknown>) || null;
 
+  // Resolve linked lead if exists
+  const leadId = (existingPayload.leadId as string) || null;
+  let linkedLead = leadId
+    ? await prisma.salesLeadAssignment.findFirst({ where: { id: leadId, tenantId } })
+    : null;
+  if (!linkedLead && conversation.customerPhone) {
+    const rawPhone = conversation.customerPhone.trim();
+    const phoneDigits = rawPhone.replace(/\D/g, '');
+    const last10 = phoneDigits.length >= 10 ? phoneDigits.slice(-10) : phoneDigits;
+    linkedLead = await prisma.salesLeadAssignment.findFirst({
+      where: {
+        tenantId,
+        OR: [
+          { customerPhone: rawPhone },
+          ...(last10.length >= 7 ? [{ customerPhone: { contains: last10 } }] : []),
+          { conversationId: id },
+        ],
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+  }
+
   if (action === 'mark-status') {
     const nextStatus = String(body.status || 'Paid');
     const paymentRequestId = String(body.paymentRequestId || currentPayment?.id || '');
@@ -3034,6 +3056,37 @@ conversationsRouter.post('/:id/payment-request', async (req: Request, res: Respo
       status: nextStatus,
       updatedAt: new Date().toISOString(),
     };
+
+    if (paymentRequestId) {
+      const matchStatus = nextStatus.toUpperCase() === 'PAID' ? 'PAID' : 'PENDING';
+      await prisma.upiPaymentLink.updateMany({
+        where: {
+          tenantId,
+          OR: [
+            { customFields: { path: ['paymentRequestId'], equals: paymentRequestId } },
+            { id: paymentRequestId },
+          ],
+        },
+        data: {
+          status: matchStatus as any,
+          ...(matchStatus === 'PAID' ? { paidAt: new Date() } : {}),
+          updatedAt: new Date(),
+        },
+      }).catch(() => undefined);
+    }
+
+    if (linkedLead && nextStatus.toUpperCase() === 'PAID') {
+      await prisma.salesLeadTimelineEntry.create({
+        data: {
+          tenantId,
+          leadId: linkedLead.id,
+          type: 'PAYMENT_RECEIVED',
+          body: `Payment marked as Paid: ${currentPayment?.amount ? `₹${currentPayment.amount}` : ''}`,
+          metadata: { paymentRequestId },
+        },
+      }).catch(() => undefined);
+    }
+
     await prisma.appConversation.update({
       where: { id },
       data: {
@@ -3080,25 +3133,96 @@ conversationsRouter.post('/:id/payment-request', async (req: Request, res: Respo
   const title = String(body.title || body.projectTitle || 'Project Payment').trim();
   const note = String(body.note || '').trim();
 
-  const upiId = String(body.payeeUpiId || 'payments@phonepe').trim();
-  const encodedTitle = encodeURIComponent(title);
-  const upiLink = `upi://pay?pa=${encodeURIComponent(upiId)}&pn=AICloser&am=${amount}&tn=${encodedTitle}&cu=INR`;
+  // Load configured workspace payment gateway settings (zero hardcoded fallback)
+  const paymentSettings = await prisma.upiPaymentSetting.findUnique({ where: { tenantId } });
+  const upiId = String(body.payeeUpiId || paymentSettings?.upiId || 'aicloser@upi').trim();
+  const payeeName = String(paymentSettings?.payeeName || 'AI Closer CRM').trim();
+
+  const publicToken = randomUUID().replace(/-/g, '').slice(0, 16);
+  const payUrl = `https://app.aicloser.in/pay/${publicToken}`;
+  const upiLink = `upi://pay?pa=${encodeURIComponent(upiId)}&pn=${encodeURIComponent(payeeName)}&am=${amount.toFixed(2)}&cu=INR&tn=${encodeURIComponent(title)}`;
+
+  // Create real database row in upiPaymentLink
+  let authUserId = req.user?.userId;
+  if (!authUserId) {
+    const fallbackUser = await prisma.appAuthUser.findFirst({ where: { tenantId } });
+    authUserId = fallbackUser?.id;
+  }
+
+  if (authUserId) {
+    await prisma.upiPaymentLink.create({
+      data: {
+        tenantId,
+        publicToken,
+        createdByUserId: authUserId,
+        customerName: conversation.customerName || linkedLead?.customerName || 'Valued Customer',
+        customerPhone: conversation.customerPhone || linkedLead?.customerPhone || '',
+        customerEmail: linkedLead?.customerEmail || null,
+        productName: title,
+        totalAmount: amount,
+        baseAmount: amount,
+        duration: 1,
+        durationUnit: 'DAY' as any,
+        durationMultiplier: 1,
+        currency: 'INR',
+        status: 'PENDING',
+        upiIdSnapshot: upiId,
+        payeeNameSnapshot: payeeName,
+        customFields: {
+          conversationId: id,
+          leadId: linkedLead?.id || null,
+          paymentRequestId,
+        },
+      },
+    }).catch((err) => {
+      logger.warn('Failed to create upiPaymentLink row for conversation payment request', { error: String(err) });
+    });
+  }
+
+  // Synchronize budget amount and timeline on the linked lead
+  if (linkedLead) {
+    await prisma.salesLeadAssignment.update({
+      where: { id: linkedLead.id },
+      data: {
+        budgetAmount: amount,
+        updatedAt: new Date(),
+      },
+    }).catch(() => undefined);
+
+    await prisma.salesLeadTimelineEntry.create({
+      data: {
+        tenantId,
+        leadId: linkedLead.id,
+        type: 'PAYMENT_LINK_GENERATED',
+        body: `Payment request created for ₹${amount.toLocaleString('en-IN')} (${title}): ${payUrl}`,
+        metadata: { paymentRequestId, amount, publicToken, payUrl },
+      },
+    }).catch(() => undefined);
+  }
 
   const newPayment = {
     id: paymentRequestId,
+    publicToken,
     amount,
     title,
     note,
     status: 'Sent',
     paymentLink: upiLink,
+    payUrl,
+    payeeUpiId: upiId,
+    payeeName,
     payeeRole: body.payeeRole || 'agency',
     createdAt: new Date().toISOString(),
   };
 
   const rawMessages = Array.isArray(existingPayload.messages) ? (existingPayload.messages as Record<string, unknown>[]) : [];
+  const prevPaymentRequests = Array.isArray(existingPayload.paymentRequests)
+    ? (existingPayload.paymentRequests as Record<string, unknown>[])
+    : (existingPayload.latestPaymentRequest ? [existingPayload.latestPaymentRequest as Record<string, unknown>] : []);
+
   const paymentMessage = {
     id: `msg-${randomUUID()}`,
-    body: `Payment request: ₹${amount.toLocaleString('en-IN')} for ${title}${note ? ` (${note})` : ''}`,
+    body: `Payment request: ₹${amount.toLocaleString('en-IN')} for ${title}${note ? ` (${note})` : ''} - Pay online: ${payUrl}`,
     senderRole: req.user?.role === 'SALES_AGENT' ? 'sales' : 'system',
     senderLabel: req.user?.displayName || 'Sales Closer',
     createdAt: new Date().toISOString(),
@@ -3111,6 +3235,7 @@ conversationsRouter.post('/:id/payment-request', async (req: Request, res: Respo
         sizeLabel: `₹${amount}`,
         note: `Payment request for ₹${amount}`,
         paymentRequestId,
+        payUrl,
       },
     ],
   };
@@ -3121,6 +3246,7 @@ conversationsRouter.post('/:id/payment-request', async (req: Request, res: Respo
       payload: {
         ...existingPayload,
         latestPaymentRequest: newPayment,
+        paymentRequests: [...prevPaymentRequests, newPayment],
         messages: [...rawMessages, paymentMessage],
       } as unknown as Prisma.InputJsonValue,
     },

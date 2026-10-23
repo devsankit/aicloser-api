@@ -249,3 +249,47 @@ export async function deleteContactsAndLinkedLeadsTransactional(
     deletedLeadId: finalLeadIds[0] || null,
   };
 }
+
+
+/** Atomically synchronizes linked conversation ownership whenever a lead is reassigned or claimed. */
+export async function syncLeadConversationAssignment(
+  tenantId: string,
+  lead: { id: string; customerPhone?: string | null; conversationId?: string | null },
+  targetAgent: { id: string; agentCode?: string | null; user?: { id?: string; displayName?: string | null; email?: string | null } | null }
+) {
+  const normPhone = normalizeLeadPhone(lead.customerPhone);
+  const conv = lead.conversationId
+    ? await prisma.appConversation.findFirst({
+        where: { id: lead.conversationId, tenantId },
+      })
+    : await prisma.appConversation.findFirst({
+        where: {
+          tenantId,
+          OR: [
+            ...(lead.customerPhone ? [{ customerPhone: lead.customerPhone }] : []),
+            ...(normPhone ? [{ customerPhone: normPhone }] : []),
+            { payload: { path: ['leadId'], equals: lead.id } },
+          ],
+        },
+      });
+
+  if (conv) {
+    const payload = (conv.payload && typeof conv.payload === 'object' && !Array.isArray(conv.payload))
+      ? { ...(conv.payload as Record<string, any>) }
+      : {};
+    const displayName = targetAgent.user?.displayName || targetAgent.agentCode || 'Assigned Closer';
+    payload.assignedTo = displayName;
+    payload.assignedAgentId = targetAgent.id;
+    payload.assignedFreelancerId = targetAgent.id;
+
+    await prisma.appConversation.update({
+      where: { id: conv.id },
+      data: {
+        assignedFreelancerId: targetAgent.id,
+        assignedFreelancerName: displayName,
+        payload: payload as any,
+        updatedAt: new Date(),
+      },
+    }).catch(() => undefined);
+  }
+}

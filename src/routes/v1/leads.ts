@@ -13,7 +13,7 @@ import { validateBody, validateQuery } from '../../middlewares/validate.js';
 import { SalesLeadStage, salesLeadStageSchema, SALES_LEAD_STAGES } from '../../types/leads.js';
 import { hasPermission, requirePermissions, PERM_LEADS_CLAIM, PERM_LEADS_REASSIGN } from '../../middlewares/rbac.js';
 import { persistApiRealtimeEvent } from '../../lib/realtime.js';
-import { syncMarketingContactForLead, normalizeLeadPhone, deleteContactsAndLinkedLeadsTransactional } from '../../lib/lead-contact-sync.js';
+import { syncMarketingContactForLead, normalizeLeadPhone, deleteContactsAndLinkedLeadsTransactional, syncLeadConversationAssignment } from '../../lib/lead-contact-sync.js';
 import { getWorkspaceScope, checkSameReportingTeam } from '../../lib/workspace-scope.js';
 import { getWorkspaceStages } from './stages.js';
 import { syncAndRotatePoolSlots, type MissedLeadRecord } from '../../lib/grab-pool-rotation.js';
@@ -797,6 +797,21 @@ leadsRouter.get('/dashboard-summary', async (req: Request, res: Response) => {
 
   const conversionRate = totalLeads > 0 ? Number(((wonCount / totalLeads) * 100).toFixed(1)) : 0;
 
+  const workspace = await prisma.aicloserWorkspace.findUnique({
+    where: { id: tenantId },
+    select: { settings: true },
+  });
+  const wsSettings = (workspace?.settings as Record<string, any>) || {};
+  const allMissedLeads: MissedLeadRecord[] = Array.isArray(wsSettings.missedLeads) ? wsSettings.missedLeads : [];
+  let missedCount = allMissedLeads.length;
+  if (req.user && (req.user.role === 'SALES_AGENT' || (req.user.role as any) === 'CLOSER')) {
+    const profile = await prisma.salesAgentProfile.findFirst({
+      where: { userId: req.user.userId, tenantId },
+      select: { id: true },
+    });
+    missedCount = profile ? allMissedLeads.filter((m) => m.agentId === profile.id).length : 0;
+  }
+
   res.json({
     success: true,
     data: {
@@ -811,6 +826,7 @@ leadsRouter.get('/dashboard-summary', async (req: Request, res: Response) => {
       pendingPaymentLinksCount: pendingLinks.length,
       conversionRate,
       stageCounts,
+      missedCount,
     },
     error: null,
   });
@@ -841,10 +857,13 @@ leadsRouter.get('/pool', async (req: Request, res: Response) => {
   const rrSettings = (wsSettings.roundRobinSettings as Record<string, any>) || {};
   const configuredCapacity = Number(rrSettings.maxVisibleToCloser) || 5;
 
+  const isSalesAgent = user?.role === 'SALES_AGENT' || (user?.role as any) === 'CLOSER';
   const maxVisibleParam = req.query.maxVisibleToCloser || req.query.limit;
-  const maxVisibleToCloser = maxVisibleParam
-    ? Math.min(50, Math.max(1, isNaN(Number(maxVisibleParam)) ? configuredCapacity : Number(maxVisibleParam)))
-    : (user?.role === 'SALES_AGENT' ? configuredCapacity : 50);
+  const maxVisibleToCloser = isSalesAgent
+    ? configuredCapacity
+    : (maxVisibleParam
+        ? Math.min(50, Math.max(1, isNaN(Number(maxVisibleParam)) ? 50 : Number(maxVisibleParam)))
+        : 50);
 
   // 3. Query open pool items
   const poolLeads = await prisma.salesLeadPoolItem.findMany({
@@ -889,7 +908,8 @@ leadsRouter.get('/pool', async (req: Request, res: Response) => {
   res.json({
     success: true,
     data: formattedLeads,
-    totalPoolCount: filteredLeads.length,
+    totalPoolCount: poolLeads.length,
+    mySlottedCount: formattedLeads.length,
     maxVisibleToCloser,
     error: null,
   });
@@ -2139,6 +2159,20 @@ leadsRouter.patch('/:id', validateBody(updateLeadSchema), async (req: Request, r
         metadata: { previousAgentId: existing.assignedAgentId, newAgentId: targetAgentId },
       },
     }));
+
+    if (targetAgentId !== existing.assignedAgentId) {
+      const targetAgentProfile = await prisma.salesAgentProfile.findFirst({
+        where: {
+          tenantId,
+          OR: [{ id: targetAgentId }, { userId: targetAgentId }],
+        },
+        include: { user: { select: { id: true, displayName: true, email: true } } },
+      });
+      if (targetAgentProfile) {
+        await syncLeadConversationAssignment(tenantId, updated, targetAgentProfile);
+        await syncMarketingContactForLead(updated).catch(() => undefined);
+      }
+    }
   }
   if (body.followUpAt !== undefined) {
     leadHistoryWrites.push(prisma.salesActivityLog.create({
@@ -2527,6 +2561,12 @@ async function handlePoolClaim(req: Request, res: Response) {
       tenantId,
       assignedAgentId: profile.id,
       stage: { notIn: inactiveLeadStages },
+      NOT: {
+        customFields: {
+          path: ['inGrabPool'],
+          equals: true,
+        },
+      },
     },
   });
   const maxActiveLeads = profile.maxActiveLeads && profile.maxActiveLeads > 0 ? profile.maxActiveLeads : 10;
@@ -2575,16 +2615,33 @@ async function handlePoolClaim(req: Request, res: Response) {
           })
         : null;
 
+      const isThisPoolLead = Boolean(
+        (poolItem.convertedAssignmentId && poolItem.convertedAssignmentId === existingLead?.id) ||
+        (existingLead && ((existingLead.customFields as any)?.inGrabPool === true))
+      );
+
       if (existingLead && existingLead.assignedAgentId !== profile.id) {
-        if (user.role === 'ADMIN' || user.role === 'SUPER_ADMIN' || user.role === 'MANAGER') {
+        if (isThisPoolLead || user.role === 'ADMIN' || user.role === 'SUPER_ADMIN' || user.role === 'MANAGER') {
+          const customFields = (existingLead.customFields as Record<string, any>) || {};
           await tx.salesLeadAssignment.update({
             where: { id: existingLead.id },
-            data: { assignedAgentId: profile.id },
+            data: {
+              assignedAgentId: profile.id,
+              customFields: { ...customFields, inGrabPool: false, claimedFromPoolAt: new Date().toISOString() },
+            },
           });
           existingLead.assignedAgentId = profile.id;
         } else {
           throw new PoolClaimError(409, 'LeadAlreadyAssigned', 'This customer already belongs to another closer in this workspace');
         }
+      } else if (existingLead && (existingLead.customFields as any)?.inGrabPool === true) {
+        const customFields = (existingLead.customFields as Record<string, any>) || {};
+        await tx.salesLeadAssignment.update({
+          where: { id: existingLead.id },
+          data: {
+            customFields: { ...customFields, inGrabPool: false, claimedFromPoolAt: new Date().toISOString() },
+          },
+        });
       }
 
       const reserved = await tx.salesLeadPoolItem.updateMany({
@@ -2651,8 +2708,9 @@ async function handlePoolClaim(req: Request, res: Response) {
       actorUserId: user.userId,
     }).catch(() => undefined);
 
-    // Sync mirrored marketing contact with newly assigned lead
+    // Sync mirrored marketing contact and conversation with newly assigned lead
     await syncMarketingContactForLead(result.lead).catch(() => undefined);
+    await syncLeadConversationAssignment(tenantId, result.lead, profile).catch(() => undefined);
 
     res.json({ success: true, data: result, message: result.idempotent ? 'Lead was already claimed by this closer' : 'Lead claimed successfully', error: null });
   } catch (error: unknown) {
@@ -3351,7 +3409,7 @@ leadsRouter.post('/:id/reassign', requirePermissions(PERM_LEADS_REASSIGN), valid
     },
   }).catch(() => undefined);
 
-  // Symmetrically sync linked MarketingContact with new assignee
+  // Symmetrically sync linked MarketingContact and appConversation with new assignee
   const normPhone = normalizeLeadPhone(lead.customerPhone);
   await prisma.marketingContact.updateMany({
     where: {
@@ -3366,6 +3424,8 @@ leadsRouter.post('/:id/reassign', requirePermissions(PERM_LEADS_REASSIGN), valid
       updatedAt: new Date(),
     },
   }).catch(() => undefined);
+
+  await syncLeadConversationAssignment(tenantId, updated, targetAgent).catch(() => undefined);
 
   await persistApiRealtimeEvent({
     tenantId,
@@ -3508,6 +3568,11 @@ leadsRouter.post('/bulk-reassign', requirePermissions(PERM_LEADS_REASSIGN), vali
     }
   });
 
+  // Reassign linked conversations
+  for (const lead of validLeads) {
+    await syncLeadConversationAssignment(tenantId, lead, targetAgent).catch(() => undefined);
+  }
+
   // Emit realtime events
   for (const lead of validLeads) {
     await persistApiRealtimeEvent({
@@ -3559,7 +3624,7 @@ const unifiedImportSchema = z.object({
 // POST /import - Unified Lead Import for CSV, Excel, WhatsApp, Google Sheets
 leadsRouter.post('/import', requirePermissions(PERM_LEADS_REASSIGN), validateBody(unifiedImportSchema), async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
-  const { source, rows, duplicateAction } = req.body;
+  const { source, rows, duplicateAction, distributionMode } = req.body;
   const upperSource = source.toUpperCase().trim();
 
   let createdCount = 0;
@@ -3590,6 +3655,7 @@ leadsRouter.post('/import', requirePermissions(PERM_LEADS_REASSIGN), validateBod
       customFields: row.customFields,
       source: upperSource,
       duplicateAction: duplicateAction as any,
+      distributionMode: distributionMode as any,
       actorUserId: req.user?.userId,
     });
 

@@ -699,15 +699,42 @@ teamRouter.post('/break/start', validateBody(breakStartSchema), async (req: Requ
   const wsSettings = (workspace?.settings as Record<string, any>) || {};
   const breakSettings = wsSettings.breakSettings || {};
   const allowedMinutes = Number(breakSettings.durationMinutes) || 30;
-  const durationMinutes = body.durationMinutes || allowedMinutes;
+  const maxDailyBreaks = Number(breakSettings.maxDailyBreaks) || 3;
+  // Strictly enforce admin break policy: agents cannot exceed allowedMinutes
+  const durationMinutes = Math.min(allowedMinutes, body.durationMinutes || allowedMinutes);
+
+  // Find agent profile if exists
+  const profile = await prisma.salesAgentProfile.findFirst({
+    where: { userId: user.userId, tenantId },
+  });
+
+  // Daily break limit enforcement
+  const startOfDay = new Date();
+  startOfDay.setHours(0, 0, 0, 0);
+  const breakHistory: Array<Record<string, any>> = Array.isArray(wsSettings.breakHistory) ? [...wsSettings.breakHistory] : [];
+  const todayUserBreaks = breakHistory.filter(
+    (b) => (b.userId === user.userId || (profile && b.profileId === profile.id)) && new Date(b.startedAt).getTime() >= startOfDay.getTime()
+  );
+
+  if (todayUserBreaks.length >= maxDailyBreaks) {
+    res.status(429).json({
+      success: false,
+      error: 'DailyBreakLimitExceeded',
+      message: `You have reached your daily break limit of ${maxDailyBreaks} breaks. Please speak with your team administrator.`,
+    });
+    return;
+  }
 
   const now = Date.now();
   const breakExpiresAt = new Date(now + durationMinutes * 60 * 1000).toISOString();
   const breakStartedAt = new Date(now).toISOString();
 
-  // Find agent profile if exists
-  const profile = await prisma.salesAgentProfile.findFirst({
-    where: { userId: user.userId, tenantId },
+  breakHistory.push({
+    userId: user.userId,
+    profileId: profile?.id || null,
+    startedAt: breakStartedAt,
+    expiresAt: breakExpiresAt,
+    durationMinutes,
   });
 
   const breakState = {
@@ -717,7 +744,7 @@ teamRouter.post('/break/start', validateBody(breakStartSchema), async (req: Requ
     durationMinutes,
   };
 
-  // 1. Update in workspace.settings.activeBreaks
+  // 1. Update in workspace.settings.activeBreaks and breakHistory
   const activeBreaks = { ...(wsSettings.activeBreaks || {}) };
   activeBreaks[user.userId] = breakState;
   if (profile) {
@@ -730,6 +757,7 @@ teamRouter.post('/break/start', validateBody(breakStartSchema), async (req: Requ
       settings: {
         ...wsSettings,
         activeBreaks,
+        breakHistory,
       } as any,
       updatedAt: new Date(),
     },
@@ -894,27 +922,66 @@ teamRouter.get('/break/team', async (req: Request, res: Response) => {
 
     const userIds = Object.keys(activeBreaks);
     if (userIds.length > 0) {
-      const users = await prisma.user.findMany({
+      // Find all agent profiles matching these IDs (either as profile.id or profile.userId)
+      const profiles = await prisma.salesAgentProfile.findMany({
+        where: {
+          tenantId,
+          OR: [{ id: { in: userIds } }, { userId: { in: userIds } }],
+        },
+        include: {
+          user: { select: { id: true, displayName: true, email: true } },
+        },
+      });
+
+      const userRecords = await prisma.user.findMany({
         where: { id: { in: userIds }, tenantId },
         select: { id: true, displayName: true, email: true },
       });
-      const userMap = new Map(users.map((u) => [u.id, u.displayName || u.email]));
+
+      // Map both profileId and userId to the canonical agent name and canonical userId
+      const nameMap = new Map<string, string>();
+      const canonicalUserMap = new Map<string, string>();
+
+      for (const p of profiles) {
+        const name = p.user?.displayName || p.user?.email || p.agentCode;
+        if (name) {
+          nameMap.set(p.id, name);
+          if (p.userId) {
+            nameMap.set(p.userId, name);
+            canonicalUserMap.set(p.id, p.userId);
+            canonicalUserMap.set(p.userId, p.userId);
+          }
+        }
+      }
+
+      for (const u of userRecords) {
+        if (!nameMap.has(u.id)) {
+          nameMap.set(u.id, u.displayName || u.email || 'Sales Closer');
+        }
+        if (!canonicalUserMap.has(u.id)) {
+          canonicalUserMap.set(u.id, u.id);
+        }
+      }
+
+      const seenUsers = new Set<string>();
 
       for (const [uid, bData] of Object.entries<any>(activeBreaks)) {
         if (bData && bData.isOnBreak) {
           const expTime = bData.breakExpiresAt ? new Date(bData.breakExpiresAt).getTime() : 0;
           if (expTime > now) {
+            const canonicalId = canonicalUserMap.get(uid) || uid;
+            if (seenUsers.has(canonicalId)) continue;
+            seenUsers.add(canonicalId);
+
             const remainingSeconds = Math.max(0, Math.floor((expTime - now) / 1000));
-            const name = userMap.get(uid) || "Sales Agent";
-            if (!onBreakList.some((item) => item.userId === uid || item.name === name)) {
-              onBreakList.push({
-                userId: uid,
-                name,
-                remainingSeconds,
-                breakStartedAt: bData.breakStartedAt,
-                breakExpiresAt: bData.breakExpiresAt,
-              });
-            }
+            const name = nameMap.get(uid) || 'Sales Agent';
+            onBreakList.push({
+              userId: canonicalId,
+              name,
+              remainingSeconds,
+              breakStartedAt: bData.breakStartedAt,
+              breakExpiresAt: bData.breakExpiresAt,
+            });
           }
         }
       }

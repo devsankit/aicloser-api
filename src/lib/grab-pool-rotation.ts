@@ -128,6 +128,7 @@ export async function syncAndRotatePoolSlots(
   }
 
   let stateChanged = false;
+  let unslottedCounter = 0;
 
   // 4. Process existing slots for open pool items
   for (const item of openPoolItems) {
@@ -140,10 +141,23 @@ export async function syncAndRotatePoolSlots(
         const onBreak = closer ? await isAgentOnBreak(tenantId, closer.id, closer.userId) : false;
         const onCall = closer ? await isAgentOnLiveCall(tenantId, closer.id, item.customerPhone) : false;
 
-        if (onBreak || onCall) {
-          // Exempt from missed count! Reset slot expiry
+        if (onCall) {
+          // Live call exemption: closer is actively talking to customer, extend their slot
           slot.slotExpiresAt = new Date(now + SLOT_DURATION_MS).toISOString();
           slot.slottedAt = new Date(now).toISOString();
+          stateChanged = true;
+        } else if (onBreak) {
+          // Break mode exemption: closer is on break, no missed lead penalty, but rotate slot to next closer
+          const currIdx = activeClosers.findIndex((c) => c.id === slot.slottedAgentId);
+          const nextIdx = (currIdx + 1) % activeClosers.length;
+          const nextCloser = activeClosers[nextIdx];
+
+          slottedPoolLeads[item.id] = {
+            poolItemId: item.id,
+            slottedAgentId: nextCloser.id,
+            slottedAt: new Date(now).toISOString(),
+            slotExpiresAt: new Date(now + SLOT_DURATION_MS).toISOString(),
+          };
           stateChanged = true;
         } else {
           // Record missed lead
@@ -189,10 +203,9 @@ export async function syncAndRotatePoolSlots(
         }
       }
     } else {
-      // Unslotted open item: Slot to requesting closer or first available closer
-      const assignedCloser = requestingAgentProfileId
-        ? activeClosers.find((c) => c.id === requestingAgentProfileId) || activeClosers[0]
-        : activeClosers[0];
+      // Unslotted open item: Distribute round-robin equally across all active closers
+      const assignedCloser = activeClosers[unslottedCounter % activeClosers.length];
+      unslottedCounter++;
 
       slottedPoolLeads[item.id] = {
         poolItemId: item.id,

@@ -78,9 +78,10 @@ export async function assignLeadToNextCloser(params: {
   leadId: string;
   source?: string;
   preferredCloserId?: string;
+  distributionMode?: 'AUTO' | 'ROUND_ROBIN' | 'POOL' | 'MANUAL';
   actorUserId?: string;
 }): Promise<AssignmentResult> {
-  const { tenantId, leadId, source = 'DIRECT', preferredCloserId, actorUserId } = params;
+  const { tenantId, leadId, source = 'DIRECT', preferredCloserId, distributionMode, actorUserId } = params;
 
   const lead = await prisma.salesLeadAssignment.findFirst({
     where: { id: leadId, tenantId },
@@ -157,8 +158,8 @@ export async function assignLeadToNextCloser(params: {
     }
   }
 
-  // If rule says POOL, move lead to grab pool instead of direct agent assignment
-  if (matchedRule?.action === 'POOL') {
+  // If rule or distributionMode says POOL, move lead to grab pool instead of direct agent assignment
+  if (distributionMode === 'POOL' || matchedRule?.action === 'POOL') {
     await prisma.salesLeadPoolItem.create({
       data: {
         tenantId,
@@ -171,9 +172,14 @@ export async function assignLeadToNextCloser(params: {
       },
     }).catch(() => undefined);
 
+    const existingCustomFields = (lead.customFields as Record<string, any>) || {};
     await prisma.salesLeadAssignment.update({
       where: { id: lead.id },
-      data: { stage: 'NEW', updatedAt: new Date() },
+      data: {
+        stage: 'NEW',
+        customFields: { ...existingCustomFields, inGrabPool: true },
+        updatedAt: new Date(),
+      },
     });
 
     return {
@@ -185,7 +191,9 @@ export async function assignLeadToNextCloser(params: {
       distributionMode: 'GRAB_POOL',
       source,
       sentToPool: true,
-      reason: `Source ${source} routed to Grab Pool per workspace rule`,
+      reason: distributionMode === 'POOL'
+        ? `Lead routed to Grab Pool per explicit distribution mode`
+        : `Source ${source} routed to Grab Pool per workspace rule`,
     };
   }
 

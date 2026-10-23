@@ -78,6 +78,8 @@ integrationsRouter.post('/justdial/webhook', async (req: Request, res: Response)
     const area = String(body.area || body.city || body.location || '').trim();
     const notes = [requirement, area ? `Area: ${area}` : null].filter(Boolean).join(' | ') || 'JustDial Inbound Lead';
 
+    const jdConfig = wsSettings.integrations?.justdial;
+
     await upsertCompanyLead({
       tenantId,
       customerName,
@@ -85,6 +87,7 @@ integrationsRouter.post('/justdial/webhook', async (req: Request, res: Response)
       customerEmail,
       source: 'JUSTDIAL',
       notes,
+      distributionMode: (jdConfig?.distributionMode as any) || undefined,
       customFields: { area, requirement, rawPayload: body },
     });
 
@@ -238,6 +241,7 @@ integrationsRouter.post('/indiamart/sync', requireRoles('ADMIN', 'SUPER_ADMIN'),
       serviceInterest,
       budgetAmount,
       notes,
+      distributionMode: (imConfig?.distributionMode as any) || undefined,
       customFields: { rawIndiaMartRow: row },
     }).catch(() => null);
 
