@@ -15,7 +15,7 @@ import { validateBody, validateQuery } from '../../middlewares/validate.js';
 import { requireRoles, hasPermission, PERM_LEADS_REASSIGN } from '../../middlewares/rbac.js';
 import { persistApiRealtimeEvent } from '../../lib/realtime.js';
 import { getWorkspaceScope, checkSameReportingTeam } from '../../lib/workspace-scope.js';
-import { syncMarketingContactForLead } from '../../lib/lead-contact-sync.js';
+import { syncMarketingContactForLead, normalizeLeadPhone, deleteContactsAndLinkedLeadsTransactional } from '../../lib/lead-contact-sync.js';
 import { getLead360 } from './leads.js';
 
 export const conversationsRouter = Router();
@@ -592,7 +592,19 @@ conversationsRouter.get('/', validateQuery(listConversationsQuerySchema), async 
     });
   }
 
-  if (status) andConditions.push({ status });
+  if (status) {
+    andConditions.push({ status });
+    if (status !== 'ARCHIVED' && status !== 'archived') {
+      andConditions.push({
+        NOT: [{ payload: { path: ['recycled'], equals: true } }],
+      });
+    }
+  } else {
+    andConditions.push({
+      status: { notIn: ['ARCHIVED', 'archived'] },
+      NOT: [{ payload: { path: ['recycled'], equals: true } }],
+    });
+  }
   if (customerPhone) andConditions.push({ customerPhone: { contains: customerPhone } });
   if (channel) andConditions.push({ serviceSlug: { contains: channel.toLowerCase() } });
   if (search) {
@@ -980,12 +992,522 @@ const handleUpdateVisibility = async (req: Request, res: Response) => {
 conversationsRouter.patch('/chat-visibility', requireRoles('ADMIN', 'SUPER_ADMIN'), validateBody(updateVisibilitySchema), handleUpdateVisibility);
 conversationsRouter.put('/chat-visibility', requireRoles('ADMIN', 'SUPER_ADMIN'), validateBody(updateVisibilitySchema), handleUpdateVisibility);
 
+// --- Soft Deletion, Bulk Delete & 30-Day Auto Cleanup Routine ---
+
+export async function findLinkedLeadForConversation(
+  tenantId: string,
+  conversation: { id: string; customerPhone?: string | null; payload?: any }
+) {
+  const payload = (conversation.payload as Record<string, any>) || {};
+  const payloadLeadId = typeof payload.leadId === 'string' && payload.leadId.trim() ? payload.leadId.trim() : undefined;
+  const cleanPhone = conversation.customerPhone ? normalizePhone(conversation.customerPhone) : undefined;
+
+  const leadOrConditions: Prisma.SalesLeadAssignmentWhereInput[] = [
+    { conversationId: conversation.id },
+  ];
+  if (payloadLeadId) {
+    leadOrConditions.push({ id: payloadLeadId });
+  }
+  if (cleanPhone && cleanPhone.length >= 10) {
+    leadOrConditions.push(
+      { customerPhone: conversation.customerPhone! },
+      { customerPhone: { endsWith: cleanPhone } }
+    );
+  } else if (conversation.customerPhone) {
+    leadOrConditions.push({ customerPhone: conversation.customerPhone });
+  }
+
+  return prisma.salesLeadAssignment.findFirst({
+    where: {
+      tenantId,
+      OR: leadOrConditions,
+    },
+  });
+}
+
+export async function findLinkedMarketingContactForConversation(
+  tenantId: string,
+  conversation: { customerPhone?: string | null },
+  leadId?: string | null
+) {
+  const contactPhone = normalizeLeadPhone(conversation.customerPhone) || (conversation.customerPhone ? normalizePhone(conversation.customerPhone) : undefined);
+  const contactOrConditions: Prisma.MarketingContactWhereInput[] = [];
+  if (leadId) {
+    contactOrConditions.push({ leadId });
+  }
+  if (contactPhone) {
+    contactOrConditions.push(
+      { e164Phone: contactPhone },
+      { e164Phone: { contains: contactPhone } }
+    );
+  }
+  if (conversation.customerPhone) {
+    contactOrConditions.push({ e164Phone: conversation.customerPhone });
+  }
+
+  if (contactOrConditions.length === 0) return null;
+
+  return prisma.marketingContact.findFirst({
+    where: {
+      tenantId,
+      OR: contactOrConditions,
+    },
+  });
+}
+
+/**
+ * 30-Day Auto Cleanup Routine:
+ * Hard deletes (prisma delete) any conversation and lead where recycled: true and deletedAt <= 30 days ago.
+ */
+export async function autoPurge30DayRecycledItems(tenantId: string): Promise<{ purgedConversations: number; purgedLeads: number }> {
+  try {
+    const cutoffDate = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+    const cutoffIso = cutoffDate.toISOString();
+
+    // 1. Hard delete conversations where recycled === true and deletedAt <= 30 days ago
+    const expiredConversations = await prisma.appConversation.findMany({
+      where: {
+        tenantId,
+        AND: [
+          {
+            OR: [
+              { status: 'ARCHIVED' },
+              { payload: { path: ['recycled'], equals: true } },
+            ],
+          },
+          { payload: { path: ['recycled'], equals: true } },
+          {
+            OR: [
+              { payload: { path: ['deletedAt'], lte: cutoffIso } },
+              { updatedAt: { lte: cutoffDate } },
+            ],
+          },
+        ],
+      },
+      select: { id: true },
+      take: 100,
+    });
+
+    let purgedConversations = 0;
+    if (expiredConversations.length > 0) {
+      const convIds = expiredConversations.map((c) => c.id);
+      const res = await prisma.appConversation.deleteMany({
+        where: {
+          tenantId,
+          id: { in: convIds },
+        },
+      });
+      purgedConversations = res.count;
+      logger.info(`[autoPurge30DayRecycledItems] Hard deleted ${purgedConversations} expired conversations for tenant ${tenantId}`);
+    }
+
+    // 2. Hard delete leads where stage === 'RECYCLED' and deletedAt <= 30 days ago
+    const expiredLeads = await prisma.salesLeadAssignment.findMany({
+      where: {
+        tenantId,
+        AND: [
+          {
+            OR: [
+              { stage: 'RECYCLED' },
+              { customFields: { path: ['recycled'], equals: true } },
+            ],
+          },
+          {
+            OR: [
+              { customFields: { path: ['deletedAt'], lte: cutoffIso } },
+              { updatedAt: { lte: cutoffDate } },
+            ],
+          },
+        ],
+      },
+      select: { id: true },
+      take: 100,
+    });
+
+    let purgedLeads = 0;
+    if (expiredLeads.length > 0) {
+      const leadIds = expiredLeads.map((l) => l.id);
+      await deleteContactsAndLinkedLeadsTransactional(tenantId, {
+        leadIds,
+      }).catch(async (err) => {
+        logger.warn('[autoPurge30DayRecycledItems] deleteContactsAndLinkedLeadsTransactional failed, falling back to deleteMany', { error: String(err) });
+        await prisma.salesLeadAssignment.deleteMany({
+          where: {
+            tenantId,
+            id: { in: leadIds },
+          },
+        }).catch(() => undefined);
+      });
+      purgedLeads = leadIds.length;
+      logger.info(`[autoPurge30DayRecycledItems] Hard deleted ${purgedLeads} expired recycled leads for tenant ${tenantId}`);
+    }
+
+    return { purgedConversations, purgedLeads };
+  } catch (error) {
+    logger.error('[autoPurge30DayRecycledItems] Failed to auto-purge recycled items', { error: String(error) });
+    return { purgedConversations: 0, purgedLeads: 0 };
+  }
+}
+
+export interface SoftDeleteConversationResult {
+  status: 200 | 403 | 404;
+  success: boolean;
+  error?: string;
+  message: string;
+  data?: {
+    conversationId: string;
+    leadId: string | null;
+  };
+}
+
+export async function softDeleteConversationRecord(
+  tenantId: string,
+  rawId: string,
+  user: { userId: string; role?: string; displayName?: string },
+  cachedWsSettings?: Record<string, any>
+): Promise<SoftDeleteConversationResult> {
+  const conversation = await resolveAppConversation(tenantId, rawId, false);
+  if (!conversation) {
+    return {
+      status: 404,
+      success: false,
+      error: 'NotFound',
+      message: 'Conversation not found',
+    };
+  }
+
+  const payload = (conversation.payload as Record<string, any>) || {};
+  const lead = await findLinkedLeadForConversation(tenantId, conversation);
+
+  const roleUpper = String(user.role || '').toUpperCase();
+
+  // Role & Permission Enforcement:
+  // - SALES_AGENT or CLOSER: only personal companion WhatsApp scanner or lead created by user
+  if (roleUpper === 'SALES_AGENT' || roleUpper === 'CLOSER') {
+    const isPersonalScanner = Boolean(
+      payload.scannedByUserId === user.userId ||
+      (user.displayName && payload.scannedByName === user.displayName) ||
+      (conversation.serviceSlug === 'manual-chat' && (!payload.scannedByUserId || payload.scannedByUserId === user.userId))
+    );
+    const isLeadCreatedByUser = Boolean(lead && lead.createdById === user.userId);
+
+    if (!isPersonalScanner && !isLeadCreatedByUser) {
+      return {
+        status: 403,
+        success: false,
+        error: 'Forbidden',
+        message: 'Sales agents can only delete personal WhatsApp scanned chats or contacts they created.',
+      };
+    }
+  } else if (roleUpper === 'MANAGER') {
+    let wsSettings = cachedWsSettings;
+    if (!wsSettings) {
+      const ws = await prisma.aicloserWorkspace.findUnique({
+        where: { id: tenantId },
+        select: { settings: true },
+      });
+      wsSettings = (ws?.settings as Record<string, any>) || {};
+    }
+    if (!wsSettings.allowManagerLeadDeletion) {
+      return {
+        status: 403,
+        success: false,
+        error: 'Forbidden',
+        message: 'Manager lead deletion is not enabled in workspace settings.',
+      };
+    }
+  } else if (roleUpper !== 'ADMIN' && roleUpper !== 'SUPER_ADMIN') {
+    return {
+      status: 403,
+      success: false,
+      error: 'Forbidden',
+      message: 'You are not authorized to delete conversations in this workspace.',
+    };
+  }
+
+  const deletedAt = new Date().toISOString();
+
+  // 1. Soft-delete conversation:
+  // Update appConversation:
+  // status: 'ARCHIVED',
+  // payload: { ...payload, recycled: true, deletedAt, deletedByUserId, deletedByName }
+  const updatedPayload = {
+    ...payload,
+    recycled: true,
+    deletedAt,
+    deletedByUserId: user.userId,
+    deletedByName: user.displayName,
+  };
+
+  await prisma.appConversation.update({
+    where: { id: conversation.id },
+    data: {
+      status: 'ARCHIVED',
+      payload: updatedPayload as unknown as Prisma.InputJsonValue,
+      updatedAt: new Date(),
+    },
+  });
+
+  // 2. If linked lead found:
+  // Update salesLeadAssignment:
+  // stage: 'RECYCLED',
+  // customFields: { ...(lead.customFields || {}), recycled: true, deletedAt, deletedByUserId, deletedByName }
+  // stageChangedAt: new Date(), updatedAt: new Date()
+  if (lead) {
+    const leadCustom = (lead.customFields && typeof lead.customFields === 'object' && !Array.isArray(lead.customFields))
+      ? (lead.customFields as Record<string, any>)
+      : {};
+    await prisma.salesLeadAssignment.update({
+      where: { id: lead.id },
+      data: {
+        stage: 'RECYCLED',
+        customFields: {
+          ...leadCustom,
+          recycled: true,
+          deletedAt,
+          deletedByUserId: user.userId,
+          deletedByName: user.displayName,
+        },
+        stageChangedAt: new Date(),
+        updatedAt: new Date(),
+      },
+    });
+  }
+
+  // 3. If linked MarketingContact exists:
+  // Update marketingContact: status: 'ARCHIVED'
+  const marketingContact = await findLinkedMarketingContactForConversation(tenantId, conversation, lead?.id);
+  if (marketingContact) {
+    const contactCustom = (marketingContact.customFields && typeof marketingContact.customFields === 'object' && !Array.isArray(marketingContact.customFields))
+      ? (marketingContact.customFields as Record<string, any>)
+      : {};
+    await prisma.marketingContact.update({
+      where: { id: marketingContact.id },
+      data: {
+        customFields: {
+          ...contactCustom,
+          status: 'ARCHIVED',
+          recycled: true,
+          deletedAt,
+          deletedByUserId: user.userId,
+          deletedByName: user.displayName,
+        },
+        updatedAt: new Date(),
+      },
+    }).catch(() => undefined);
+  }
+
+  // 4. Log activity in salesActivityLog:
+  // action: 'CHAT_AND_CONTACT_RECYCLED',
+  // note: `Chat and contact moved to Recycle Bin by ${user.displayName || user.userId}`,
+  // metadata: { conversationId: conversation.id, leadId: lead?.id }
+  await prisma.salesActivityLog.create({
+    data: {
+      tenantId,
+      assignmentId: lead?.id || null,
+      actorUserId: user.userId,
+      action: 'CHAT_AND_CONTACT_RECYCLED',
+      note: `Chat and contact moved to Recycle Bin by ${user.displayName || user.userId}`,
+      metadata: {
+        conversationId: conversation.id,
+        leadId: lead?.id || null,
+        deletedByUserId: user.userId,
+        deletedByName: user.displayName,
+      },
+    },
+  }).catch(() => undefined);
+
+  // 5. Persist realtime event
+  await persistApiRealtimeEvent({
+    tenantId,
+    eventType: 'conversation.recycled',
+    payload: {
+      conversationId: conversation.id,
+      leadId: lead?.id || null,
+      deletedByUserId: user.userId,
+    },
+    actorUserId: user.userId,
+  }).catch(() => undefined);
+
+  return {
+    status: 200,
+    success: true,
+    message: 'Chat and linked contact moved to Recycle Bin',
+    data: {
+      conversationId: conversation.id,
+      leadId: lead?.id || null,
+    },
+  };
+}
+
+const bulkDeleteConversationsSchema = z.object({
+  conversationIds: z.array(z.string().min(1, 'Conversation ID cannot be empty')).min(1, 'At least one conversation ID is required'),
+});
+
+const listRecycleBinQuerySchema = z.object({
+  page: z.string().optional().transform((v) => (v ? Math.max(1, Number(v)) : 1)),
+  limit: z.string().optional().transform((v) => (v ? Math.min(100, Math.max(1, Number(v))) : 25)),
+  search: z.string().optional(),
+});
+
+// GET /recycle-bin - View soft-deleted conversations in Recycle Bin
+conversationsRouter.get('/recycle-bin', validateQuery(listRecycleBinQuerySchema), async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const user = req.user!;
+  const roleUpper = String(user.role || '').toUpperCase();
+
+  if (roleUpper === 'MANAGER') {
+    const ws = await prisma.aicloserWorkspace.findUnique({
+      where: { id: tenantId },
+      select: { settings: true },
+    });
+    const wsSettings = (ws?.settings as Record<string, any>) || {};
+    if (!wsSettings.allowManagerLeadDeletion) {
+      return void res.status(403).json({
+        success: false,
+        error: 'Forbidden',
+        message: 'Manager recycle bin access is not enabled for this workspace.',
+      });
+    }
+  } else if (roleUpper !== 'ADMIN' && roleUpper !== 'SUPER_ADMIN' && roleUpper !== 'SALES_AGENT' && roleUpper !== 'CLOSER') {
+    return void res.status(403).json({
+      success: false,
+      error: 'Forbidden',
+      message: 'You are not authorized to view the recycle bin.',
+    });
+  }
+
+  // Trigger 30-day auto cleanup routine when recycle bin is viewed
+  void autoPurge30DayRecycledItems(tenantId).catch(() => undefined);
+
+  const { page, limit, search } = req.query as unknown as { page: number; limit: number; search?: string };
+
+  const andConditions: any[] = [
+    { tenantId },
+    {
+      OR: [
+        { status: 'ARCHIVED' },
+        { payload: { path: ['recycled'], equals: true } },
+      ],
+    },
+  ];
+
+  if (roleUpper === 'SALES_AGENT' || roleUpper === 'CLOSER') {
+    andConditions.push({
+      OR: [
+        { payload: { path: ['scannedByUserId'], equals: user.userId } },
+        { payload: { path: ['deletedByUserId'], equals: user.userId } },
+      ],
+    });
+  }
+
+  if (search) {
+    const trimmed = search.trim();
+    andConditions.push({
+      OR: [
+        { customerName: { contains: trimmed, mode: 'insensitive' } },
+        { customerPhone: { contains: trimmed } },
+      ],
+    });
+  }
+
+  const where = { AND: andConditions };
+
+  const [total, conversations] = await Promise.all([
+    prisma.appConversation.count({ where }),
+    prisma.appConversation.findMany({
+      where,
+      skip: (page - 1) * limit,
+      take: limit,
+      orderBy: { updatedAt: 'desc' },
+      select: {
+        id: true,
+        tenantId: true,
+        serviceSlug: true,
+        customerName: true,
+        customerPhone: true,
+        status: true,
+        assignedFreelancerId: true,
+        assignedFreelancerName: true,
+        payload: true,
+        createdAt: true,
+        updatedAt: true,
+      },
+    }),
+  ]);
+
+  return void res.json({
+    success: true,
+    data: conversations,
+    pagination: {
+      total,
+      page,
+      limit,
+      totalPages: Math.ceil(total / limit),
+    },
+    error: null,
+  });
+});
+
+// POST /bulk-delete - Soft-delete multiple conversations and contacts to Recycle Bin
+conversationsRouter.post('/bulk-delete', validateBody(bulkDeleteConversationsSchema), async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const user = req.user!;
+  const { conversationIds } = req.body as { conversationIds: string[] };
+
+  const roleUpper = String(user.role || '').toUpperCase();
+  let wsSettings: Record<string, any> | undefined;
+
+  if (roleUpper === 'MANAGER') {
+    const ws = await prisma.aicloserWorkspace.findUnique({
+      where: { id: tenantId },
+      select: { settings: true },
+    });
+    wsSettings = (ws?.settings as Record<string, any>) || {};
+    if (!wsSettings.allowManagerLeadDeletion) {
+      return void res.status(403).json({
+        success: false,
+        error: 'Forbidden',
+        message: 'Manager lead deletion is not enabled in workspace settings.',
+      });
+    }
+  } else if (roleUpper !== 'ADMIN' && roleUpper !== 'SUPER_ADMIN' && roleUpper !== 'SALES_AGENT' && roleUpper !== 'CLOSER') {
+    return void res.status(403).json({
+      success: false,
+      error: 'Forbidden',
+      message: 'You are not authorized to delete conversations in this workspace.',
+    });
+  }
+
+  const uniqueIds = Array.from(new Set(conversationIds.map((id) => String(id).trim()).filter(Boolean)));
+  let deletedCount = 0;
+
+  for (const id of uniqueIds) {
+    try {
+      const result = await softDeleteConversationRecord(tenantId, id, user, wsSettings);
+      if (result.success) {
+        deletedCount++;
+      }
+    } catch (err) {
+      logger.warn(`[bulk-delete] Error soft-deleting conversation ${id}`, { error: String(err) });
+    }
+  }
+
+  void autoPurge30DayRecycledItems(tenantId).catch(() => undefined);
+
+  return void res.json({
+    success: true,
+    deletedCount,
+    message: `Successfully moved ${deletedCount} chat(s) and contact(s) to Recycle Bin.`,
+  });
+});
+
 // GET /:id - Single conversation detail with ownership verification
 conversationsRouter.get('/:id', async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const id = String(req.params.id);
 
-  if (id === 'chat-visibility') return;
+  if (id === 'chat-visibility' || id === 'recycle-bin' || id === 'bulk-delete') return;
 
   const conversation = await resolveAppConversation(tenantId, id, false);
 
@@ -1004,6 +1526,106 @@ conversationsRouter.get('/:id', async (req: Request, res: Response) => {
     success: true,
     data: conversation,
     error: null,
+  });
+});
+
+// DELETE /:id - Soft delete conversation and linked contact to Recycle Bin
+conversationsRouter.delete('/:id', async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const user = req.user!;
+  const id = String(req.params.id);
+
+  const result = await softDeleteConversationRecord(tenantId, id, user);
+  if (!result.success) {
+    return void res.status(result.status).json({
+      success: false,
+      error: result.error || 'Forbidden',
+      message: result.message,
+    });
+  }
+
+  // Trigger background 30-day auto cleanup
+  void autoPurge30DayRecycledItems(tenantId).catch(() => undefined);
+
+  return void res.json({
+    success: true,
+    message: result.message,
+    data: result.data,
+  });
+});
+
+// POST /:id/restore - Restore soft-deleted conversation from Recycle Bin back to Active
+conversationsRouter.post('/:id/restore', async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const user = req.user!;
+  const id = String(req.params.id);
+  const roleUpper = String(user.role || '').toUpperCase();
+
+  if (roleUpper !== 'ADMIN' && roleUpper !== 'SUPER_ADMIN') {
+    if (roleUpper === 'MANAGER') {
+      const ws = await prisma.aicloserWorkspace.findUnique({
+        where: { id: tenantId },
+        select: { settings: true },
+      });
+      const wsSettings = (ws?.settings as Record<string, any>) || {};
+      if (!wsSettings.allowManagerLeadDeletion) {
+        return void res.status(403).json({
+          success: false,
+          error: 'Forbidden',
+          message: 'Manager lead restore is not enabled in workspace settings.',
+        });
+      }
+    } else {
+      return void res.status(403).json({
+        success: false,
+        error: 'Forbidden',
+        message: 'Only workspace administrators and authorized managers can restore from the recycle bin.',
+      });
+    }
+  }
+
+  const conversation = await resolveAppConversation(tenantId, id, false);
+  if (!conversation) {
+    return void res.status(404).json({ success: false, error: 'NotFound', message: 'Conversation not found' });
+  }
+
+  const payload = (conversation.payload as Record<string, any>) || {};
+  const { recycled, deletedAt, deletedByUserId, deletedByName, ...cleanPayload } = payload;
+
+  await prisma.appConversation.update({
+    where: { id: conversation.id },
+    data: {
+      status: 'Active',
+      payload: cleanPayload as unknown as Prisma.InputJsonValue,
+      updatedAt: new Date(),
+    },
+  });
+
+  const lead = await findLinkedLeadForConversation(tenantId, conversation);
+  if (lead && lead.stage === 'RECYCLED') {
+    const leadCustom = (lead.customFields && typeof lead.customFields === 'object' && !Array.isArray(lead.customFields))
+      ? { ...(lead.customFields as Record<string, any>) }
+      : {};
+    delete leadCustom.recycled;
+    delete leadCustom.deletedAt;
+    delete leadCustom.deletedByUserId;
+    delete leadCustom.deletedByName;
+
+    await prisma.salesLeadAssignment.update({
+      where: { id: lead.id },
+      data: {
+        stage: 'NEW',
+        customFields: leadCustom,
+        stageChangedAt: new Date(),
+        updatedAt: new Date(),
+      },
+    });
+  }
+
+  return void res.json({
+    success: true,
+    message: 'Conversation restored successfully',
+    data: { id: conversation.id, status: 'Active' },
   });
 });
 
