@@ -307,8 +307,8 @@ formsRouter.post('/:slug/submit', submitPublicForm);
 // ==========================================
 formsRouter.use(authenticate, enforceTenantIsolation);
 
-// GET /forms - list forms in current workspace
-formsRouter.get('/', async (req: Request, res: Response) => {
+// GET /forms - list forms in current workspace (Admin and Manager only)
+formsRouter.get('/', requireFormAdmin, async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const ws = await prisma.aicloserWorkspace.findUnique({
     where: { id: tenantId },
