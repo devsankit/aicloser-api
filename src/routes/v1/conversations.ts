@@ -92,6 +92,7 @@ const listConversationsQuerySchema = z.object({
 const sendMessageSchema = z.object({
   body: z.string().min(1, 'Message text is required'),
   lane: z.enum(['customer', 'internal']).optional().default('customer'),
+  dispatchChannel: z.enum(['OFFICIAL_API', 'PERSONAL', 'AUTO']).optional(),
   attachments: z
     .array(
       z.object({
@@ -104,6 +105,13 @@ const sendMessageSchema = z.object({
       })
     )
     .optional(),
+});
+
+const getOrCreateConversationSchema = z.object({
+  leadId: z.string().optional(),
+  customerPhone: z.string().min(1, 'Customer phone is required'),
+  customerName: z.string().optional(),
+  channelSource: z.enum(['OFFICIAL_API', 'QR_SCANNER']).optional().default('OFFICIAL_API'),
 });
 
 function normalizePhone(value: string | null | undefined) {
@@ -1111,6 +1119,79 @@ conversationsRouter.get('/:id/messages', async (req: Request, res: Response) => 
   });
 });
 
+// 2.5 POST /get-or-create - Retrieve or create active conversation thread for a lead or phone number
+conversationsRouter.post('/get-or-create', validateBody(getOrCreateConversationSchema), async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const body = req.body as z.infer<typeof getOrCreateConversationSchema>;
+  const cleanPhone = body.customerPhone.replace(/\D/g, '').slice(-10);
+  const isPersonalQr = body.channelSource === 'QR_SCANNER';
+  const targetServiceSlug = isPersonalQr ? 'manual-chat' : 'whatsapp-cloud';
+
+  // Find existing conversation for this phone and channel type
+  let conversation = await prisma.appConversation.findFirst({
+    where: {
+      tenantId,
+      customerPhone: { contains: cleanPhone },
+      serviceSlug: targetServiceSlug,
+    },
+  });
+
+  if (!conversation) {
+    let leadCustomerName = body.customerName;
+    if (body.leadId) {
+      const existingLead = await prisma.salesLeadAssignment.findFirst({
+        where: { id: body.leadId, tenantId },
+        select: { customerName: true, customerPhone: true },
+      });
+      if (existingLead?.customerName && !leadCustomerName) {
+        leadCustomerName = existingLead.customerName;
+      }
+    }
+
+    const newConv = await prisma.appConversation.create({
+      data: {
+        id: `conv-${randomUUID().slice(0, 12)}`,
+        tenantId,
+        serviceId: isPersonalQr ? 'srv-wa-companion' : 'srv-wa-cloud',
+        serviceSlug: targetServiceSlug,
+        assignedFreelancerId: req.user?.userId || null,
+        assignedFreelancerName: req.user?.displayName || null,
+        customerName: leadCustomerName || body.customerPhone,
+        customerPhone: body.customerPhone,
+        status: 'OPEN',
+        leadStatusId: 'status-open',
+        payload: {
+          leadId: body.leadId || null,
+          channelSource: body.channelSource,
+          scannedByName: isPersonalQr ? (req.user?.displayName || 'Sales Closer') : null,
+          scannedByUserId: isPersonalQr ? req.user?.userId : null,
+          messages: [],
+        },
+      },
+    });
+
+    if (body.leadId) {
+      await prisma.salesLeadAssignment.update({
+        where: { id: body.leadId, tenantId },
+        data: { conversationId: newConv.id },
+      }).catch(() => undefined);
+    }
+
+    conversation = newConv;
+  }
+
+  res.json({
+    success: true,
+    data: {
+      conversation: {
+        ...conversation,
+        channelSource: isPersonalQr ? 'QR_SCANNER' : 'OFFICIAL_API',
+      },
+    },
+    error: null,
+  });
+});
+
 // 3. POST /:id/messages - Send message in thread
 conversationsRouter.post('/:id/messages', validateBody(sendMessageSchema), async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
@@ -1167,7 +1248,11 @@ conversationsRouter.post('/:id/messages', validateBody(sendMessageSchema), async
   if (body.lane !== 'internal' && conversation.customerPhone) {
     const cleanPhone = conversation.customerPhone.replace(/\D/g, '');
     if (cleanPhone.length >= 8) {
-      if ((conversation as any).serviceSlug === 'manual-chat') {
+      const useCompanion =
+        body.dispatchChannel === 'PERSONAL' ||
+        (body.dispatchChannel !== 'OFFICIAL_API' && (conversation as any).serviceSlug === 'manual-chat');
+
+      if (useCompanion) {
         // Dispatch via companion WhatsApp Baileys daemon
         const waServiceUrl = process.env.WA_SERVICE_URL || 'http://127.0.0.1:3015';
         try {
@@ -1239,12 +1324,17 @@ conversationsRouter.post('/:id/messages', validateBody(sendMessageSchema), async
                   wamid: realWamid,
                 });
               } else {
+                const metaErrCode = metaData?.error?.code;
                 const metaErrMsg = metaData?.error?.message || (metaData ? JSON.stringify(metaData) : 'Meta API error');
-                outboundDispatchError = metaErrMsg;
+                if (metaErrCode === 131047 || metaErrMsg.includes('24 hours')) {
+                  outboundDispatchError = 'Meta 24-hour service window closed. Switch to Personal WhatsApp or use a template to reply.';
+                } else {
+                  outboundDispatchError = metaErrMsg;
+                }
                 logger.error('Meta WhatsApp outbound dispatch failed', {
                   conversationId: conversation.id,
                   recipientPhone: cleanPhone,
-                  metaError: metaErrMsg,
+                  metaError: outboundDispatchError,
                 });
               }
             } else {
