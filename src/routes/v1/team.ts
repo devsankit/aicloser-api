@@ -682,69 +682,173 @@ const handleInvite = async (req: Request, res: Response) => {
 teamRouter.post('/invite', requirePermissions(PERM_TEAM_MANAGE), validateBody(inviteMemberSchema), handleInvite);
 teamRouter.post('/', requirePermissions(PERM_TEAM_MANAGE), validateBody(inviteMemberSchema), handleInvite);
 
+function getStartOfTodayMs(): number {
+  const d = new Date();
+  d.setHours(0, 0, 0, 0);
+  return d.getTime();
+}
+
+interface UserBreakStats {
+  allowedSeconds: number;
+  allowedMinutes: number;
+  usedSeconds: number;
+  remainingSeconds: number;
+  activeBreak: Record<string, any> | null;
+  isOnBreak: boolean;
+  todayLogs: Array<Record<string, any>>;
+}
+
+function computeUserBreakStats(
+  userId: string,
+  profileId: string | null,
+  wsSettings: Record<string, any>
+): UserBreakStats {
+  const breakSettings = wsSettings.breakSettings || {};
+  const allowedMinutes = Number(breakSettings.durationMinutes) || 30;
+  const allowedSeconds = allowedMinutes * 60;
+  const startOfDay = getStartOfTodayMs();
+
+  const breakHistory: Array<Record<string, any>> = Array.isArray(wsSettings.breakHistory) ? wsSettings.breakHistory : [];
+  const activeBreaks = wsSettings.activeBreaks || {};
+  const now = Date.now();
+
+  // 1. Calculate seconds consumed in completed/paused/expired breaks today
+  let usedSeconds = 0;
+  const todayLogs: Array<Record<string, any>> = [];
+
+  for (const item of breakHistory) {
+    const isUser = item.userId === userId || (profileId && item.profileId === profileId);
+    if (!isUser) continue;
+    const startTime = new Date(item.startedAt).getTime();
+    if (startTime >= startOfDay) {
+      todayLogs.push(item);
+      if (item.status !== 'IN_PROGRESS' && typeof item.durationSeconds === 'number') {
+        usedSeconds += Math.max(0, item.durationSeconds);
+      }
+    }
+  }
+
+  // 2. Check if there is an active break currently running
+  const active = activeBreaks[userId] || (profileId ? activeBreaks[profileId] : null);
+  let currentActive: Record<string, any> | null = null;
+  let isOnBreak = false;
+
+  if (active && active.isOnBreak) {
+    const sessionStartedAt = new Date(active.breakStartedAt).getTime();
+    const initialRemaining = typeof active.initialRemainingSeconds === 'number'
+      ? active.initialRemainingSeconds
+      : Math.max(0, allowedSeconds - usedSeconds);
+    const elapsed = Math.max(0, Math.round((now - sessionStartedAt) / 1000));
+
+    if (elapsed >= initialRemaining) {
+      // Break naturally expired!
+      usedSeconds += initialRemaining;
+      isOnBreak = false;
+    } else {
+      isOnBreak = true;
+      usedSeconds += elapsed;
+      currentActive = {
+        ...active,
+        initialRemainingSeconds: initialRemaining,
+        elapsedSeconds: elapsed,
+        remainingSeconds: Math.max(0, initialRemaining - elapsed),
+      };
+    }
+  }
+
+  const remainingSeconds = Math.max(0, allowedSeconds - usedSeconds);
+
+  return {
+    allowedSeconds,
+    allowedMinutes,
+    usedSeconds: Math.min(allowedSeconds, usedSeconds),
+    remainingSeconds,
+    activeBreak: currentActive,
+    isOnBreak,
+    todayLogs,
+  };
+}
+
 const breakStartSchema = z.object({
   durationMinutes: z.number().int().positive().max(240).optional(),
 });
 
-// POST /break/start - Start agent break mode
+// POST /break/start - Start or resume agent break mode
 teamRouter.post('/break/start', validateBody(breakStartSchema), async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const user = req.user!;
-  const body = req.body as z.infer<typeof breakStartSchema>;
 
   const workspace = await prisma.aicloserWorkspace.findUnique({
     where: { id: tenantId },
     select: { settings: true },
   });
   const wsSettings = (workspace?.settings as Record<string, any>) || {};
-  const breakSettings = wsSettings.breakSettings || {};
-  const allowedMinutes = Number(breakSettings.durationMinutes) || 30;
-  const maxDailyBreaks = Number(breakSettings.maxDailyBreaks) || 3;
-  // Strictly enforce admin break policy: agents cannot exceed allowedMinutes
-  const durationMinutes = Math.min(allowedMinutes, body.durationMinutes || allowedMinutes);
 
-  // Find agent profile if exists
   const profile = await prisma.salesAgentProfile.findFirst({
     where: { userId: user.userId, tenantId },
   });
 
-  // Daily break limit enforcement
-  const startOfDay = new Date();
-  startOfDay.setHours(0, 0, 0, 0);
-  const breakHistory: Array<Record<string, any>> = Array.isArray(wsSettings.breakHistory) ? [...wsSettings.breakHistory] : [];
-  const todayUserBreaks = breakHistory.filter(
-    (b) => (b.userId === user.userId || (profile && b.profileId === profile.id)) && new Date(b.startedAt).getTime() >= startOfDay.getTime()
-  );
+  const stats = computeUserBreakStats(user.userId, profile?.id || null, wsSettings);
 
-  if (todayUserBreaks.length >= maxDailyBreaks) {
-    res.status(429).json({
+  // If already on break, return current active break state
+  if (stats.isOnBreak && stats.activeBreak) {
+    return void res.json({
+      success: true,
+      isOnBreak: true,
+      breakStartedAt: stats.activeBreak.breakStartedAt,
+      breakExpiresAt: stats.activeBreak.breakExpiresAt,
+      durationMinutes: Math.ceil(stats.remainingSeconds / 60),
+      remainingSeconds: stats.remainingSeconds,
+      usedSeconds: stats.usedSeconds,
+      allowedMinutes: stats.allowedMinutes,
+      message: `Already on break. ${Math.ceil(stats.remainingSeconds / 60)} minutes remaining.`,
+      error: null,
+    });
+  }
+
+  // Check if daily break quota is exhausted
+  if (stats.remainingSeconds <= 5) {
+    return void res.status(429).json({
       success: false,
       error: 'DailyBreakLimitExceeded',
-      message: `You have reached your daily break limit of ${maxDailyBreaks} breaks. Please speak with your team administrator.`,
+      message: `Daily break quota of ${stats.allowedMinutes} minutes is exhausted for today. Inbound routing remains active.`,
+      remainingSeconds: 0,
+      usedSeconds: stats.allowedSeconds,
+      allowedMinutes: stats.allowedMinutes,
     });
-    return;
   }
 
   const now = Date.now();
-  const breakExpiresAt = new Date(now + durationMinutes * 60 * 1000).toISOString();
+  const remainingSec = stats.remainingSeconds;
   const breakStartedAt = new Date(now).toISOString();
+  const breakExpiresAt = new Date(now + remainingSec * 1000).toISOString();
+  const logId = `brk-${now}-${Math.random().toString(36).slice(2, 7)}`;
+  const userName = user.displayName || user.email || profile?.agentCode || 'Sales Closer';
 
-  breakHistory.push({
+  const breakHistory: Array<Record<string, any>> = Array.isArray(wsSettings.breakHistory) ? [...wsSettings.breakHistory] : [];
+  const logEntry = {
+    id: logId,
     userId: user.userId,
     profileId: profile?.id || null,
+    userName,
     startedAt: breakStartedAt,
-    expiresAt: breakExpiresAt,
-    durationMinutes,
-  });
+    endedAt: null,
+    durationSeconds: 0,
+    initialRemainingSeconds: remainingSec,
+    status: 'IN_PROGRESS',
+    date: new Date().toISOString().split('T')[0],
+  };
+  breakHistory.push(logEntry);
 
   const breakState = {
     isOnBreak: true,
+    logId,
     breakStartedAt,
     breakExpiresAt,
-    durationMinutes,
+    initialRemainingSeconds: remainingSec,
+    durationMinutes: Math.ceil(remainingSec / 60),
   };
 
-  // 1. Update in workspace.settings.activeBreaks and breakHistory
   const activeBreaks = { ...(wsSettings.activeBreaks || {}) };
   activeBreaks[user.userId] = breakState;
   if (profile) {
@@ -763,7 +867,6 @@ teamRouter.post('/break/start', validateBody(breakStartSchema), async (req: Requ
     },
   });
 
-  // 2. Also record in profile permissions if profile exists
   if (profile) {
     const perms = (profile.permissions && typeof profile.permissions === 'object' && !Array.isArray(profile.permissions))
       ? { ...(profile.permissions as Record<string, any>) }
@@ -780,14 +883,16 @@ teamRouter.post('/break/start', validateBody(breakStartSchema), async (req: Requ
     isOnBreak: true,
     breakStartedAt,
     breakExpiresAt,
-    durationMinutes,
-    remainingSeconds: durationMinutes * 60,
-    message: `Break started for ${durationMinutes} minutes`,
+    durationMinutes: Math.ceil(remainingSec / 60),
+    remainingSeconds: remainingSec,
+    usedSeconds: stats.usedSeconds,
+    allowedMinutes: stats.allowedMinutes,
+    message: `Break started. ${Math.ceil(remainingSec / 60)} minutes remaining today.`,
     error: null,
   });
 });
 
-// POST /break/end - End active break early
+// POST /break/end - End or pause active break (preserves remaining time)
 teamRouter.post('/break/end', async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const user = req.user!;
@@ -798,10 +903,51 @@ teamRouter.post('/break/end', async (req: Request, res: Response) => {
   });
   const wsSettings = (workspace?.settings as Record<string, any>) || {};
   const activeBreaks = { ...(wsSettings.activeBreaks || {}) };
+  const breakHistory: Array<Record<string, any>> = Array.isArray(wsSettings.breakHistory) ? [...wsSettings.breakHistory] : [];
 
   const profile = await prisma.salesAgentProfile.findFirst({
     where: { userId: user.userId, tenantId },
   });
+
+  const activeBreak = activeBreaks[user.userId] || (profile ? activeBreaks[profile.id] : null);
+  const now = Date.now();
+
+  let actualDuration = 0;
+  if (activeBreak && activeBreak.isOnBreak) {
+    const startMs = new Date(activeBreak.breakStartedAt).getTime();
+    const elapsed = Math.max(1, Math.round((now - startMs) / 1000));
+    const initRemaining = typeof activeBreak.initialRemainingSeconds === 'number'
+      ? activeBreak.initialRemainingSeconds
+      : 1800;
+    actualDuration = Math.min(initRemaining, elapsed);
+
+    // Update log in breakHistory
+    const targetLogId = activeBreak.logId;
+    let found = false;
+    for (let i = breakHistory.length - 1; i >= 0; i--) {
+      const item = breakHistory[i];
+      if ((targetLogId && item.id === targetLogId) || (!targetLogId && item.userId === user.userId && item.status === 'IN_PROGRESS')) {
+        item.endedAt = new Date(now).toISOString();
+        item.durationSeconds = actualDuration;
+        item.status = actualDuration >= initRemaining ? 'EXPIRED' : 'PAUSED';
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      breakHistory.push({
+        id: `brk-${now}`,
+        userId: user.userId,
+        profileId: profile?.id || null,
+        userName: user.displayName || user.email || 'Sales Closer',
+        startedAt: activeBreak.breakStartedAt,
+        endedAt: new Date(now).toISOString(),
+        durationSeconds: actualDuration,
+        status: actualDuration >= initRemaining ? 'EXPIRED' : 'PAUSED',
+        date: new Date().toISOString().split('T')[0],
+      });
+    }
+  }
 
   delete activeBreaks[user.userId];
   if (profile) {
@@ -814,6 +960,7 @@ teamRouter.post('/break/end', async (req: Request, res: Response) => {
       settings: {
         ...wsSettings,
         activeBreaks,
+        breakHistory,
       } as any,
       updatedAt: new Date(),
     },
@@ -830,15 +977,25 @@ teamRouter.post('/break/end', async (req: Request, res: Response) => {
     }).catch(() => undefined);
   }
 
+  const updatedStats = computeUserBreakStats(user.userId, profile?.id || null, {
+    ...wsSettings,
+    activeBreaks,
+    breakHistory,
+  });
+
   res.json({
     success: true,
     isOnBreak: false,
-    message: 'Break ended successfully',
+    elapsedSeconds: actualDuration,
+    remainingSeconds: updatedStats.remainingSeconds,
+    usedSeconds: updatedStats.usedSeconds,
+    allowedMinutes: updatedStats.allowedMinutes,
+    message: 'Break ended/paused successfully',
     error: null,
   });
 });
 
-// GET /break/status - Check current break status (auto-resumes if expired)
+// GET /break/status - Check current break status & remaining quota
 teamRouter.get('/break/status', async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const user = req.user!;
@@ -848,57 +1005,132 @@ teamRouter.get('/break/status', async (req: Request, res: Response) => {
     select: { settings: true },
   });
   const wsSettings = (workspace?.settings as Record<string, any>) || {};
-  const breakSettings = wsSettings.breakSettings || {};
-  const allowedMinutes = Number(breakSettings.durationMinutes) || 30;
 
-  const activeBreaks = wsSettings.activeBreaks || {};
   const profile = await prisma.salesAgentProfile.findFirst({
     where: { userId: user.userId, tenantId },
   });
 
-  const breakData = activeBreaks[user.userId] || (profile ? activeBreaks[profile.id] : null);
-  const now = Date.now();
+  const stats = computeUserBreakStats(user.userId, profile?.id || null, wsSettings);
 
-  if (breakData && breakData.isOnBreak) {
-    const expTime = breakData.breakExpiresAt ? new Date(breakData.breakExpiresAt).getTime() : 0;
-    if (expTime > now) {
-      const remainingSeconds = Math.max(0, Math.round((expTime - now) / 1000));
-      res.json({
-        success: true,
-        isOnBreak: true,
-        remainingSeconds,
-        breakStartedAt: breakData.breakStartedAt,
-        breakExpiresAt: breakData.breakExpiresAt,
-        allowedMinutes,
-        error: null,
-      });
-      return;
-    } else {
-      // Auto-resume: break expired!
-      const updatedActiveBreaks = { ...activeBreaks };
-      delete updatedActiveBreaks[user.userId];
-      if (profile) delete updatedActiveBreaks[profile.id];
+  // If break expired during active check, persist cleanup to workspace
+  const activeBreaks = wsSettings.activeBreaks || {};
+  const activeBreak = activeBreaks[user.userId] || (profile ? activeBreaks[profile.id] : null);
 
-      await prisma.aicloserWorkspace.update({
-        where: { id: tenantId },
-        data: {
-          settings: {
-            ...wsSettings,
-            activeBreaks: updatedActiveBreaks,
-          } as any,
-          updatedAt: new Date(),
-        },
-      }).catch(() => undefined);
+  if (activeBreak && !stats.isOnBreak) {
+    const updatedActiveBreaks = { ...activeBreaks };
+    delete updatedActiveBreaks[user.userId];
+    if (profile) delete updatedActiveBreaks[profile.id];
+
+    const breakHistory: Array<Record<string, any>> = Array.isArray(wsSettings.breakHistory) ? [...wsSettings.breakHistory] : [];
+    if (activeBreak.logId) {
+      for (const item of breakHistory) {
+        if (item.id === activeBreak.logId && item.status === 'IN_PROGRESS') {
+          item.endedAt = activeBreak.breakExpiresAt;
+          item.durationSeconds = activeBreak.initialRemainingSeconds;
+          item.status = 'EXPIRED';
+        }
+      }
     }
+
+    await prisma.aicloserWorkspace.update({
+      where: { id: tenantId },
+      data: {
+        settings: {
+          ...wsSettings,
+          activeBreaks: updatedActiveBreaks,
+          breakHistory,
+        } as any,
+        updatedAt: new Date(),
+      },
+    }).catch(() => undefined);
   }
 
   res.json({
     success: true,
-    isOnBreak: false,
-    remainingSeconds: 0,
-    allowedMinutes,
+    isOnBreak: stats.isOnBreak,
+    remainingSeconds: stats.remainingSeconds,
+    usedSeconds: stats.usedSeconds,
+    allowedMinutes: stats.allowedMinutes,
+    breakStartedAt: stats.activeBreak?.breakStartedAt || null,
+    breakExpiresAt: stats.activeBreak?.breakExpiresAt || null,
     error: null,
   });
+});
+
+// GET /break/logs - Retrieve detailed break session history and time records
+teamRouter.get('/break/logs', async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const user = req.user!;
+  const scope = String(req.query.scope || '');
+
+  try {
+    const workspace = await prisma.aicloserWorkspace.findUnique({
+      where: { id: tenantId },
+      select: { settings: true },
+    });
+    const wsSettings = (workspace?.settings as Record<string, any>) || {};
+    const breakHistory: Array<Record<string, any>> = Array.isArray(wsSettings.breakHistory) ? wsSettings.breakHistory : [];
+
+    const profile = await prisma.salesAgentProfile.findFirst({
+      where: { userId: user.userId, tenantId },
+    });
+
+    const stats = computeUserBreakStats(user.userId, profile?.id || null, wsSettings);
+    const isAdminOrManager = user.role === 'ADMIN' || user.role === 'SUPER_ADMIN' || user.role === 'MANAGER';
+    const seeAll = isAdminOrManager && scope === 'all';
+
+    const filteredLogs = breakHistory
+      .filter((item) => {
+        if (!item || !item.startedAt) return false;
+        if (!seeAll) {
+          const isUser = item.userId === user.userId || (profile && item.profileId === profile.id);
+          if (!isUser) return false;
+        }
+        return true;
+      })
+      .map((item) => {
+        const isCurrentActive = item.status === 'IN_PROGRESS';
+        let currentDuration = item.durationSeconds || 0;
+        if (isCurrentActive) {
+          currentDuration = Math.max(0, Math.round((Date.now() - new Date(item.startedAt).getTime()) / 1000));
+        }
+        return {
+          id: item.id || `brk-${item.startedAt}`,
+          userId: item.userId,
+          profileId: item.profileId,
+          userName: item.userName || 'Sales Closer',
+          startedAt: item.startedAt,
+          endedAt: item.endedAt || null,
+          durationSeconds: currentDuration,
+          status: isCurrentActive ? 'IN_PROGRESS' : item.status || 'COMPLETED',
+          date: item.date || item.startedAt.split('T')[0],
+        };
+      })
+      .sort((a, b) => new Date(b.startedAt).getTime() - new Date(a.startedAt).getTime())
+      .slice(0, 100);
+
+    res.json({
+      success: true,
+      logs: filteredLogs,
+      summary: {
+        allowedMinutes: stats.allowedMinutes,
+        allowedSeconds: stats.allowedSeconds,
+        usedSeconds: stats.usedSeconds,
+        usedMinutes: Math.round((stats.usedSeconds / 60) * 10) / 10,
+        remainingSeconds: stats.remainingSeconds,
+        remainingMinutes: Math.round((stats.remainingSeconds / 60) * 10) / 10,
+        isOnBreak: stats.isOnBreak,
+        totalBreaksToday: stats.todayLogs.length,
+      },
+    });
+  } catch (err: any) {
+    res.status(500).json({
+      success: false,
+      error: 'BreakLogsFetchFailed',
+      message: err.message,
+      logs: [],
+    });
+  }
 });
 
 // GET /break/team - List team members currently on break (for Admin / Manager monitoring)
