@@ -858,6 +858,10 @@ conversationsRouter.get('/', validateQuery(listConversationsQuerySchema), async 
             attachments: Array.isArray(lastMsg.attachments) ? (lastMsg.attachments as CleanChatMessage['attachments']) : undefined,
           }
         : null,
+      lastMessageAt: lastMsg?.createdAt
+        ? String(lastMsg.createdAt)
+        : (typeof payload.lastMessageAt === 'string' ? payload.lastMessageAt : c.createdAt.toISOString()),
+      createdAt: c.createdAt.toISOString(),
       updatedAt: c.updatedAt,
     };
   });
@@ -873,6 +877,13 @@ conversationsRouter.get('/', validateQuery(listConversationsQuerySchema), async 
       return isMine;
     }
     return true;
+  });
+
+  // Strictly sort conversations by latest message timestamp descending (so reading/clicking does not change order!)
+  accessibleItems.sort((a, b) => {
+    const timeA = new Date(a.lastMessageAt || a.lastMessage?.createdAt || a.createdAt || 0).getTime();
+    const timeB = new Date(b.lastMessageAt || b.lastMessage?.createdAt || b.createdAt || 0).getTime();
+    return timeB - timeA;
   });
 
   res.json({
@@ -1320,6 +1331,43 @@ conversationsRouter.post('/:id/read', async (req: Request, res: Response) => {
       } as unknown as Prisma.InputJsonValue,
     },
   });
+
+  // Dispatch mark-as-read receipt to Meta Graph API for official WhatsApp Cloud API messages
+  try {
+    const rawMessages = Array.isArray(payload.messages) ? (payload.messages as any[]) : [];
+    const customerMessagesWithWamid = rawMessages
+      .filter((m) => (m.senderRole === 'customer' || m.role === 'customer' || m.lane === 'customer') && (m.externalMessageId || m.wamid || (typeof m.id === 'string' && m.id.startsWith('wamid.'))))
+      .map((m) => m.externalMessageId || m.wamid || m.id);
+
+    const latestWamid = customerMessagesWithWamid[customerMessagesWithWamid.length - 1];
+    if (latestWamid) {
+      const channel = await prisma.whatsAppChannel.findFirst({
+        where: { tenantId },
+        orderBy: { isDefault: 'desc' },
+      });
+      if (channel && channel.phoneNumberId) {
+        const decryptedToken = decryptWhatsAppToken(channel.encryptedAccessToken) || process.env.META_ACCESS_TOKEN;
+        if (decryptedToken) {
+          const apiVer = channel.graphApiVersion || 'v22.0';
+          const metaUrl = `https://graph.facebook.com/${apiVer}/${channel.phoneNumberId}/messages`;
+          fetch(metaUrl, {
+            method: 'POST',
+            headers: {
+              'Authorization': `Bearer ${decryptedToken}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              messaging_product: 'whatsapp',
+              status: 'read',
+              message_id: latestWamid,
+            }),
+          }).catch((err) => logger.warn('Meta mark-as-read dispatch caught error', { error: String(err) }));
+        }
+      }
+    }
+  } catch (metaErr) {
+    logger.warn('Failed to dispatch Meta mark-as-read receipt', { error: String(metaErr) });
+  }
 
   res.json({ success: true, message: 'Conversation marked as read', error: null });
 });
