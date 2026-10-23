@@ -1162,66 +1162,102 @@ conversationsRouter.post('/:id/messages', validateBody(sendMessageSchema), async
     (payload.aiSettings as any).lastHumanMessageAt = new Date().toISOString();
   }
 
-  // Outbound dispatch to Meta WhatsApp Cloud API if lane is customer and customer has a phone
+  // Outbound dispatch to Meta WhatsApp Cloud API or Companion WhatsApp daemon if lane is customer and customer has a phone
   let outboundDispatchError: string | null = null;
   if (body.lane !== 'internal' && conversation.customerPhone) {
     const cleanPhone = conversation.customerPhone.replace(/\D/g, '');
     if (cleanPhone.length >= 8) {
-      try {
-        const channel = await prisma.whatsAppChannel.findFirst({
-          where: { tenantId, status: 'ACTIVE' },
-          orderBy: { isDefault: 'desc' },
-        });
-
-        if (channel && channel.phoneNumberId) {
-          const decryptedToken = decryptWhatsAppToken(channel.encryptedAccessToken);
-          if (decryptedToken) {
-            const apiVer = channel.graphApiVersion || 'v22.0';
-            const metaUrl = `https://graph.facebook.com/${apiVer}/${channel.phoneNumberId}/messages`;
-            const metaRes = await fetch(metaUrl, {
-              method: 'POST',
-              headers: {
-                'Authorization': `Bearer ${decryptedToken}`,
-                'Content-Type': 'application/json',
-              },
-              body: JSON.stringify({
-                messaging_product: 'whatsapp',
-                recipient_type: 'individual',
-                to: cleanPhone,
-                type: 'text',
-                text: { preview_url: false, body: body.body },
-              }),
+      if ((conversation as any).serviceSlug === 'manual-chat') {
+        // Dispatch via companion WhatsApp Baileys daemon
+        const waServiceUrl = process.env.WA_SERVICE_URL || 'http://127.0.0.1:3015';
+        try {
+          const waRes = await fetch(`${waServiceUrl}/send`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              to: cleanPhone,
+              body: body.body,
+            }),
+            signal: AbortSignal.timeout(10_000),
+          });
+          const waData = (await waRes.json().catch(() => null)) as any;
+          if (waRes.ok && waData?.ok) {
+            newMessage.status = 'sent';
+            newMessage.externalMessageId = waData.messageId || null;
+            logger.info('Companion WhatsApp outbound message dispatched successfully via Baileys', {
+              conversationId: conversation.id,
+              recipientPhone: cleanPhone,
+              messageId: waData.messageId,
             });
-
-            const metaData = (await metaRes.json().catch(() => null)) as any;
-            if (metaRes.ok && metaData?.messages?.[0]?.id) {
-              const realWamid = metaData.messages[0].id;
-              newMessage.externalMessageId = realWamid;
-              newMessage.status = 'sent';
-              logger.info('WhatsApp outbound message dispatched successfully', {
-                conversationId: conversation.id,
-                recipientPhone: cleanPhone,
-                wamid: realWamid,
-              });
-            } else {
-              const metaErrMsg = metaData?.error?.message || (metaData ? JSON.stringify(metaData) : 'Meta API error');
-              outboundDispatchError = metaErrMsg;
-              logger.error('Meta WhatsApp outbound dispatch failed', {
-                conversationId: conversation.id,
-                recipientPhone: cleanPhone,
-                metaError: metaErrMsg,
-              });
-            }
           } else {
-            logger.warn('WhatsApp channel access token could not be decrypted', { tenantId, channelId: channel.id });
+            outboundDispatchError = waData?.error || 'Failed to dispatch via companion WhatsApp';
+            logger.warn('Companion WhatsApp outbound dispatch failed', {
+              conversationId: conversation.id,
+              recipientPhone: cleanPhone,
+              error: outboundDispatchError,
+            });
           }
+        } catch (err: any) {
+          outboundDispatchError = err?.message || 'Companion WhatsApp daemon unreachable';
+          logger.error('Error dispatching via companion WhatsApp daemon', { error: outboundDispatchError });
         }
-      } catch (waErr: any) {
-        logger.error('Error during WhatsApp outbound dispatch', {
-          conversationId: conversation.id,
-          error: waErr?.message || String(waErr),
-        });
-        outboundDispatchError = waErr?.message || 'Failed to dispatch WhatsApp message';
+      } else {
+        try {
+          const channel = await prisma.whatsAppChannel.findFirst({
+            where: { tenantId, status: 'ACTIVE' },
+            orderBy: { isDefault: 'desc' },
+          });
+
+          if (channel && channel.phoneNumberId) {
+            const decryptedToken = decryptWhatsAppToken(channel.encryptedAccessToken);
+            if (decryptedToken) {
+              const apiVer = channel.graphApiVersion || 'v22.0';
+              const metaUrl = `https://graph.facebook.com/${apiVer}/${channel.phoneNumberId}/messages`;
+              const metaRes = await fetch(metaUrl, {
+                method: 'POST',
+                headers: {
+                  'Authorization': `Bearer ${decryptedToken}`,
+                  'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                  messaging_product: 'whatsapp',
+                  recipient_type: 'individual',
+                  to: cleanPhone,
+                  type: 'text',
+                  text: { preview_url: false, body: body.body },
+                }),
+              });
+
+              const metaData = (await metaRes.json().catch(() => null)) as any;
+              if (metaRes.ok && metaData?.messages?.[0]?.id) {
+                const realWamid = metaData.messages[0].id;
+                newMessage.externalMessageId = realWamid;
+                newMessage.status = 'sent';
+                logger.info('WhatsApp outbound message dispatched successfully', {
+                  conversationId: conversation.id,
+                  recipientPhone: cleanPhone,
+                  wamid: realWamid,
+                });
+              } else {
+                const metaErrMsg = metaData?.error?.message || (metaData ? JSON.stringify(metaData) : 'Meta API error');
+                outboundDispatchError = metaErrMsg;
+                logger.error('Meta WhatsApp outbound dispatch failed', {
+                  conversationId: conversation.id,
+                  recipientPhone: cleanPhone,
+                  metaError: metaErrMsg,
+                });
+              }
+            } else {
+              logger.warn('WhatsApp channel access token could not be decrypted', { tenantId, channelId: channel.id });
+            }
+          }
+        } catch (waErr: any) {
+          logger.error('Error during WhatsApp outbound dispatch', {
+            conversationId: conversation.id,
+            error: waErr?.message || String(waErr),
+          });
+          outboundDispatchError = waErr?.message || 'Failed to dispatch WhatsApp message';
+        }
       }
     }
   }

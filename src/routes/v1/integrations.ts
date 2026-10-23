@@ -997,21 +997,233 @@ integrationsRouter.get('/whatsapp/devices', async (req: Request, res: Response) 
   });
 });
 
-// POST /whatsapp/devices/pair - Initiate pairing session for a new companion device
-integrationsRouter.post('/whatsapp/devices/pair', async (req: Request, res: Response) => {
-  const tenantId = req.tenantId!;
-  const { name } = (req.body || {}) as { name?: string };
+async function syncBaileysScrapedChatsToDatabase(
+  tenantId: string,
+  authUser: { userId: string; displayName?: string | null; email?: string | null }
+): Promise<number> {
+  const waServiceUrl = process.env.WA_SERVICE_URL || 'http://127.0.0.1:3015';
+  try {
+    const res = await fetch(`${waServiceUrl}/scrape`, { signal: AbortSignal.timeout(10_000) });
+    const data = (await res.json().catch(() => null)) as any;
+    if (!data?.ok || !Array.isArray(data.chats) || data.chats.length === 0) return 0;
 
-  const sessionId = `wa_pair_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-  const pairingCode = `${Math.floor(1000 + Math.random() * 9000)}-${Math.floor(1000 + Math.random() * 9000)}`;
+    const closerName = authUser.displayName || authUser.email || 'Closer';
+    let syncedCount = 0;
+
+    for (const chat of data.chats) {
+      if (!chat.phone || !String(chat.phone).replace(/\D/g, '')) continue;
+      const phoneDigits = String(chat.phone).replace(/\D/g, '');
+      const last10 = phoneDigits.slice(-10);
+
+      const existingConv = await prisma.appConversation.findFirst({
+        where: {
+          tenantId,
+          serviceSlug: 'manual-chat',
+          customerPhone: { contains: last10 },
+        },
+      });
+
+      const formattedMessages = Array.isArray(chat.messages)
+        ? chat.messages.map((m: any) => ({
+            id: m.id || `msg-${crypto.randomUUID().slice(0, 8)}`,
+            role: m.role || 'customer',
+            body: m.body || '',
+            createdAt: m.timestamp || new Date().toISOString(),
+            senderRole: m.role || 'customer',
+            senderLabel: m.role === 'sales' ? closerName : (chat.name || chat.phone),
+            status: 'read',
+          }))
+        : [];
+
+      if (existingConv) {
+        const payload = (existingConv.payload as Record<string, unknown>) || {};
+        const oldMessages = Array.isArray(payload.messages) ? (payload.messages as any[]) : [];
+        const seenIds = new Set(oldMessages.map((m) => m.id));
+        const combined = [...oldMessages];
+        for (const fm of formattedMessages) {
+          if (!seenIds.has(fm.id)) {
+            combined.push(fm);
+            seenIds.add(fm.id);
+          }
+        }
+        await prisma.appConversation.update({
+          where: { id: existingConv.id },
+          data: {
+            customerName: chat.name && !chat.name.startsWith('+') ? chat.name : existingConv.customerName,
+            payload: {
+              ...payload,
+              messages: combined,
+              lastMessagePreview: chat.lastMessagePreview || payload.lastMessagePreview,
+              lastMessageAt: chat.lastMessageAt || payload.lastMessageAt,
+            } as any,
+            updatedAt: new Date(),
+          },
+        });
+      } else {
+        await prisma.appConversation.create({
+          data: {
+            id: `conv-wa-${crypto.randomUUID().slice(0, 8)}`,
+            tenantId,
+            serviceId: 'svc-whatsapp-personal',
+            serviceSlug: 'manual-chat',
+            leadStatusId: 'new',
+            customerName: chat.name || chat.phone,
+            customerPhone: chat.phone,
+            assignedFreelancerName: closerName,
+            status: 'Active',
+            payload: {
+              messages: formattedMessages,
+              sourceChannel: 'whatsapp',
+              isPersonalQr: true,
+              scannedByUserId: authUser.userId,
+              scannedByName: closerName,
+              scannerDeviceName: `${closerName} WhatsApp Line`,
+              lastMessagePreview: chat.lastMessagePreview,
+              lastMessageAt: chat.lastMessageAt,
+            } as any,
+          },
+        });
+        syncedCount++;
+      }
+    }
+    return syncedCount;
+  } catch (err: any) {
+    logger.warn('Failed to sync Baileys scraped chats:', err?.message);
+    return 0;
+  }
+}
+
+// GET /whatsapp/devices/status - Live WebSocket status & active QR from Baileys daemon
+integrationsRouter.get('/whatsapp/devices/status', async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const waServiceUrl = process.env.WA_SERVICE_URL || 'http://127.0.0.1:3015';
+
+  try {
+    const response = await fetch(`${waServiceUrl}/status`, { signal: AbortSignal.timeout(5_000) });
+    const json = (await response.json().catch(() => null)) as any;
+
+    if (json?.ok && json.scanner) {
+      const scanner = json.scanner;
+
+      if (scanner.status === 'CONNECTED' && scanner.connectedPhone) {
+        const devices = getTenantDevices(tenantId);
+        let existing = devices.find((d) => d.phoneNumber === scanner.connectedPhone);
+        if (!existing) {
+          existing = {
+            id: `wa-dev-${Date.now()}`,
+            tenantId,
+            name: scanner.connectedDisplayName || `${req.user?.displayName || 'Closer'} WhatsApp Line`,
+            phoneNumber: scanner.connectedPhone,
+            batteryLevel: 100,
+            isCharging: false,
+            status: 'connected',
+            activeConversations: scanner.stats?.totalChats || 0,
+            pendingLeads: scanner.stats?.totalContacts || 0,
+            protocol: 'Baileys Multi-Device v2.24',
+            isPrimary: devices.length === 0,
+            scannedByUserId: req.user?.userId,
+            scannedByName: req.user?.displayName || req.user?.email || 'Closer',
+            lastSyncedAt: new Date().toISOString(),
+            createdAt: new Date().toISOString(),
+            sampleLeads: [],
+          };
+          devices.unshift(existing);
+          companionDevicesStore.set(tenantId, devices);
+          persistDevicesToDisk();
+          // Auto-sync initial chats
+          syncBaileysScrapedChatsToDatabase(tenantId, req.user!).catch(() => {});
+        } else {
+          existing.status = 'connected';
+          existing.lastSyncedAt = new Date().toISOString();
+          existing.activeConversations = scanner.stats?.totalChats || existing.activeConversations;
+        }
+      }
+
+      return void res.json({
+        success: true,
+        data: {
+          status: scanner.status,
+          qrCodeDataUrl: scanner.qrCodeDataUrl || '',
+          qrRaw: scanner.qrRaw || '',
+          pairingCode: scanner.pairingCode || '',
+          connectedPhone: scanner.connectedPhone || '',
+          connectedDisplayName: scanner.connectedDisplayName || '',
+          stats: scanner.stats,
+        },
+        error: null,
+      });
+    }
+  } catch (err: any) {
+    logger.warn('Error fetching Baileys daemon status:', err?.message);
+  }
 
   res.json({
     success: true,
     data: {
-      sessionId,
-      qrData: `2@aicloser_${sessionId}_relay_multi_device_v2`,
-      pairingCode,
-      deviceName: name || 'New WhatsApp Companion Line',
+      status: 'DISCONNECTED',
+      qrCodeDataUrl: '',
+      qrRaw: '',
+      pairingCode: '',
+      connectedPhone: '',
+      connectedDisplayName: '',
+    },
+    error: null,
+  });
+});
+
+// POST /whatsapp/devices/pair - Initiate real live pairing session for a new companion device
+integrationsRouter.post('/whatsapp/devices/pair', async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const { name, forceRefresh } = (req.body || {}) as { name?: string; forceRefresh?: boolean };
+  const waServiceUrl = process.env.WA_SERVICE_URL || 'http://127.0.0.1:3015';
+
+  try {
+    const response = await fetch(`${waServiceUrl}/start`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ forceRefresh: Boolean(forceRefresh ?? true) }),
+      signal: AbortSignal.timeout(10_000),
+    });
+
+    const json = (await response.json().catch(() => null)) as any;
+    if (json?.ok && json.scanner) {
+      const scanner = json.scanner;
+      return void res.json({
+        success: true,
+        data: {
+          sessionId: `wa_${Date.now()}`,
+          status: scanner.status,
+          qrCodeDataUrl: scanner.qrCodeDataUrl || '',
+          qrRaw: scanner.qrRaw || '',
+          pairingCode: scanner.pairingCode || '',
+          connectedPhone: scanner.connectedPhone || '',
+          connectedDisplayName: scanner.connectedDisplayName || '',
+          deviceName: name || `${req.user?.displayName || 'Closer'} WhatsApp Line`,
+          expiresInSec: 60,
+          protocol: 'Baileys Multi-Device WebSocket v2.24',
+          instructions: [
+            'Open WhatsApp on your phone',
+            'Tap Menu (⋮ on Android) or Settings (iOS) > Linked Devices',
+            'Tap Link a Device',
+            'Point your phone at this screen to capture the code',
+          ],
+        },
+        error: null,
+      });
+    }
+  } catch (err: any) {
+    logger.warn('Failed to start Baileys daemon pairing:', err?.message);
+  }
+
+  res.json({
+    success: true,
+    data: {
+      sessionId: `wa_pair_${Date.now()}`,
+      status: 'CONNECTING',
+      qrCodeDataUrl: '',
+      qrRaw: '',
+      pairingCode: '',
+      deviceName: name || 'WhatsApp Companion Line',
       expiresInSec: 60,
       protocol: 'Baileys Multi-Device WebSocket v2.24',
       instructions: [
@@ -1023,6 +1235,34 @@ integrationsRouter.post('/whatsapp/devices/pair', async (req: Request, res: Resp
     },
     error: null,
   });
+});
+
+// POST /whatsapp/devices/pairing-code - Request 8-digit phone pairing code via Baileys
+integrationsRouter.post('/whatsapp/devices/pairing-code', async (req: Request, res: Response) => {
+  const { phone } = (req.body || {}) as { phone?: string };
+  const cleanPhone = (phone || '').replace(/\D/g, '');
+  if (!cleanPhone || cleanPhone.length < 8) {
+    res.status(400).json({ success: false, error: 'Valid phone number with country code is required.' });
+    return;
+  }
+
+  const waServiceUrl = process.env.WA_SERVICE_URL || 'http://127.0.0.1:3015';
+  try {
+    const response = await fetch(`${waServiceUrl}/pairing-code`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ phone: cleanPhone }),
+      signal: AbortSignal.timeout(15_000),
+    });
+    const json = (await response.json().catch(() => null)) as any;
+    if (json?.ok && json.pairingCode) {
+      res.json({ success: true, data: { pairingCode: json.pairingCode } });
+      return;
+    }
+    res.status(400).json({ success: false, error: json?.error || 'Failed to generate pairing code' });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err?.message || 'Baileys daemon service unavailable' });
+  }
 });
 
 const confirmPairSchema = z.object({
@@ -1064,11 +1304,45 @@ integrationsRouter.post('/whatsapp/devices/confirm-pair', validateBody(confirmPa
   companionDevicesStore.set(tenantId, devices);
   persistDevicesToDisk();
 
+  // Trigger background chat sync
+  syncBaileysScrapedChatsToDatabase(tenantId, req.user!).catch(() => {});
+
   res.status(201).json({
     success: true,
     message: `WhatsApp account "${newDevice.name}" successfully linked as companion device`,
     data: newDevice,
     error: null,
+  });
+});
+
+// POST /whatsapp/devices/sync - Sync chats from companion Baileys daemon
+integrationsRouter.post('/whatsapp/devices/sync', async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const count = await syncBaileysScrapedChatsToDatabase(tenantId, req.user!);
+  res.json({
+    success: true,
+    message: `Synced ${count} WhatsApp chats into your CRM inbox`,
+    data: { syncedCount: count },
+  });
+});
+
+// POST /whatsapp/devices/disconnect - Log out from Baileys daemon
+integrationsRouter.post('/whatsapp/devices/disconnect', async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const waServiceUrl = process.env.WA_SERVICE_URL || 'http://127.0.0.1:3015';
+  try {
+    await fetch(`${waServiceUrl}/disconnect`, { method: 'POST', signal: AbortSignal.timeout(5_000) });
+  } catch {}
+
+  const devices = getTenantDevices(tenantId);
+  for (const d of devices) {
+    d.status = 'disconnected';
+  }
+  persistDevicesToDisk();
+
+  res.json({
+    success: true,
+    message: 'Disconnected WhatsApp line successfully',
   });
 });
 
