@@ -59,6 +59,24 @@ paymentsRouter.get('/public/:tokenOrId', async (req: Request, res: Response) => 
     return;
   }
 
+  const custom = (payment.customFields as any) || {};
+  const createdAtDate = new Date(payment.createdAt);
+  const expiryMinutes = Number(custom.expiryMinutes || 30);
+  const expiresAtDate = custom.expiresAt
+    ? new Date(custom.expiresAt)
+    : new Date(createdAtDate.getTime() + expiryMinutes * 60 * 1000);
+  const now = new Date();
+  const isExpired = payment.status === 'EXPIRED' || (payment.status === 'PENDING' && now > expiresAtDate);
+  const remainingSeconds = Math.max(0, Math.floor((expiresAtDate.getTime() - now.getTime()) / 1000));
+
+  if (payment.status === 'PENDING' && isExpired) {
+    await prisma.upiPaymentLink.update({
+      where: { id: payment.id },
+      data: { status: UpiPaymentLinkStatus.EXPIRED },
+    }).catch(() => {});
+    payment.status = UpiPaymentLinkStatus.EXPIRED;
+  }
+
   const settings = await prisma.upiPaymentSetting.findUnique({
     where: { tenantId: payment.tenantId },
   });
@@ -92,6 +110,11 @@ paymentsRouter.get('/public/:tokenOrId', async (req: Request, res: Response) => 
     paidAt: payment.paidAt,
     createdAt: payment.createdAt,
     creatorName: payment.createdBy?.displayName || 'Sales Specialist',
+    expiresAt: expiresAtDate.toISOString(),
+    isExpired,
+    remainingSeconds,
+    expiryMinutes,
+    leadId: custom.leadId || null,
   };
 
   res.json({
@@ -111,6 +134,30 @@ paymentsRouter.post('/public/:tokenOrId/confirm', upload.any(), async (req: Requ
 
     if (!payment) {
       res.status(404).json({ success: false, error: 'NotFound', message: 'Payment request not found or expired' });
+      return;
+    }
+
+    const custom = (payment.customFields as any) || {};
+    const createdAtDate = new Date(payment.createdAt);
+    const expiryMinutes = Number(custom.expiryMinutes || 30);
+    const expiresAtDate = custom.expiresAt
+      ? new Date(custom.expiresAt)
+      : new Date(createdAtDate.getTime() + expiryMinutes * 60 * 1000);
+    const now = new Date();
+    const isExpired = payment.status === 'EXPIRED' || (payment.status === 'PENDING' && now > expiresAtDate);
+
+    if (isExpired) {
+      if (payment.status === 'PENDING') {
+        await prisma.upiPaymentLink.update({
+          where: { id: payment.id },
+          data: { status: UpiPaymentLinkStatus.EXPIRED },
+        }).catch(() => {});
+      }
+      res.status(410).json({
+        success: false,
+        error: 'PaymentLinkExpired',
+        message: 'This dynamic UPI payment link has expired. Please contact your sales specialist to request a fresh payment link.',
+      });
       return;
     }
 
@@ -248,6 +295,8 @@ const createPaymentSchema = z.object({
   notes: z.string().optional(),
   customerNote: z.string().optional(),
   upiId: z.string().optional(),
+  expiryMinutes: z.number().positive().optional().default(30),
+  expiresAt: z.string().optional(),
 });
 
 const updatePaymentSchema = z.object({
@@ -259,6 +308,8 @@ const updatePaymentSchema = z.object({
   customerName: z.string().optional(),
   customerPhone: z.string().optional(),
   customerEmail: z.string().email().optional(),
+  expiryMinutes: z.number().positive().optional(),
+  expiresAt: z.string().optional(),
 });
 
 const settlePaymentSchema = z.object({
@@ -423,10 +474,28 @@ paymentsRouter.get('/', validateQuery(listPaymentsQuerySchema), async (req: Requ
     ]),
   );
 
+  const now = new Date();
   const formattedPayments = payments.map((p) => {
     const payUrl = `https://app.aicloser.in/pay/${p.publicToken}`;
+    const custom = (p.customFields as any) || {};
+    const createdAtDate = new Date(p.createdAt);
+    const expiryMinutes = Number(custom.expiryMinutes || 30);
+    const expiresAtDate = custom.expiresAt
+      ? new Date(custom.expiresAt)
+      : new Date(createdAtDate.getTime() + expiryMinutes * 60 * 1000);
+    const isExpired = p.status === 'EXPIRED' || (p.status === 'PENDING' && now > expiresAtDate);
+    const remainingSeconds = Math.max(0, Math.floor((expiresAtDate.getTime() - now.getTime()) / 1000));
+    const effectiveStatus = isExpired && p.status === 'PENDING' ? 'EXPIRED' : p.status;
+
     return {
       ...p,
+      status: effectiveStatus,
+      rawStatus: p.status,
+      expiresAt: expiresAtDate.toISOString(),
+      isExpired,
+      remainingSeconds,
+      expiryMinutes,
+      leadId: custom.leadId || null,
       payUrl,
       paymentUrl: payUrl,
       isPaid: p.status === 'PAID',
@@ -523,9 +592,16 @@ paymentsRouter.post('/', validateBody(createPaymentSchema), async (req: Request,
     }
 
     const effectiveLeadId = body.leadId || (body.customFields as any)?.leadId || lead?.id || null;
+    const expiryMinutes = body.expiryMinutes || 30;
+    const expiresAt = body.expiresAt
+      ? new Date(body.expiresAt)
+      : new Date(Date.now() + expiryMinutes * 60 * 1000);
+
     const paymentCustomFields: Record<string, any> = {
       ...(typeof body.customFields === 'object' && body.customFields ? body.customFields : {}),
       ...(effectiveLeadId ? { leadId: effectiveLeadId } : {}),
+      expiresAt: expiresAt.toISOString(),
+      expiryMinutes,
     };
 
     const payment = await prisma.upiPaymentLink.create({
@@ -546,10 +622,31 @@ paymentsRouter.post('/', validateBody(createPaymentSchema), async (req: Request,
         customerEmail,
         productName,
         customerNote,
-        customFields: Object.keys(paymentCustomFields).length > 0 ? paymentCustomFields : undefined,
+        customFields: paymentCustomFields,
         status: UpiPaymentLinkStatus.PENDING,
       },
     });
+
+    // Directly bind payment link & countdown timer to the SalesLeadAssignment for follow-ups!
+    if (lead) {
+      const existingLeadCustom = (typeof lead.customFields === 'object' && lead.customFields) ? (lead.customFields as any) : {};
+      await prisma.salesLeadAssignment.update({
+        where: { id: lead.id },
+        data: {
+          budgetAmount: body.amount,
+          customFields: {
+            ...existingLeadCustom,
+            lastPaymentLinkId: payment.id,
+            lastPaymentLinkToken: payment.publicToken,
+            paymentExpiresAt: expiresAt.toISOString(),
+            paymentStatus: 'PENDING',
+            paymentAmount: body.amount,
+            paymentProductName: productName,
+          },
+          updatedAt: new Date(),
+        },
+      }).catch(() => undefined);
+    }
 
     await persistApiRealtimeEvent({
       tenantId,
@@ -567,6 +664,11 @@ paymentsRouter.post('/', validateBody(createPaymentSchema), async (req: Request,
     const payUrl = `https://app.aicloser.in/pay/${payment.publicToken}`;
     const paymentData = {
       ...payment,
+      expiresAt: expiresAt.toISOString(),
+      isExpired: false,
+      remainingSeconds: Math.max(0, Math.floor((expiresAt.getTime() - Date.now()) / 1000)),
+      expiryMinutes,
+      leadId: effectiveLeadId,
       payUrl,
       paymentUrl: payUrl,
     };
@@ -604,9 +706,27 @@ paymentsRouter.get('/:id', async (req: Request, res: Response) => {
     return;
   }
 
+  const custom = (payment.customFields as any) || {};
+  const createdAtDate = new Date(payment.createdAt);
+  const expiryMinutes = Number(custom.expiryMinutes || 30);
+  const expiresAtDate = custom.expiresAt
+    ? new Date(custom.expiresAt)
+    : new Date(createdAtDate.getTime() + expiryMinutes * 60 * 1000);
+  const now = new Date();
+  const isExpired = payment.status === 'EXPIRED' || (payment.status === 'PENDING' && now > expiresAtDate);
+  const remainingSeconds = Math.max(0, Math.floor((expiresAtDate.getTime() - now.getTime()) / 1000));
+  const effectiveStatus = isExpired && payment.status === 'PENDING' ? 'EXPIRED' : payment.status;
+
   const payUrl = `https://app.aicloser.in/pay/${payment.publicToken}`;
   const responseData = {
     ...payment,
+    status: effectiveStatus,
+    rawStatus: payment.status,
+    expiresAt: expiresAtDate.toISOString(),
+    isExpired,
+    remainingSeconds,
+    expiryMinutes,
+    leadId: custom.leadId || null,
     hasProof: Boolean(payment.proofStoragePath),
     payUrl,
     paymentUrl: payUrl,
@@ -650,6 +770,22 @@ paymentsRouter.patch('/:id', validateBody(updatePaymentSchema), async (req: Requ
     return;
   }
 
+  const custom = (payment.customFields as any) || {};
+  let updatedCustom = { ...custom };
+  if (body.expiryMinutes !== undefined) {
+    const newExpiresAt = new Date(Date.now() + body.expiryMinutes * 60 * 1000).toISOString();
+    updatedCustom = {
+      ...updatedCustom,
+      expiryMinutes: body.expiryMinutes,
+      expiresAt: newExpiresAt,
+    };
+  } else if (body.expiresAt !== undefined) {
+    updatedCustom = {
+      ...updatedCustom,
+      expiresAt: new Date(body.expiresAt).toISOString(),
+    };
+  }
+
   const updated = await prisma.upiPaymentLink.update({
     where: { id: payment.id },
     data: {
@@ -659,8 +795,30 @@ paymentsRouter.patch('/:id', validateBody(updatePaymentSchema), async (req: Requ
       ...(body.customerName !== undefined ? { customerName: body.customerName } : {}),
       ...(body.customerPhone !== undefined ? { customerPhone: body.customerPhone } : {}),
       ...(body.customerEmail !== undefined ? { customerEmail: body.customerEmail } : {}),
+      customFields: updatedCustom,
     },
   });
+
+  if (custom.leadId) {
+    const lead = await prisma.salesLeadAssignment.findFirst({
+      where: { id: custom.leadId, tenantId },
+    });
+    if (lead) {
+      const existingLeadCustom = (typeof lead.customFields === 'object' && lead.customFields) ? (lead.customFields as any) : {};
+      await prisma.salesLeadAssignment.update({
+        where: { id: lead.id },
+        data: {
+          ...(body.amount !== undefined ? { budgetAmount: body.amount } : {}),
+          customFields: {
+            ...existingLeadCustom,
+            ...(updatedCustom.expiresAt ? { paymentExpiresAt: updatedCustom.expiresAt } : {}),
+            ...(body.amount !== undefined ? { paymentAmount: body.amount } : {}),
+          },
+          updatedAt: new Date(),
+        },
+      }).catch(() => undefined);
+    }
+  }
 
   await prisma.salesActivityLog.create({
     data: {
@@ -673,7 +831,14 @@ paymentsRouter.patch('/:id', validateBody(updatePaymentSchema), async (req: Requ
   }).catch(() => undefined);
 
   const payUrl = `https://app.aicloser.in/pay/${updated.publicToken}`;
-  const responseData = { ...updated, payUrl, paymentUrl: payUrl };
+  const responseData = {
+    ...updated,
+    expiresAt: updatedCustom.expiresAt,
+    expiryMinutes: updatedCustom.expiryMinutes || 30,
+    leadId: custom.leadId || null,
+    payUrl,
+    paymentUrl: payUrl,
+  };
 
   res.json({
     success: true,
