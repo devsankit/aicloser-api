@@ -128,94 +128,10 @@ export async function syncAndRotatePoolSlots(
   }
 
   let stateChanged = false;
-  let unslottedCounter = 0;
 
-  // 4. Process existing slots for open pool items
-  for (const item of openPoolItems) {
-    const slot = slottedPoolLeads[item.id];
-    if (slot) {
-      const expiresAt = new Date(slot.slotExpiresAt).getTime();
-      if (expiresAt <= now) {
-        // Slot has expired without being claimed!
-        const closer = activeClosers.find((c) => c.id === slot.slottedAgentId);
-        const onBreak = closer ? await isAgentOnBreak(tenantId, closer.id, closer.userId) : false;
-        const onCall = closer ? await isAgentOnLiveCall(tenantId, closer.id, item.customerPhone) : false;
-
-        if (onCall) {
-          // Live call exemption: closer is actively talking to customer, extend their slot
-          slot.slotExpiresAt = new Date(now + SLOT_DURATION_MS).toISOString();
-          slot.slottedAt = new Date(now).toISOString();
-          stateChanged = true;
-        } else if (onBreak) {
-          // Break mode exemption: closer is on break, no missed lead penalty, but rotate slot to next closer
-          const currIdx = activeClosers.findIndex((c) => c.id === slot.slottedAgentId);
-          const nextIdx = (currIdx + 1) % activeClosers.length;
-          const nextCloser = activeClosers[nextIdx];
-
-          slottedPoolLeads[item.id] = {
-            poolItemId: item.id,
-            slottedAgentId: nextCloser.id,
-            slottedAt: new Date(now).toISOString(),
-            slotExpiresAt: new Date(now + SLOT_DURATION_MS).toISOString(),
-          };
-          stateChanged = true;
-        } else {
-          // Record missed lead
-          const missedRecord: MissedLeadRecord = {
-            id: `missed-${randomUUID().slice(0, 8)}`,
-            leadId: item.convertedAssignmentId || item.id,
-            poolItemId: item.id,
-            agentId: slot.slottedAgentId,
-            customerName: item.customerName,
-            customerPhone: item.customerPhone || undefined,
-            missedAt: new Date(now).toISOString(),
-            reason: '10-minute pool slot expired without claim',
-          };
-          missedLeads.unshift(missedRecord);
-
-          // Find next closer index
-          const currIdx = activeClosers.findIndex((c) => c.id === slot.slottedAgentId);
-          const nextIdx = (currIdx + 1) % activeClosers.length;
-          const nextCloser = activeClosers[nextIdx];
-
-          // Re-slot lead to next closer
-          slottedPoolLeads[item.id] = {
-            poolItemId: item.id,
-            slottedAgentId: nextCloser.id,
-            slottedAt: new Date(now).toISOString(),
-            slotExpiresAt: new Date(now + SLOT_DURATION_MS).toISOString(),
-          };
-          stateChanged = true;
-
-          // Record activity log for missed pool lead (if linked to an assignment)
-          if (item.convertedAssignmentId) {
-            await prisma.salesActivityLog.create({
-              data: {
-                tenantId,
-                assignmentId: item.convertedAssignmentId,
-                actorUserId: closer?.userId,
-                action: 'POOL_LEAD_MISSED',
-                note: `Grab pool lead ${item.customerName} expired without claim by closer ${closer?.user?.displayName || slot.slottedAgentId}. Rotated to ${nextCloser.user?.displayName || nextCloser.agentCode}.`,
-                metadata: { poolItemId: item.id, missedByAgentId: slot.slottedAgentId, rotatedToAgentId: nextCloser.id },
-              },
-            }).catch(() => undefined);
-          }
-        }
-      }
-    } else {
-      // Unslotted open item: Distribute round-robin equally across all active closers
-      const assignedCloser = activeClosers[unslottedCounter % activeClosers.length];
-      unslottedCounter++;
-
-      slottedPoolLeads[item.id] = {
-        poolItemId: item.id,
-        slottedAgentId: assignedCloser.id,
-        slottedAt: new Date(now).toISOString(),
-        slotExpiresAt: new Date(now + SLOT_DURATION_MS).toISOString(),
-      };
-      stateChanged = true;
-    }
-  }
+  // 4. Read configured capacity limit (default 5 leads visible per closer)
+  const rrSettings = (wsSettings.roundRobinSettings as Record<string, any>) || {};
+  const configuredCapacity = Math.max(1, Number(rrSettings.maxVisibleToCloser) || 5);
 
   // Clean up slots for items that are no longer OPEN
   const openItemIds = new Set(openPoolItems.map((i) => i.id));
@@ -226,7 +142,127 @@ export async function syncAndRotatePoolSlots(
     }
   }
 
-  // 5. Persist changes to workspace.settings if modified
+  // Track active slot count per closer
+  const closerSlotCounts: Record<string, number> = {};
+  for (const c of activeClosers) {
+    closerSlotCounts[c.id] = 0;
+  }
+  for (const slot of Object.values(slottedPoolLeads)) {
+    if (closerSlotCounts[slot.slottedAgentId] !== undefined) {
+      closerSlotCounts[slot.slottedAgentId]++;
+    }
+  }
+
+  // 5. Process existing active slots (rotation and expiration)
+  for (const item of openPoolItems) {
+    const slot = slottedPoolLeads[item.id];
+    if (!slot) continue;
+
+    const expiresAt = new Date(slot.slotExpiresAt).getTime();
+    if (expiresAt <= now) {
+      // Slot has expired without being claimed!
+      const closer = activeClosers.find((c) => c.id === slot.slottedAgentId);
+      const onBreak = closer ? await isAgentOnBreak(tenantId, closer.id, closer.userId) : false;
+      const onCall = closer ? await isAgentOnLiveCall(tenantId, closer.id, item.customerPhone) : false;
+
+      if (onCall) {
+        // Live call exemption: closer is actively talking to customer, extend their slot
+        slot.slotExpiresAt = new Date(now + SLOT_DURATION_MS).toISOString();
+        slot.slottedAt = new Date(now).toISOString();
+        stateChanged = true;
+      } else if (onBreak) {
+        // Break mode exemption: closer is on break, no missed lead penalty, rotate slot to next closer
+        const currIdx = activeClosers.findIndex((c) => c.id === slot.slottedAgentId);
+        const nextIdx = (currIdx + 1) % activeClosers.length;
+        const nextCloser = activeClosers[nextIdx];
+
+        slottedPoolLeads[item.id] = {
+          poolItemId: item.id,
+          slottedAgentId: nextCloser.id,
+          slottedAt: new Date(now).toISOString(),
+          slotExpiresAt: new Date(now + SLOT_DURATION_MS).toISOString(),
+        };
+        stateChanged = true;
+      } else {
+        // Record missed lead for this closer
+        const missedRecord: MissedLeadRecord = {
+          id: `missed-${randomUUID().slice(0, 8)}`,
+          leadId: item.convertedAssignmentId || item.id,
+          poolItemId: item.id,
+          agentId: slot.slottedAgentId,
+          customerName: item.customerName,
+          customerPhone: item.customerPhone || undefined,
+          missedAt: new Date(now).toISOString(),
+          reason: '10-minute pool slot expired without claim',
+        };
+        missedLeads.unshift(missedRecord);
+
+        // Find next closer index
+        const currIdx = activeClosers.findIndex((c) => c.id === slot.slottedAgentId);
+        const nextIdx = (currIdx + 1) % activeClosers.length;
+        const nextCloser = activeClosers[nextIdx];
+
+        // Re-slot lead to next closer
+        slottedPoolLeads[item.id] = {
+          poolItemId: item.id,
+          slottedAgentId: nextCloser.id,
+          slottedAt: new Date(now).toISOString(),
+          slotExpiresAt: new Date(now + SLOT_DURATION_MS).toISOString(),
+        };
+        stateChanged = true;
+
+        // Record activity log for missed pool lead (if linked to an assignment)
+        if (item.convertedAssignmentId) {
+          await prisma.salesActivityLog.create({
+            data: {
+              tenantId,
+              assignmentId: item.convertedAssignmentId,
+              actorUserId: closer?.userId,
+              action: 'POOL_LEAD_MISSED',
+              note: `Grab pool lead ${item.customerName} expired without claim by closer ${closer?.user?.displayName || slot.slottedAgentId}. Rotated to ${nextCloser.user?.displayName || nextCloser.agentCode}.`,
+              metadata: { poolItemId: item.id, missedByAgentId: slot.slottedAgentId, rotatedToAgentId: nextCloser.id },
+            },
+          }).catch(() => undefined);
+        }
+      }
+    }
+  }
+
+  // Recalculate closer slot counts after rotation
+  for (const c of activeClosers) {
+    closerSlotCounts[c.id] = 0;
+  }
+  for (const slot of Object.values(slottedPoolLeads)) {
+    if (closerSlotCounts[slot.slottedAgentId] !== undefined) {
+      closerSlotCounts[slot.slottedAgentId]++;
+    }
+  }
+
+  // 6. Slot unslotted backlog items ONLY up to each closer's capacity limit
+  for (const item of openPoolItems) {
+    if (slottedPoolLeads[item.id]) continue;
+
+    // Find closer with available capacity
+    const availableCloser = activeClosers.find(
+      (c) => (closerSlotCounts[c.id] || 0) < configuredCapacity
+    );
+    if (!availableCloser) {
+      // All closers have reached their active grab pool capacity limit (e.g. 5 leads each)
+      // Remaining open items stay in queue without generating slot expiration
+      break;
+    }
+
+    slottedPoolLeads[item.id] = {
+      poolItemId: item.id,
+      slottedAgentId: availableCloser.id,
+      slottedAt: new Date(now).toISOString(),
+      slotExpiresAt: new Date(now + SLOT_DURATION_MS).toISOString(),
+    };
+    closerSlotCounts[availableCloser.id] = (closerSlotCounts[availableCloser.id] || 0) + 1;
+    stateChanged = true;
+  }
+
+  // 7. Persist changes to workspace.settings if modified
   if (stateChanged) {
     await prisma.aicloserWorkspace.update({
       where: { id: tenantId },
@@ -234,7 +270,7 @@ export async function syncAndRotatePoolSlots(
         settings: {
           ...wsSettings,
           slottedPoolLeads,
-          missedLeads: missedLeads.slice(0, 500), // maintain last 500 missed
+          missedLeads: missedLeads.slice(0, 200), // maintain recent missed
         } as any,
         updatedAt: new Date(),
       },

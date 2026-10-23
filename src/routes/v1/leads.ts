@@ -768,32 +768,73 @@ leadsRouter.get('/dashboard-summary', async (req: Request, res: Response) => {
   let wonCount = 0;
   let wonAmount = 0;
   let lostCount = 0;
-  const stageCounts: Record<string, number> = {};
+  let openDealsValue = 0;
+  let closedWonBudget = 0;
+  const stageCounts: Record<string, number> = {
+    NEW: 0,
+    CONTACTED: 0,
+    IN_PROGRESS: 0,
+    DEMO: 0,
+    FOLLOW_UP: 0,
+    NEGOTIATION: 0,
+    CLOSED_WON: 0,
+    CLOSED_LOST: 0,
+  };
 
   for (const item of stageAggregates) {
     const count = item._count?.id ?? 0;
-    stageCounts[item.stage] = count;
+    const val = Number(item._sum?.budgetAmount ?? 0);
+    const s = (item.stage || '').toUpperCase();
 
-    if (item.stage === 'CLOSED_WON' || (item.stage as string) === 'PAID') {
+    // Standardize stage bucket counting matching normalizeStageId
+    if (s === 'NEW' || s === 'ASSIGNED') {
+      stageCounts.NEW += count;
+      openDealsValue += val;
+    } else if (s === 'CONTACTED' || s === 'QUALIFIED' || s === 'INTERESTED') {
+      stageCounts.CONTACTED += count;
+      openDealsValue += val;
+    } else if (s === 'IN_PROGRESS') {
+      stageCounts.IN_PROGRESS += count;
+      openDealsValue += val;
+    } else if (s === 'DEMO') {
+      stageCounts.DEMO += count;
+      openDealsValue += val;
+    } else if (s === 'FOLLOW_UP') {
+      stageCounts.FOLLOW_UP += count;
+      openDealsValue += val;
+    } else if (s === 'NEGOTIATION') {
+      stageCounts.NEGOTIATION += count;
+      openDealsValue += val;
+    } else if (s === 'CLOSED_WON' || s === 'PAID' || s === 'WON') {
+      stageCounts.CLOSED_WON += count;
       wonCount += count;
-    } else if (item.stage === 'CLOSED_LOST' || (item.stage as string) === 'LOST') {
+      closedWonBudget += val;
+    } else if (s === 'CLOSED_LOST' || s === 'LOST' || s === 'RECYCLED') {
+      stageCounts.CLOSED_LOST += count;
       lostCount += count;
+    } else {
+      stageCounts.NEW += count;
+      openDealsValue += val;
     }
   }
 
-  // Real Payment-Centric Pipeline Value:
-  // Total sum of payment URLs shared with leads where payment is PENDING or CUSTOMER_CONFIRMED (not paid yet)
   const pendingLinks = paymentLinks.filter(
     (pl) => pl.status === 'PENDING' || pl.status === 'CUSTOMER_CONFIRMED'
   );
   const paidLinks = paymentLinks.filter((pl) => pl.status === 'PAID');
-
-  const pipelineValue = pendingLinks.reduce((sum, pl) => sum + Number(pl.totalAmount || 0), 0);
   const paidAmount = paidLinks.reduce((sum, pl) => sum + Number(pl.totalAmount || 0), 0);
+  const pendingAmount = pendingLinks.reduce((sum, pl) => sum + Number(pl.totalAmount || 0), 0);
+
+  // If realized payments exist, report realized amount, otherwise closed won deal budgets
   if (paidLinks.length > 0) {
     wonCount = paidLinks.length;
     wonAmount = paidAmount;
+  } else {
+    wonAmount = closedWonBudget;
   }
+
+  // Consistent Pipeline Value: Sum of active open deals in pipeline
+  const pipelineValue = openDealsValue;
 
   const conversionRate = totalLeads > 0 ? Number(((wonCount / totalLeads) * 100).toFixed(1)) : 0;
 
@@ -803,13 +844,21 @@ leadsRouter.get('/dashboard-summary', async (req: Request, res: Response) => {
   });
   const wsSettings = (workspace?.settings as Record<string, any>) || {};
   const allMissedLeads: MissedLeadRecord[] = Array.isArray(wsSettings.missedLeads) ? wsSettings.missedLeads : [];
-  let missedCount = allMissedLeads.length;
+
+  // Strictly filter to missed leads TODAY (startOfDay to endOfDay)
+  const todayMissedLeads = allMissedLeads.filter((m) => {
+    if (!m.missedAt) return false;
+    const t = new Date(m.missedAt).getTime();
+    return t >= startOfDay.getTime() && t <= endOfDay.getTime();
+  });
+
+  let missedCount = todayMissedLeads.length;
   if (req.user && (req.user.role === 'SALES_AGENT' || (req.user.role as any) === 'CLOSER')) {
     const profile = await prisma.salesAgentProfile.findFirst({
       where: { userId: req.user.userId, tenantId },
       select: { id: true },
     });
-    missedCount = profile ? allMissedLeads.filter((m) => m.agentId === profile.id).length : 0;
+    missedCount = profile ? todayMissedLeads.filter((m) => m.agentId === profile.id).length : 0;
   }
 
   res.json({
@@ -824,6 +873,7 @@ leadsRouter.get('/dashboard-summary', async (req: Request, res: Response) => {
       lostCount,
       pipelineValue,
       pendingPaymentLinksCount: pendingLinks.length,
+      pendingPaymentLinksAmount: pendingAmount,
       conversionRate,
       stageCounts,
       missedCount,
