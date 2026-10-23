@@ -36,6 +36,10 @@ export interface CleanChatMessage {
   aiAgentId?: string | null;
   status?: 'sent' | 'delivered' | 'read' | 'failed';
   externalMessageId?: string | null;
+  template?: {
+    name: string;
+    language?: string;
+  };
   attachments?: Array<{
     id?: string;
     name: string;
@@ -75,6 +79,84 @@ export interface ConversationAccessResult {
   permission: 'VIEW' | 'REPLY';
 }
 
+export interface Window24HourStatus {
+  is24HourWindowOpen: boolean;
+  lastInboundAt: string | null;
+  windowExpiresAt: string | null;
+}
+
+export function calculate24HourWindow(conversation: {
+  serviceSlug?: string | null;
+  payload?: any;
+}): Window24HourStatus {
+  const serviceSlug = String(conversation.serviceSlug || '').toLowerCase();
+
+  // Personal QR chats (companion WhatsApp via Baileys) have no 24-hour service window limit
+  if (serviceSlug === 'manual-chat') {
+    return {
+      is24HourWindowOpen: true,
+      lastInboundAt: null,
+      windowExpiresAt: null,
+    };
+  }
+
+  const payload = (conversation.payload as Record<string, unknown>) || {};
+  const rawMessages = Array.isArray(payload.messages) ? (payload.messages as Record<string, unknown>[]) : [];
+
+  let lastInboundTime = 0;
+
+  for (const msg of rawMessages) {
+    const isOutbound =
+      msg.fromMe === true ||
+      msg.direction === 'OUTBOUND' ||
+      msg.senderType === 'HUMAN' ||
+      ['sales', 'admin', 'closer', 'agent', 'system'].includes(String(msg.senderRole || msg.role || ''));
+
+    const isCustomerInbound =
+      !isOutbound &&
+      (msg.senderRole === 'customer' ||
+        msg.role === 'customer' ||
+        msg.lane === 'customer' ||
+        msg.sender === 'customer' ||
+        (!msg.fromMe && msg.direction !== 'OUTBOUND'));
+
+    if (isCustomerInbound && msg.createdAt) {
+      const t = new Date(String(msg.createdAt)).getTime();
+      if (!isNaN(t) && t > lastInboundTime) {
+        lastInboundTime = t;
+      }
+    }
+  }
+
+  if (lastInboundTime === 0) {
+    // Official API: No inbound message received yet from customer. Free-form messaging locked.
+    return {
+      is24HourWindowOpen: false,
+      lastInboundAt: null,
+      windowExpiresAt: null,
+    };
+  }
+
+  const now = Date.now();
+  const WINDOW_MS = 24 * 60 * 60 * 1000;
+  const expiresAt = lastInboundTime + WINDOW_MS;
+
+  if (now >= expiresAt) {
+    // 24-hour window has expired. Free-form messaging locked.
+    return {
+      is24HourWindowOpen: false,
+      lastInboundAt: new Date(lastInboundTime).toISOString(),
+      windowExpiresAt: null,
+    };
+  }
+
+  return {
+    is24HourWindowOpen: true,
+    lastInboundAt: new Date(lastInboundTime).toISOString(),
+    windowExpiresAt: new Date(expiresAt).toISOString(),
+  };
+}
+
 const listConversationsQuerySchema = z.object({
   page: z.string().optional().transform((v) => (v ? Math.max(1, Number(v)) : 1)),
   limit: z.string().optional().transform((v) => (v ? Math.min(100, Math.max(1, Number(v))) : 25)),
@@ -87,25 +169,41 @@ const listConversationsQuerySchema = z.object({
   agentName: z.string().optional(),
   scannerName: z.string().optional(),
   scannerUserId: z.string().optional(),
+  includeEmpty: z.string().optional(),
 });
 
-const sendMessageSchema = z.object({
-  body: z.string().min(1, 'Message text is required'),
-  lane: z.enum(['customer', 'internal']).optional().default('customer'),
-  dispatchChannel: z.enum(['OFFICIAL_API', 'PERSONAL', 'AUTO']).optional(),
-  attachments: z
-    .array(
-      z.object({
-        id: z.string().optional(),
-        name: z.string(),
-        mimeType: z.string().optional(),
-        sizeBytes: z.number().optional(),
-        url: z.string().optional(),
-        externalUrl: z.string().optional(),
-      })
-    )
-    .optional(),
-});
+const sendMessageSchema = z
+  .object({
+    body: z.string().optional().default(''),
+    lane: z.enum(['customer', 'internal']).optional().default('customer'),
+    dispatchChannel: z.enum(['OFFICIAL_API', 'PERSONAL', 'AUTO']).optional(),
+    templateName: z.string().optional(),
+    templateLanguage: z.string().optional().default('en_US'),
+    templateComponents: z.array(z.any()).optional(),
+    variableValues: z.record(z.unknown()).optional(),
+    attachments: z
+      .array(
+        z.object({
+          id: z.string().optional(),
+          name: z.string(),
+          mimeType: z.string().optional(),
+          sizeBytes: z.number().optional(),
+          url: z.string().optional(),
+          externalUrl: z.string().optional(),
+        })
+      )
+      .optional(),
+  })
+  .refine(
+    (data) =>
+      (data.body && data.body.trim().length > 0) ||
+      Boolean(data.templateName && data.templateName.trim().length > 0) ||
+      Boolean(data.attachments && data.attachments.length > 0),
+    {
+      message: 'Message body, templateName, or attachment is required',
+      path: ['body'],
+    }
+  );
 
 const getOrCreateConversationSchema = z.object({
   leadId: z.string().optional(),
@@ -419,7 +517,7 @@ conversationsRouter.get('/:id/360', async (req: Request, res: Response) => {
 
 // 1. GET / - List conversations with strict closer scoping and rich UI fields
 conversationsRouter.get('/', validateQuery(listConversationsQuerySchema), async (req: Request, res: Response) => {
-  const { page, limit, status, search, customerPhone, channel, sourceType, agentId, agentName, scannerName, scannerUserId } = req.query as unknown as {
+  const { page, limit, status, search, customerPhone, channel, sourceType, agentId, agentName, scannerName, scannerUserId, includeEmpty } = req.query as unknown as {
     page: number;
     limit: number;
     status?: string;
@@ -431,10 +529,19 @@ conversationsRouter.get('/', validateQuery(listConversationsQuerySchema), async 
     agentName?: string;
     scannerName?: string;
     scannerUserId?: string;
+    includeEmpty?: string;
   };
 
   const tenantId = req.tenantId!;
   const andConditions: any[] = [{ tenantId }];
+
+  // Exclude empty 0-message conversations from the inbox by default unless includeEmpty === 'true'
+  const shouldExcludeEmpty = includeEmpty !== 'true' && includeEmpty !== '1';
+  if (shouldExcludeEmpty) {
+    andConditions.push({
+      NOT: [{ payload: { path: ['messages'], equals: [] } }],
+    });
+  }
 
   // Dedicated API vs QR Scanner filtering
   if (scannerName) {
@@ -763,6 +870,7 @@ conversationsRouter.get('/', validateQuery(listConversationsQuerySchema), async 
 
     const isMetaApi =
       serviceSlug === 'whatsapp-intake' ||
+      serviceSlug === 'whatsapp-cloud' ||
       extType === 'company_whatsapp' ||
       provider === 'meta_cloud_api' ||
       Boolean(payload.wabaId || payload.phoneNumberId);
@@ -780,13 +888,15 @@ conversationsRouter.get('/', validateQuery(listConversationsQuerySchema), async 
       channelSource = 'INSTAGRAM';
     } else if (serviceSlug.includes('website') || extType.includes('website') || serviceSlug.includes('lead-form')) {
       channelSource = 'WEBSITE';
-    } else if (isQrScanner) {
+    } else if (serviceSlug === 'manual-chat' || isQrScanner) {
       channelSource = 'QR_SCANNER';
-    } else if (isMetaApi) {
-      channelSource = 'OFFICIAL_API';
     } else {
       channelSource = 'OFFICIAL_API';
     }
+
+    const isOfficialApi = channelSource === 'OFFICIAL_API' && serviceSlug !== 'manual-chat';
+    const isPersonalQr = channelSource === 'QR_SCANNER' || serviceSlug === 'manual-chat';
+    const windowStatus = calculate24HourWindow(c);
 
     const scannedByName =
       channelSource === 'QR_SCANNER'
@@ -814,6 +924,7 @@ conversationsRouter.get('/', validateQuery(listConversationsQuerySchema), async 
     return {
       id: c.id,
       tenantId: c.tenantId,
+      serviceSlug: c.serviceSlug,
       customerName: c.customerName,
       customerPhone: shouldMask ? maskPhoneNumber(c.customerPhone, true) : c.customerPhone,
       status: c.status,
@@ -822,9 +933,12 @@ conversationsRouter.get('/', validateQuery(listConversationsQuerySchema), async 
       channelSource,
       channelSourceLabel,
       scannedByName,
-      isOfficialApi: channelSource === 'OFFICIAL_API',
-      isPersonalQr: channelSource === 'QR_SCANNER',
-      isReassignable: req.user?.role === 'ADMIN' || req.user?.role === 'SUPER_ADMIN' || !isQrScanner,
+      isOfficialApi,
+      isPersonalQr,
+      isReassignable: req.user?.role === 'ADMIN' || req.user?.role === 'SUPER_ADMIN' || !isPersonalQr,
+      is24HourWindowOpen: windowStatus.is24HourWindowOpen,
+      lastInboundAt: windowStatus.lastInboundAt,
+      windowExpiresAt: windowStatus.windowExpiresAt,
       stage: lead?.stage || 'NEW',
       leadStage: lead?.stage || 'NEW',
       leadId: lead?.id || null,
@@ -886,8 +1000,26 @@ conversationsRouter.get('/', validateQuery(listConversationsQuerySchema), async 
     };
   });
 
-  // Enforce closer QR data isolation: personal QR chats belonging to Closer A are strictly hidden from Closer B
+  // Enforce closer QR data isolation, strict channel isolation, and empty conversation suppression
   const accessibleItems = items.filter((item) => {
+    if (shouldExcludeEmpty) {
+      const msgs = (item.payload?.messages as any[]);
+      if (!Array.isArray(msgs) || msgs.length === 0) {
+        return false;
+      }
+    }
+
+    // Strict channel isolation: Tab "Mine" (QR_SCANNER) vs Tab "API" (OFFICIAL_API)
+    if (sourceType === 'QR_SCANNER') {
+      if (item.serviceSlug !== 'manual-chat' && !item.isPersonalQr) {
+        return false;
+      }
+    } else if (sourceType === 'OFFICIAL_API') {
+      if (item.serviceSlug === 'manual-chat' || item.isPersonalQr) {
+        return false;
+      }
+    }
+
     if (req.user?.role === 'SALES_AGENT' && item.isPersonalQr) {
       const isMine =
         (item.payload.scannedByUserId && item.payload.scannedByUserId === req.user.userId) ||
@@ -1502,12 +1634,36 @@ conversationsRouter.post('/bulk-delete', validateBody(bulkDeleteConversationsSch
   });
 });
 
+// GET /templates - Get Meta approved WhatsApp templates for conversational outreach
+conversationsRouter.get('/templates', async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const templates = await prisma.whatsAppTemplate.findMany({
+    where: {
+      tenantId,
+      status: 'APPROVED',
+    },
+    include: {
+      versions: {
+        orderBy: { versionNumber: 'desc' },
+        take: 1,
+      },
+    },
+    orderBy: { name: 'asc' },
+  });
+
+  res.json({
+    success: true,
+    data: templates,
+    error: null,
+  });
+});
+
 // GET /:id - Single conversation detail with ownership verification
 conversationsRouter.get('/:id', async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const id = String(req.params.id);
 
-  if (id === 'chat-visibility' || id === 'recycle-bin' || id === 'bulk-delete') return;
+  if (id === 'chat-visibility' || id === 'recycle-bin' || id === 'bulk-delete' || id === 'templates') return;
 
   const conversation = await resolveAppConversation(tenantId, id, false);
 
@@ -1522,9 +1678,16 @@ conversationsRouter.get('/:id', async (req: Request, res: Response) => {
     return;
   }
 
+  const windowStatus = calculate24HourWindow(conversation);
+
   res.json({
     success: true,
-    data: conversation,
+    data: {
+      ...conversation,
+      is24HourWindowOpen: windowStatus.is24HourWindowOpen,
+      lastInboundAt: windowStatus.lastInboundAt,
+      windowExpiresAt: windowStatus.windowExpiresAt,
+    },
     error: null,
   });
 });
@@ -1802,12 +1965,17 @@ conversationsRouter.post('/get-or-create', validateBody(getOrCreateConversationS
     conversation = newConv;
   }
 
+  const windowStatus = calculate24HourWindow(conversation);
+
   res.json({
     success: true,
     data: {
       conversation: {
         ...conversation,
         channelSource: isPersonalQr ? 'QR_SCANNER' : 'OFFICIAL_API',
+        is24HourWindowOpen: windowStatus.is24HourWindowOpen,
+        lastInboundAt: windowStatus.lastInboundAt,
+        windowExpiresAt: windowStatus.windowExpiresAt,
       },
     },
     error: null,
@@ -1847,9 +2015,16 @@ conversationsRouter.post('/:id/messages', validateBody(sendMessageSchema), async
   const payload = (conversation.payload as Record<string, unknown>) || {};
   const rawMessages = Array.isArray(payload.messages) ? (payload.messages as Record<string, unknown>[]) : [];
 
+  const isTemplateMessage = Boolean(body.templateName && body.templateName.trim().length > 0);
+  const messageBody = body.body && body.body.trim().length > 0
+    ? body.body
+    : isTemplateMessage
+    ? `[Template: ${body.templateName}]`
+    : '';
+
   const newMessage: CleanChatMessage = {
     id: `msg-${randomUUID()}`,
-    body: body.body,
+    body: messageBody,
     lane: body.lane,
     createdAt: new Date().toISOString(),
     senderRole: 'sales',
@@ -1858,6 +2033,7 @@ conversationsRouter.post('/:id/messages', validateBody(sendMessageSchema), async
     senderUserId: req.user?.userId || null,
     status: 'sent',
     attachments: body.attachments,
+    ...(isTemplateMessage ? { template: { name: body.templateName!, language: body.templateLanguage || 'en_US' } } : {}),
   };
 
   // Flag human activity in aiSettings for human takeover tracking
@@ -1883,7 +2059,7 @@ conversationsRouter.post('/:id/messages', validateBody(sendMessageSchema), async
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               to: cleanPhone,
-              body: body.body,
+              body: messageBody,
             }),
             signal: AbortSignal.timeout(10_000),
           });
@@ -1909,66 +2085,207 @@ conversationsRouter.post('/:id/messages', validateBody(sendMessageSchema), async
           logger.error('Error dispatching via companion WhatsApp daemon', { error: outboundDispatchError });
         }
       } else {
-        try {
-          const channel = await prisma.whatsAppChannel.findFirst({
-            where: { tenantId, status: 'ACTIVE' },
-            orderBy: { isDefault: 'desc' },
+        // Official Meta WhatsApp Cloud API dispatch
+        const channel = await prisma.whatsAppChannel.findFirst({
+          where: { tenantId, status: 'ACTIVE' },
+          orderBy: { isDefault: 'desc' },
+        });
+
+        if (!channel || !channel.phoneNumberId) {
+          res.status(400).json({
+            success: false,
+            error: 'NoActiveWhatsAppChannel',
+            message: 'No active WhatsApp Cloud API channel configured for this workspace. Please configure a channel in Settings.',
+          });
+          return;
+        }
+
+        const decryptedToken = decryptWhatsAppToken(channel.encryptedAccessToken);
+        if (!decryptedToken) {
+          res.status(400).json({
+            success: false,
+            error: 'WhatsAppTokenDecryptionFailed',
+            message: 'WhatsApp channel access token could not be decrypted. Please reconnect your WhatsApp Business account.',
+          });
+          return;
+        }
+
+        const apiVer = channel.graphApiVersion || 'v22.0';
+        const metaUrl = `https://graph.facebook.com/${apiVer}/${channel.phoneNumberId}/messages`;
+
+        if (isTemplateMessage) {
+          // Template dispatch
+          const templateRecord = await prisma.whatsAppTemplate.findFirst({
+            where: { tenantId, name: body.templateName },
           });
 
-          if (channel && channel.phoneNumberId) {
-            const decryptedToken = decryptWhatsAppToken(channel.encryptedAccessToken);
-            if (decryptedToken) {
-              const apiVer = channel.graphApiVersion || 'v22.0';
-              const metaUrl = `https://graph.facebook.com/${apiVer}/${channel.phoneNumberId}/messages`;
-              const metaRes = await fetch(metaUrl, {
-                method: 'POST',
-                headers: {
-                  'Authorization': `Bearer ${decryptedToken}`,
-                  'Content-Type': 'application/json',
-                },
-                body: JSON.stringify({
-                  messaging_product: 'whatsapp',
-                  recipient_type: 'individual',
-                  to: cleanPhone,
-                  type: 'text',
-                  text: { preview_url: false, body: body.body },
-                }),
-              });
-
-              const metaData = (await metaRes.json().catch(() => null)) as any;
-              if (metaRes.ok && metaData?.messages?.[0]?.id) {
-                const realWamid = metaData.messages[0].id;
-                newMessage.externalMessageId = realWamid;
-                newMessage.status = 'sent';
-                logger.info('WhatsApp outbound message dispatched successfully', {
-                  conversationId: conversation.id,
-                  recipientPhone: cleanPhone,
-                  wamid: realWamid,
-                });
-              } else {
-                const metaErrCode = metaData?.error?.code;
-                const metaErrMsg = metaData?.error?.message || (metaData ? JSON.stringify(metaData) : 'Meta API error');
-                if (metaErrCode === 131047 || metaErrMsg.includes('24 hours')) {
-                  outboundDispatchError = 'Meta 24-hour service window closed. Switch to Personal WhatsApp or use a template to reply.';
-                } else {
-                  outboundDispatchError = metaErrMsg;
-                }
-                logger.error('Meta WhatsApp outbound dispatch failed', {
-                  conversationId: conversation.id,
-                  recipientPhone: cleanPhone,
-                  metaError: outboundDispatchError,
-                });
-              }
-            } else {
-              logger.warn('WhatsApp channel access token could not be decrypted', { tenantId, channelId: channel.id });
+          const languageCode = body.templateLanguage || templateRecord?.language || 'en_US';
+          let components = body.templateComponents;
+          if (!components && templateRecord && (body as any).variableValues) {
+            const varValues = (body as any).variableValues as Record<string, unknown>;
+            const params = Array.from({ length: templateRecord.variableCount || 0 }, (_, idx) => ({
+              type: 'text',
+              text: String(varValues[String(idx + 1)] || ''),
+            }));
+            if (params.length > 0) {
+              components = [{ type: 'body', parameters: params }];
             }
           }
-        } catch (waErr: any) {
-          logger.error('Error during WhatsApp outbound dispatch', {
-            conversationId: conversation.id,
-            error: waErr?.message || String(waErr),
-          });
-          outboundDispatchError = waErr?.message || 'Failed to dispatch WhatsApp message';
+
+          const templatePayload: Record<string, any> = {
+            messaging_product: 'whatsapp',
+            recipient_type: 'individual',
+            to: cleanPhone,
+            type: 'template',
+            template: {
+              name: body.templateName,
+              language: { code: languageCode },
+              ...(components && components.length > 0 ? { components } : {}),
+            },
+          };
+
+          try {
+            const metaRes = await fetch(metaUrl, {
+              method: 'POST',
+              headers: {
+                'Authorization': `Bearer ${decryptedToken}`,
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify(templatePayload),
+              signal: AbortSignal.timeout(15_000),
+            });
+
+            const metaData = (await metaRes.json().catch(() => null)) as any;
+            if (metaRes.ok && metaData?.messages?.[0]?.id) {
+              const realWamid = metaData.messages[0].id;
+              newMessage.externalMessageId = realWamid;
+              newMessage.status = 'sent';
+              logger.info('WhatsApp outbound template dispatched successfully', {
+                conversationId: conversation.id,
+                recipientPhone: cleanPhone,
+                templateName: body.templateName,
+                wamid: realWamid,
+              });
+            } else {
+              const metaErrMsg = metaData?.error?.message || (metaData ? JSON.stringify(metaData) : 'Meta API error');
+              logger.error('Meta WhatsApp template dispatch failed', {
+                conversationId: conversation.id,
+                recipientPhone: cleanPhone,
+                templateName: body.templateName,
+                metaError: metaErrMsg,
+              });
+              res.status(400).json({
+                success: false,
+                error: 'MetaTemplateDispatchFailed',
+                message: `Failed to dispatch WhatsApp template: ${metaErrMsg}`,
+                details: metaData?.error || null,
+              });
+              return;
+            }
+          } catch (templateErr: any) {
+            logger.error('Error dispatching WhatsApp template', {
+              conversationId: conversation.id,
+              error: templateErr?.message || String(templateErr),
+            });
+            res.status(400).json({
+              success: false,
+              error: 'MetaTemplateDispatchFailed',
+              message: `Error communicating with Meta API: ${templateErr?.message || 'Network timeout'}`,
+            });
+            return;
+          }
+        } else {
+          // Free-form message: MUST verify 24-hour customer service window
+          const windowStatus = calculate24HourWindow(conversation);
+          if (!windowStatus.is24HourWindowOpen) {
+            logger.warn('Blocked free-form WhatsApp outbound message: 24h window closed', {
+              conversationId: conversation.id,
+              recipientPhone: cleanPhone,
+            });
+            res.status(400).json({
+              success: false,
+              error: 'Meta24HourWindowClosed',
+              message: 'Meta 24-hour customer service window is closed. Free-form messaging is locked. You must send an approved WhatsApp Template to contact this user.',
+              data: {
+                is24HourWindowOpen: false,
+                windowExpiresAt: null,
+              },
+            });
+            return;
+          }
+
+          try {
+            const metaRes = await fetch(metaUrl, {
+              method: 'POST',
+              headers: {
+                'Authorization': `Bearer ${decryptedToken}`,
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify({
+                messaging_product: 'whatsapp',
+                recipient_type: 'individual',
+                to: cleanPhone,
+                type: 'text',
+                text: { preview_url: false, body: messageBody },
+              }),
+              signal: AbortSignal.timeout(15_000),
+            });
+
+            const metaData = (await metaRes.json().catch(() => null)) as any;
+            if (metaRes.ok && metaData?.messages?.[0]?.id) {
+              const realWamid = metaData.messages[0].id;
+              newMessage.externalMessageId = realWamid;
+              newMessage.status = 'sent';
+              logger.info('WhatsApp outbound message dispatched successfully', {
+                conversationId: conversation.id,
+                recipientPhone: cleanPhone,
+                wamid: realWamid,
+              });
+            } else {
+              const metaErrCode = metaData?.error?.code;
+              const metaErrMsg = metaData?.error?.message || (metaData ? JSON.stringify(metaData) : 'Meta API error');
+              if (metaErrCode === 131047 || metaErrMsg.includes('24 hours')) {
+                logger.warn('Meta API returned 131047 (24h window closed)', {
+                  conversationId: conversation.id,
+                  recipientPhone: cleanPhone,
+                });
+                res.status(400).json({
+                  success: false,
+                  error: 'Meta24HourWindowClosed',
+                  message: 'Meta 24-hour customer service window is closed. Free-form messaging is locked. You must send an approved WhatsApp Template to contact this user.',
+                  data: {
+                    is24HourWindowOpen: false,
+                    windowExpiresAt: null,
+                  },
+                });
+                return;
+              }
+
+              logger.error('Meta WhatsApp outbound dispatch failed', {
+                conversationId: conversation.id,
+                recipientPhone: cleanPhone,
+                metaError: metaErrMsg,
+              });
+              res.status(400).json({
+                success: false,
+                error: 'MetaDispatchFailed',
+                message: `Failed to dispatch WhatsApp message: ${metaErrMsg}`,
+                details: metaData?.error || null,
+              });
+              return;
+            }
+          } catch (waErr: any) {
+            logger.error('Error during WhatsApp outbound dispatch', {
+              conversationId: conversation.id,
+              error: waErr?.message || String(waErr),
+            });
+            res.status(400).json({
+              success: false,
+              error: 'MetaDispatchFailed',
+              message: `Error communicating with Meta API: ${waErr?.message || 'Network timeout'}`,
+            });
+            return;
+          }
         }
       }
     }
