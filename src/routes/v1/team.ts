@@ -792,8 +792,7 @@ teamRouter.post('/break/start', validateBody(breakStartSchema), async (req: Requ
 
   // If already on break, return current active break state
   if (stats.isOnBreak && stats.activeBreak) {
-    return void res.json({
-      success: true,
+    const activePayload = {
       isOnBreak: true,
       breakStartedAt: stats.activeBreak.breakStartedAt,
       breakExpiresAt: stats.activeBreak.breakExpiresAt,
@@ -801,6 +800,11 @@ teamRouter.post('/break/start', validateBody(breakStartSchema), async (req: Requ
       remainingSeconds: stats.remainingSeconds,
       usedSeconds: stats.usedSeconds,
       allowedMinutes: stats.allowedMinutes,
+    };
+    return void res.json({
+      success: true,
+      ...activePayload,
+      data: activePayload,
       message: `Already on break. ${Math.ceil(stats.remainingSeconds / 60)} minutes remaining.`,
       error: null,
     });
@@ -878,8 +882,7 @@ teamRouter.post('/break/start', validateBody(breakStartSchema), async (req: Requ
     }).catch(() => undefined);
   }
 
-  res.json({
-    success: true,
+  const startPayload = {
     isOnBreak: true,
     breakStartedAt,
     breakExpiresAt,
@@ -887,6 +890,12 @@ teamRouter.post('/break/start', validateBody(breakStartSchema), async (req: Requ
     remainingSeconds: remainingSec,
     usedSeconds: stats.usedSeconds,
     allowedMinutes: stats.allowedMinutes,
+  };
+
+  res.json({
+    success: true,
+    ...startPayload,
+    data: startPayload,
     message: `Break started. ${Math.ceil(remainingSec / 60)} minutes remaining today.`,
     error: null,
   });
@@ -983,13 +992,18 @@ teamRouter.post('/break/end', async (req: Request, res: Response) => {
     breakHistory,
   });
 
-  res.json({
-    success: true,
+  const endPayload = {
     isOnBreak: false,
     elapsedSeconds: actualDuration,
     remainingSeconds: updatedStats.remainingSeconds,
     usedSeconds: updatedStats.usedSeconds,
     allowedMinutes: updatedStats.allowedMinutes,
+  };
+
+  res.json({
+    success: true,
+    ...endPayload,
+    data: endPayload,
     message: 'Break ended/paused successfully',
     error: null,
   });
@@ -1045,14 +1059,19 @@ teamRouter.get('/break/status', async (req: Request, res: Response) => {
     }).catch(() => undefined);
   }
 
-  res.json({
-    success: true,
+  const statusPayload = {
     isOnBreak: stats.isOnBreak,
     remainingSeconds: stats.remainingSeconds,
     usedSeconds: stats.usedSeconds,
     allowedMinutes: stats.allowedMinutes,
     breakStartedAt: stats.activeBreak?.breakStartedAt || null,
     breakExpiresAt: stats.activeBreak?.breakExpiresAt || null,
+  };
+
+  res.json({
+    success: true,
+    ...statusPayload,
+    data: statusPayload,
     error: null,
   });
 });
