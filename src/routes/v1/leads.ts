@@ -3147,6 +3147,14 @@ leadsRouter.post('/:id/transfer', validateBody(transferLeadSchema), async (req: 
       ? { ...(conv.payload as Record<string, any>) }
       : {};
     payload.assignedTo = targetProfile.user?.displayName || targetProfile.agentCode;
+    payload.assignedFreelancerId = targetProfile.id;
+    payload.assignedAgentId = targetProfile.id;
+    payload.assignedUserId = targetProfile.userId;
+    if (payload.scannedByUserId) {
+      payload.originalScannedByUserId = payload.originalScannedByUserId || payload.scannedByUserId;
+      payload.scannedByUserId = targetProfile.userId;
+      payload.scannedByName = targetProfile.user?.displayName || targetProfile.agentCode;
+    }
     await prisma.appConversation.update({
       where: { id: conv.id },
       data: {
@@ -3318,6 +3326,7 @@ leadsRouter.post('/:id/share', validateBody(shareLeadSchema), async (req: Reques
         sharedByUserId: user.userId,
       });
       convPayload.shares = convFiltered;
+      convPayload.sharedUserIds = Array.from(new Set([...(Array.isArray(convPayload.sharedUserIds) ? convPayload.sharedUserIds : []), targetId, targetProfile?.id].filter(Boolean)));
       await prisma.appConversation.update({
         where: { id: conv.id },
         data: { payload: convPayload as unknown as Prisma.InputJsonValue, updatedAt: new Date() },

@@ -297,28 +297,62 @@ async function checkConversationAccess(
     (conversation as any).serviceSlug === 'manual-chat'
   );
   const scannedByUserId = (payload.scannedByUserId as string | undefined) || undefined;
+  const scope = await getWorkspaceScope(tenantId, user);
 
-  // Personal companion WhatsApp chats belong strictly to the closer who scanned them and Admin/SuperAdmin.
-  // Other closers CANNOT see or access another closer's personal WhatsApp chats unless explicitly shared!
-  if (isPersonalQr && scannedByUserId && scannedByUserId !== user.userId) {
-    const scope = await getWorkspaceScope(tenantId, user);
-    const shares = Array.isArray(payload.shares) ? (payload.shares as ConversationShareRecord[]) : [];
-    const activeShare = shares.find((s) => !s.revokedAt && (s.userId === user.userId || (s.agentProfileId && scope.profileIds.includes(s.agentProfileId))));
-    
-    if (!activeShare) {
-      return { hasAccess: false, isOwnerOrAssigned: false, isShared: false, permission: 'VIEW' };
-    }
-    return {
-      hasAccess: true,
-      isOwnerOrAssigned: false,
-      isShared: true,
-      permission: activeShare.permission || 'REPLY',
-    };
+  // 1. Direct assignment check: if the conversation is directly assigned to current user's profile, userId, or displayName
+  const isDirectlyAssigned = Boolean(
+    (conversation.assignedFreelancerId && (scope.profileIds.includes(conversation.assignedFreelancerId) || conversation.assignedFreelancerId === user.userId)) ||
+    (payload.assignedUserId && payload.assignedUserId === user.userId) ||
+    ((conversation as any).assignedFreelancerName && user.displayName && (conversation as any).assignedFreelancerName.toLowerCase() === user.displayName.toLowerCase())
+  );
+  if (isDirectlyAssigned) {
+    return { hasAccess: true, isOwnerOrAssigned: true, isShared: false, permission: 'REPLY' };
   }
 
-  // 0. Personal QR scanner ownership: the user who connected this companion line is unconditionally the primary owner
-  if (scannedByUserId && scannedByUserId === user.userId) {
-    return { hasAccess: true, isOwnerOrAssigned: true, isShared: false, permission: 'REPLY' };
+  // 2. Check if linked lead is assigned to current user's profile
+  if (scope.profileIds.length > 0) {
+    const lead = await prisma.salesLeadAssignment.findFirst({
+      where: {
+        tenantId,
+        assignedAgentId: { in: scope.profileIds },
+        OR: [
+          { conversationId: conversation.id },
+          ...phoneMatchConditions([conversation.customerPhone]),
+        ],
+      },
+      select: { id: true },
+    });
+    if (lead) {
+      return { hasAccess: true, isOwnerOrAssigned: true, isShared: false, permission: 'REPLY' };
+    }
+  }
+
+  // 3. Personal companion WhatsApp chats:
+  if (isPersonalQr) {
+    // If current user is the scanner AND the chat has NOT been reassigned away to another teammate
+    const isReassignedAway = Boolean(
+      conversation.assignedFreelancerId &&
+      !scope.profileIds.includes(conversation.assignedFreelancerId) &&
+      conversation.assignedFreelancerId !== user.userId &&
+      conversation.assignedFreelancerId !== 'Unassigned'
+    );
+
+    if (scannedByUserId && scannedByUserId === user.userId && !isReassignedAway) {
+      return { hasAccess: true, isOwnerOrAssigned: true, isShared: false, permission: 'REPLY' };
+    }
+
+    // Check if explicitly shared with this user
+    const shares = Array.isArray(payload.shares) ? (payload.shares as ConversationShareRecord[]) : [];
+    const activeShare = shares.find((s) => !s.revokedAt && (s.userId === user.userId || (s.agentProfileId && scope.profileIds.includes(s.agentProfileId))));
+    if (activeShare) {
+      return {
+        hasAccess: true,
+        isOwnerOrAssigned: false,
+        isShared: true,
+        permission: activeShare.permission || 'REPLY',
+      };
+    }
+    return { hasAccess: false, isOwnerOrAssigned: false, isShared: false, permission: 'VIEW' };
   }
 
   const mode = (roleUpper === 'SALES_AGENT' || roleUpper === 'CLOSER') ? await getChatVisibilityMode(tenantId) : 'COMPANY_WIDE';
@@ -326,33 +360,7 @@ async function checkConversationAccess(
     return { hasAccess: true, isOwnerOrAssigned: true, isShared: false, permission: 'REPLY' };
   }
 
-  const scope = await getWorkspaceScope(tenantId, user);
-
-  // 1. Check if directly assigned to current user's profile, userId, or displayName
-  if (
-    (conversation.assignedFreelancerId && (scope.profileIds.includes(conversation.assignedFreelancerId) || conversation.assignedFreelancerId === user.userId)) ||
-    ((conversation as any).assignedFreelancerName && user.displayName && (conversation as any).assignedFreelancerName.toLowerCase() === user.displayName.toLowerCase())
-  ) {
-    return { hasAccess: true, isOwnerOrAssigned: true, isShared: false, permission: 'REPLY' };
-  }
-
-  // 2. Check if linked lead is assigned to current user's profile
-  const lead = await prisma.salesLeadAssignment.findFirst({
-    where: {
-      tenantId,
-      assignedAgentId: { in: scope.profileIds },
-      OR: [
-        { conversationId: conversation.id },
-        ...phoneMatchConditions([conversation.customerPhone]),
-      ],
-    },
-    select: { id: true },
-  });
-  if (lead) {
-    return { hasAccess: true, isOwnerOrAssigned: true, isShared: false, permission: 'REPLY' };
-  }
-
-  // 3. Check if explicitly shared with this user (active share with no revokedAt)
+  // Check if explicitly shared with this user (active share with no revokedAt)
   const shares = Array.isArray(payload.shares) ? (payload.shares as ConversationShareRecord[]) : [];
   const activeShare = shares.find((s) => {
     if (s.revokedAt) return false;
@@ -391,8 +399,8 @@ export async function resolveAppConversation(tenantId: string, rawId: string, au
   });
   if (conv) return conv;
 
-  // 2. Strip prefixes: 'conv-lead-', 'lead-'
-  const cleanId = id.replace(/^conv-lead-/, '').replace(/^lead-/, '');
+  // 2. Strip prefixes: 'conv-lead-', 'lead-', 'draft-'
+  const cleanId = id.replace(/^conv-lead-/, '').replace(/^lead-/, '').replace(/^draft-/, '');
 
   // 3. Direct match with stripped ID
   conv = await prisma.appConversation.findFirst({
@@ -667,40 +675,53 @@ conversationsRouter.get('/', validateQuery(listConversationsQuerySchema), async 
       const phones = assignedLeads.map((l) => l.customerPhone).filter(Boolean) as string[];
       const convIds = assignedLeads.map((l) => l.conversationId).filter(Boolean) as string[];
 
-      // STRICT PERSONAL QR PARTITIONING:
-      // Personal QR WhatsApp chats (manual-chat) belong EXCLUSIVELY to the scanning agent.
-      // Another agent can NEVER see them through lead/phone matches unless explicitly shared!
+      // Closer conversation visibility:
+      // 1. Any conversation (API or Personal QR) explicitly assigned to THIS agent or matching their assigned leads
+      // 2. Personal QR chats scanned by THIS agent that have NOT been reassigned away to another agent
+      // 3. Conversations explicitly shared with THIS agent
       andConditions.push({
         OR: [
-          // 1. Personal QR chats scanned by THIS agent
+          // 1. Assigned to THIS closer (by profile ID, userId, convId, or phone match)
+          { assignedFreelancerId: profile?.id ?? '__NO_ACCESS__' },
+          { payload: { path: ['assignedUserId'], equals: authUser.userId } },
+          ...(convIds.length > 0 ? [{ id: { in: convIds } }] : []),
+          ...phoneMatchConditions(phones),
+
+          // 2. Personal QR chats scanned by THIS agent (only if unassigned or still assigned to this closer)
           {
             serviceSlug: 'manual-chat',
             payload: { path: ['scannedByUserId'], equals: authUser.userId },
+            OR: [
+              { assignedFreelancerId: null },
+              { assignedFreelancerId: 'Unassigned' },
+              ...(profile ? [{ assignedFreelancerId: profile.id }] : []),
+              { payload: { path: ['assignedUserId'], equals: authUser.userId } },
+            ],
           },
-          // 2. Explicitly shared with THIS agent
+
+          // 3. Explicitly shared with THIS agent
           {
             payload: { path: ['sharedUserIds'], array_contains: authUser.userId },
           },
           ...(profile ? [{ payload: { path: ['sharedUserIds'], array_contains: profile.id } }] : []),
-          // 3. Official API & company channels (strictly NOT manual-chat of other agents) assigned to THIS agent
-          {
-            serviceSlug: { not: 'manual-chat' },
-            OR: [
-              { assignedFreelancerId: profile?.id ?? '__NO_ACCESS__' },
-              ...(convIds.length > 0 ? [{ id: { in: convIds } }] : []),
-              ...phoneMatchConditions(phones),
-            ],
-          },
         ],
       });
     } else {
       // In COMPANY_WIDE mode, sales reps see all general/API channels,
-      // but personal companion QR chats remain strictly isolated to the scanning closer.
+      // but personal companion QR chats are visible only if assigned, scanned (and not reassigned away), or shared.
       andConditions.push({
         OR: [
+          { assignedFreelancerId: profile?.id ?? '__NO_ACCESS__' },
+          { payload: { path: ['assignedUserId'], equals: authUser.userId } },
           {
             serviceSlug: 'manual-chat',
             payload: { path: ['scannedByUserId'], equals: authUser.userId },
+            OR: [
+              { assignedFreelancerId: null },
+              { assignedFreelancerId: 'Unassigned' },
+              ...(profile ? [{ assignedFreelancerId: profile.id }] : []),
+              { payload: { path: ['assignedUserId'], equals: authUser.userId } },
+            ],
           },
           {
             payload: { path: ['sharedUserIds'], array_contains: authUser.userId },
@@ -2691,9 +2712,7 @@ const handleAssignConversation = async (req: Request, res: Response) => {
   }
 
   // 2. Check conversation and tenant isolation
-  const conversation = await prisma.appConversation.findUnique({
-    where: { id },
-  });
+  const conversation = await resolveAppConversation(tenantId, id, true);
 
   if (!conversation) {
     res.status(404).json({ success: false, error: 'NotFound', message: 'Conversation not found' });
@@ -2853,9 +2872,17 @@ const handleAssignConversation = async (req: Request, res: Response) => {
   convPayload.assignedTo = assignedFreelancerName;
   convPayload.assignedFreelancerId = assignedFreelancerId;
   convPayload.assignedAgentId = assignedFreelancerId;
+  convPayload.assignedUserId = agentProfile.userId;
+
+  // If this was a personal companion WhatsApp chat, symmetrically reassign companion ownership to target agent
+  if (convPayload.scannedByUserId) {
+    convPayload.originalScannedByUserId = convPayload.originalScannedByUserId || convPayload.scannedByUserId;
+    convPayload.scannedByUserId = agentProfile.userId;
+    convPayload.scannedByName = assignedFreelancerName;
+  }
 
   await prisma.appConversation.update({
-    where: { id },
+    where: { id: conversation.id },
     data: {
       assignedFreelancerId,
       assignedFreelancerName,
@@ -2866,13 +2893,16 @@ const handleAssignConversation = async (req: Request, res: Response) => {
 
   // Also update linked leads & create timeline entries for Command History
   const leadIdFromPayload = (convPayload as any)?.leadId;
+  const cleanId = id.replace(/^conv-lead-/, '').replace(/^lead-/, '').replace(/^draft-/, '');
   const linkedLeads = await prisma.salesLeadAssignment.findMany({
     where: {
       tenantId,
       OR: [
         ...(leadIdFromPayload ? [{ id: leadIdFromPayload }] : []),
-        { conversationId: id },
-        { id: `sales-conversation-${id}` },
+        { id },
+        { id: cleanId },
+        { conversationId: conversation.id },
+        { id: `sales-conversation-${conversation.id}` },
         ...phoneMatchConditions([conversation.customerPhone]),
       ],
     },
@@ -2884,14 +2914,16 @@ const handleAssignConversation = async (req: Request, res: Response) => {
       ...((linkedLead.customFields as Record<string, any>) || {}),
       owner: assignedFreelancerName,
       assignedAgentName: assignedFreelancerName,
+      assignedUserId: agentProfile.userId,
     };
 
     await prisma.salesLeadAssignment.update({
       where: { id: linkedLead.id },
       data: {
         assignedAgentId: assignedFreelancerId,
-        conversationId: id,
+        conversationId: conversation.id,
         customFields: updatedCustomFields,
+        updatedAt: new Date(),
       },
     });
 
@@ -2903,11 +2935,11 @@ const handleAssignConversation = async (req: Request, res: Response) => {
         userId: user.userId,
         agentId: assignedFreelancerId,
         type: 'LEAD_REASSIGNED',
-        body: `Lead transferred to ${assignedFreelancerName} by ${actorName}${handoverNote}`,
+        body: `Lead & Chat transferred to ${assignedFreelancerName} by ${actorName}${handoverNote}`,
         metadata: {
           fromUserId: user.userId,
           toAgentId: assignedFreelancerId,
-          conversationId: id,
+          conversationId: conversation.id,
           note: (req.body as any)?.note || null,
         },
       },
@@ -2920,8 +2952,8 @@ const handleAssignConversation = async (req: Request, res: Response) => {
         assignmentId: linkedLead.id,
         actorUserId: user.userId,
         action: 'LEAD_REASSIGNED',
-        note: `Lead transferred to ${assignedFreelancerName} by ${actorName}${handoverNote}`,
-        metadata: { previousAgentId: linkedLead.assignedAgentId, newAgentId: assignedFreelancerId, conversationId: id },
+        note: `Lead & Chat transferred to ${assignedFreelancerName} by ${actorName}${handoverNote}`,
+        metadata: { previousAgentId: linkedLead.assignedAgentId, newAgentId: assignedFreelancerId, conversationId: conversation.id },
       },
     }).catch(() => undefined);
   }
@@ -3039,9 +3071,7 @@ conversationsRouter.get('/:id/shares', async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const id = String(req.params.id);
 
-  const conversation = await prisma.appConversation.findFirst({
-    where: { id, tenantId },
-  });
+  const conversation = await resolveAppConversation(tenantId, id, true);
 
   if (!conversation) {
     res.status(404).json({ success: false, error: 'NotFound', message: 'Conversation not found' });
@@ -3119,9 +3149,7 @@ conversationsRouter.post('/:id/share', validateBody(directShareBodySchema), asyn
   const id = String(req.params.id);
   const targetUserId = String(req.body.targetUserId || req.body.userId || '').trim();
 
-  const conversation = await prisma.appConversation.findFirst({
-    where: { id, tenantId },
-  });
+  const conversation = await resolveAppConversation(tenantId, id, true);
 
   if (!conversation) {
     res.status(404).json({ success: false, error: 'NotFound', message: 'Conversation not found' });
@@ -3255,9 +3283,7 @@ conversationsRouter.post('/:id/shares', validateBody(createShareSchema), async (
   const id = String(req.params.id);
   const { userId: targetUserParam, permission } = req.body as z.infer<typeof createShareSchema>;
 
-  const conversation = await prisma.appConversation.findFirst({
-    where: { id, tenantId },
-  });
+  const conversation = await resolveAppConversation(tenantId, id, true);
 
   if (!conversation) {
     res.status(404).json({ success: false, error: 'NotFound', message: 'Conversation not found' });
@@ -3473,9 +3499,7 @@ conversationsRouter.delete('/:id/shares/:userId', async (req: Request, res: Resp
   const id = String(req.params.id);
   const targetUserParam = String(req.params.userId).trim();
 
-  const conversation = await prisma.appConversation.findFirst({
-    where: { id, tenantId },
-  });
+  const conversation = await resolveAppConversation(tenantId, id);
 
   if (!conversation) {
     res.status(404).json({ success: false, error: 'NotFound', message: 'Conversation not found' });
