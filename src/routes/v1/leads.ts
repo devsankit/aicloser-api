@@ -730,9 +730,25 @@ leadsRouter.get('/dashboard-summary', async (req: Request, res: Response) => {
   const startOfDay = new Date(now.getFullYear(), now.getMonth(), now.getDate());
   const endOfDay = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59, 999);
 
+  const isCloser = (req.user?.role === 'SALES_AGENT' || (req.user?.role as any) === 'CLOSER') && Boolean(req.user?.userId);
   const paymentLinkWhere: any = { tenantId };
-  if (req.user?.role === 'SALES_AGENT') {
-    paymentLinkWhere.createdByUserId = req.user.userId;
+  if (isCloser && req.user) {
+    const profile = await prisma.salesAgentProfile.findFirst({
+      where: { userId: req.user.userId, tenantId },
+      select: { id: true },
+    });
+    const assignedLeads = profile
+      ? await prisma.salesLeadAssignment.findMany({
+          where: { assignedAgentId: profile.id, tenantId },
+          select: { id: true },
+        })
+      : [];
+    const assignedLeadIds = assignedLeads.map((l) => l.id);
+
+    paymentLinkWhere.OR = [
+      { createdByUserId: req.user.userId },
+      ...(assignedLeadIds.length ? [{ customFields: { path: ['leadId'], in: assignedLeadIds } }] : []),
+    ];
   }
 
   const [
@@ -834,16 +850,19 @@ leadsRouter.get('/dashboard-summary', async (req: Request, res: Response) => {
     }
   }
 
-  const pendingLinks = paymentLinks.filter(
-    (pl) => pl.status === 'PENDING' || pl.status === 'CUSTOMER_CONFIRMED'
-  );
   const paidLinks = paymentLinks.filter((pl) => pl.status === 'PAID');
-  const paidAmount = paidLinks.reduce((sum, pl) => sum + Number(pl.totalAmount || 0), 0);
-  const pendingAmount = pendingLinks.reduce((sum, pl) => sum + Number(pl.totalAmount || 0), 0);
+  const pendingVerificationLinks = paymentLinks.filter((pl) => pl.status === 'CUSTOMER_CONFIRMED');
+  const openLinks = paymentLinks.filter((pl) => pl.status === 'PENDING');
 
+  const paidAmount = paidLinks.reduce((sum, pl) => sum + Number(pl.totalAmount || 0), 0);
+  const pendingVerificationAmount = pendingVerificationLinks.reduce((sum, pl) => sum + Number(pl.totalAmount || 0), 0);
+  const openLinksAmount = openLinks.reduce((sum, pl) => sum + Number(pl.totalAmount || 0), 0);
+  const totalPendingAmount = pendingVerificationAmount + openLinksAmount;
+
+  // Realized settled revenue from verified payment ledger
+  const settledRevenue = paidAmount;
   // If realized payments exist, report realized amount, otherwise closed won deal budgets
   if (paidLinks.length > 0) {
-    wonCount = paidLinks.length;
     wonAmount = paidAmount;
   } else {
     wonAmount = closedWonBudget;
@@ -886,10 +905,15 @@ leadsRouter.get('/dashboard-summary', async (req: Request, res: Response) => {
       followUpsPending,
       wonCount,
       wonAmount,
+      settledRevenue,
       lostCount,
       pipelineValue,
-      pendingPaymentLinksCount: pendingLinks.length,
-      pendingPaymentLinksAmount: pendingAmount,
+      pendingPaymentLinksCount: pendingVerificationLinks.length + openLinks.length,
+      pendingPaymentLinksAmount: totalPendingAmount,
+      pendingVerificationCount: pendingVerificationLinks.length,
+      pendingVerificationAmount,
+      openLinksCount: openLinks.length,
+      openLinksAmount,
       conversionRate,
       stageCounts,
       missedCount,
