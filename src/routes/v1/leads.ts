@@ -294,6 +294,8 @@ leadsRouter.post('/', validateBody(createLeadSchema), async (req: Request, res: 
         data: {
           lastContactedAt: new Date(),
           ...(body.customerName ? { customerName: body.customerName } : {}),
+          ...(body.serviceInterest ? { serviceInterest: body.serviceInterest } : {}),
+          ...(agent ? { assignedAgentId: agent.id } : {}),
           ...(body.notes ? { notes: existing.notes ? (existing.notes + "\n---\n" + body.notes) : body.notes } : {}),
           ...(body.budgetAmount !== undefined ? { budgetAmount: body.budgetAmount } : {}),
           ...(body.stage ? { stage: body.stage, stageChangedAt: new Date() } : {}),
