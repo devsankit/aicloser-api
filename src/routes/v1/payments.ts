@@ -419,7 +419,26 @@ paymentsRouter.get('/', validateQuery(listPaymentsQuerySchema), async (req: Requ
     const phoneFilter = rawDigits.length >= 10 ? rawDigits.slice(-10) : targetPhone;
     where.customerPhone = { contains: phoneFilter };
   } else if (!scope.all) {
-    where.createdByUserId = { in: scope.userIds.length ? scope.userIds : ['__NO_ACCESS__'] };
+    const profile = await prisma.salesAgentProfile.findFirst({
+      where: { userId: req.user!.userId, tenantId },
+      select: { id: true },
+    });
+    const assignedLeads = profile
+      ? await prisma.salesLeadAssignment.findMany({
+          where: { assignedAgentId: profile.id, tenantId },
+          select: { id: true },
+        })
+      : [];
+    const assignedLeadIds = assignedLeads.map((l) => l.id);
+
+    const userOrLeadConditions: any[] = [
+      { createdByUserId: { in: scope.userIds.length ? scope.userIds : ['__NO_ACCESS__'] } },
+    ];
+    for (const lid of assignedLeadIds) {
+      userOrLeadConditions.push({ customFields: { path: ['leadId'], equals: lid } });
+    }
+
+    where.OR = userOrLeadConditions;
   }
 
   // Handle status mapping (COMPLETED -> PAID)
@@ -434,12 +453,18 @@ paymentsRouter.get('/', validateQuery(listPaymentsQuerySchema), async (req: Requ
 
   if (search) {
     const trimmed = search.trim();
-    where.OR = [
+    const searchConditions: any[] = [
       { customerName: { contains: trimmed, mode: 'insensitive' } },
       { customerPhone: { contains: trimmed } },
       { customerEmail: { contains: trimmed, mode: 'insensitive' } },
       { utrReference: { contains: trimmed } },
     ];
+    if (where.OR) {
+      where.AND = [{ OR: where.OR }, { OR: searchConditions }];
+      delete where.OR;
+    } else {
+      where.OR = searchConditions;
+    }
   }
 
   const [total, payments, amountSummary, statusSummary] = await Promise.all([

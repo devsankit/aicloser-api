@@ -818,22 +818,28 @@ leadsRouter.get('/dashboard-summary', async (req: Request, res: Response) => {
   ]);
 
   let relevantPaymentLinks = paymentLinks;
-  if (isCloser && req.user) {
-    const profile = await prisma.salesAgentProfile.findFirst({
-      where: { userId: req.user.userId, tenantId },
+  const targetAgentProfile = isCloser && req.user
+    ? await prisma.salesAgentProfile.findFirst({
+        where: { userId: req.user.userId, tenantId },
+        select: { id: true, userId: true },
+      })
+    : (req.query.assignedAgentId
+        ? await prisma.salesAgentProfile.findFirst({
+            where: { id: String(req.query.assignedAgentId), tenantId },
+            select: { id: true, userId: true },
+          })
+        : null);
+
+  if (targetAgentProfile) {
+    const assignedLeads = await prisma.salesLeadAssignment.findMany({
+      where: { assignedAgentId: targetAgentProfile.id, tenantId },
       select: { id: true },
     });
-    const assignedLeads = profile
-      ? await prisma.salesLeadAssignment.findMany({
-          where: { assignedAgentId: profile.id, tenantId },
-          select: { id: true },
-        })
-      : [];
     const assignedLeadIds = new Set(assignedLeads.map((l) => l.id));
 
     relevantPaymentLinks = paymentLinks.filter(
       (pl) =>
-        pl.createdByUserId === req.user?.userId ||
+        (targetAgentProfile.userId && pl.createdByUserId === targetAgentProfile.userId) ||
         (pl.customFields && assignedLeadIds.has((pl.customFields as any)?.leadId))
     );
   }
