@@ -178,6 +178,7 @@ const leadStageInputSchema = z
     if (!v) return 'NEW';
     const s = v.toUpperCase().replace(/[\s-]+/g, '_');
     if (s === 'WON') return 'CLOSED_WON';
+    if (s === 'LOST') return 'CLOSED_LOST';
     if (s === 'IN_PROGRESS' || s === 'PROGRESS') return 'CONTACTED';
     if (s === 'DEMO') return 'QUALIFIED';
     if (s === 'CALL_SCHEDULED') return 'FOLLOW_UP';
@@ -292,8 +293,28 @@ leadsRouter.post('/', validateBody(createLeadSchema), async (req: Request, res: 
         where: { id: existing.id },
         data: {
           lastContactedAt: new Date(),
+          ...(body.customerName ? { customerName: body.customerName } : {}),
           ...(body.notes ? { notes: existing.notes ? (existing.notes + "\n---\n" + body.notes) : body.notes } : {}),
-          ...(body.budgetAmount ? { budgetAmount: body.budgetAmount } : {}),
+          ...(body.budgetAmount !== undefined ? { budgetAmount: body.budgetAmount } : {}),
+          ...(body.stage ? { stage: body.stage, stageChangedAt: new Date() } : {}),
+          ...(body.source ? { source: body.source } : {}),
+          ...(body.priority ? { priority: body.priority } : {}),
+          ...(body.followUpAt !== undefined ? { followUpAt: body.followUpAt ? new Date(body.followUpAt) : null } : {}),
+          ...(body.tags && body.tags.length ? { tags: Array.from(new Set([...(existing.tags || []), ...body.tags])) } : {}),
+          ...(body.customFields ? { customFields: { ...((existing.customFields as any) || {}), ...body.customFields } } : {}),
+        },
+        include: {
+          assignedAgent: {
+            include: {
+              user: {
+                select: {
+                  id: true,
+                  displayName: true,
+                  email: true,
+                },
+              },
+            },
+          },
         },
       });
 
@@ -340,6 +361,19 @@ leadsRouter.post('/', validateBody(createLeadSchema), async (req: Request, res: 
         followUpAt: body.followUpAt ? new Date(body.followUpAt) : null,
         tags: body.tags || [],
         customFields: body.customFields || {},
+      },
+      include: {
+        assignedAgent: {
+          include: {
+            user: {
+              select: {
+                id: true,
+                displayName: true,
+                email: true,
+              },
+            },
+          },
+        },
       },
     });
   } catch (err: any) {
@@ -731,25 +765,6 @@ leadsRouter.get('/dashboard-summary', async (req: Request, res: Response) => {
   const endOfDay = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59, 999);
 
   const isCloser = (req.user?.role === 'SALES_AGENT' || (req.user?.role as any) === 'CLOSER') && Boolean(req.user?.userId);
-  const paymentLinkWhere: any = { tenantId };
-  if (isCloser && req.user) {
-    const profile = await prisma.salesAgentProfile.findFirst({
-      where: { userId: req.user.userId, tenantId },
-      select: { id: true },
-    });
-    const assignedLeads = profile
-      ? await prisma.salesLeadAssignment.findMany({
-          where: { assignedAgentId: profile.id, tenantId },
-          select: { id: true },
-        })
-      : [];
-    const assignedLeadIds = assignedLeads.map((l) => l.id);
-
-    paymentLinkWhere.OR = [
-      { createdByUserId: req.user.userId },
-      ...(assignedLeadIds.length ? [{ customFields: { path: ['leadId'], in: assignedLeadIds } }] : []),
-    ];
-  }
 
   const [
     totalLeads,
@@ -786,10 +801,31 @@ leadsRouter.get('/dashboard-summary', async (req: Request, res: Response) => {
       _sum: { budgetAmount: true },
     }),
     prisma.upiPaymentLink.findMany({
-      where: paymentLinkWhere,
-      select: { status: true, totalAmount: true },
+      where: { tenantId },
+      select: { status: true, totalAmount: true, createdByUserId: true, customFields: true },
     }),
   ]);
+
+  let relevantPaymentLinks = paymentLinks;
+  if (isCloser && req.user) {
+    const profile = await prisma.salesAgentProfile.findFirst({
+      where: { userId: req.user.userId, tenantId },
+      select: { id: true },
+    });
+    const assignedLeads = profile
+      ? await prisma.salesLeadAssignment.findMany({
+          where: { assignedAgentId: profile.id, tenantId },
+          select: { id: true },
+        })
+      : [];
+    const assignedLeadIds = new Set(assignedLeads.map((l) => l.id));
+
+    relevantPaymentLinks = paymentLinks.filter(
+      (pl) =>
+        pl.createdByUserId === req.user?.userId ||
+        (pl.customFields && assignedLeadIds.has((pl.customFields as any)?.leadId))
+    );
+  }
 
   let wonCount = 0;
   let wonAmount = 0;
@@ -850,9 +886,9 @@ leadsRouter.get('/dashboard-summary', async (req: Request, res: Response) => {
     }
   }
 
-  const paidLinks = paymentLinks.filter((pl) => pl.status === 'PAID');
-  const pendingVerificationLinks = paymentLinks.filter((pl) => pl.status === 'CUSTOMER_CONFIRMED');
-  const openLinks = paymentLinks.filter((pl) => pl.status === 'PENDING');
+  const paidLinks = relevantPaymentLinks.filter((pl) => pl.status === 'PAID');
+  const pendingVerificationLinks = relevantPaymentLinks.filter((pl) => pl.status === 'CUSTOMER_CONFIRMED');
+  const openLinks = relevantPaymentLinks.filter((pl) => pl.status === 'PENDING');
 
   const paidAmount = paidLinks.reduce((sum, pl) => sum + Number(pl.totalAmount || 0), 0);
   const pendingVerificationAmount = pendingVerificationLinks.reduce((sum, pl) => sum + Number(pl.totalAmount || 0), 0);
