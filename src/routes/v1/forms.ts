@@ -5,6 +5,7 @@ import { authenticate } from '../../middlewares/auth.js';
 import { enforceTenantIsolation } from '../../middlewares/tenant-isolation.js';
 import { requireRoles } from '../../middlewares/rbac.js';
 import { logger } from '../../lib/logger.js';
+import { persistApiRealtimeEvent } from '../../lib/realtime.js';
 
 export const formsRouter = Router();
 
@@ -218,6 +219,24 @@ const submitPublicForm = async (req: Request, res: Response) => {
     }).catch((err) => {
       logger.warn('Failed to write form submission activity log', { error: String(err) });
     });
+
+    await persistApiRealtimeEvent({
+      tenantId: targetWorkspaceId,
+      eventType: 'lead.created',
+      payload: {
+        id: lead.id,
+        leadId: lead.id,
+        customerName: lead.customerName,
+        customerPhone: lead.customerPhone,
+        customerEmail: lead.customerEmail,
+        stage: lead.stage,
+        source: lead.source,
+        budgetAmount: lead.budgetAmount,
+        serviceInterest: lead.serviceInterest,
+        tags: lead.tags,
+        assignedAgentId: activeAgent.id,
+      },
+    }).catch(() => undefined);
   } else {
     // No agent configured in workspace: ingest directly into SalesLeadPoolItem
     const poolItem = await prisma.salesLeadPoolItem.create({
@@ -253,6 +272,20 @@ const submitPublicForm = async (req: Request, res: Response) => {
     }).catch((err) => {
       logger.warn('Failed to write pool form submission activity log', { error: String(err) });
     });
+
+    await persistApiRealtimeEvent({
+      tenantId: targetWorkspaceId,
+      eventType: 'lead.created',
+      payload: {
+        id: poolItem.id,
+        leadId: poolItem.id,
+        customerName: poolItem.customerName,
+        customerPhone: poolItem.customerPhone,
+        customerEmail: poolItem.customerEmail,
+        source: poolItem.source,
+        isPool: true,
+      },
+    }).catch(() => undefined);
   }
 
   // Also sync to MarketingContact for omnichannel engagement

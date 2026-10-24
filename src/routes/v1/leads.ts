@@ -3906,8 +3906,8 @@ const reassignLeadSchema = z.object({
   reason: z.string().optional(),
 });
 
-// POST /:id/reassign - Dedicated lead reassignment endpoint
-leadsRouter.post('/:id/reassign', requirePermissions(PERM_LEADS_REASSIGN), validateBody(reassignLeadSchema), async (req: Request, res: Response) => {
+// Handler: Dedicated lead reassignment
+const handleReassignLead = async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const id = String(req.params.id);
   const { assignedAgentId, reason } = req.body as z.infer<typeof reassignLeadSchema>;
@@ -4036,12 +4036,29 @@ leadsRouter.post('/:id/reassign', requirePermissions(PERM_LEADS_REASSIGN), valid
 
   await syncLeadConversationAssignment(tenantId, updated, targetAgent).catch(() => undefined);
 
+  const assignPayload = {
+    id: lead.id,
+    leadId: lead.id,
+    assignedAgentId: targetAgent.id,
+    agentCode: targetAgent.agentCode,
+    assignedFreelancerName: targetAgent.user.displayName || targetAgent.agentCode,
+    assignedTo: targetAgent.user.displayName || targetAgent.agentCode,
+  };
+
   await persistApiRealtimeEvent({
     tenantId,
     actorUserId: req.user?.userId,
     audienceRoles: ['SUPER_ADMIN', 'ADMIN', 'MANAGER', 'SALES_AGENT'],
     eventType: 'lead.reassigned',
-    payload: { id: lead.id, assignedAgentId: targetAgent.id, agentCode: targetAgent.agentCode },
+    payload: assignPayload,
+  }).catch(() => undefined);
+
+  await persistApiRealtimeEvent({
+    tenantId,
+    actorUserId: req.user?.userId,
+    audienceRoles: ['SUPER_ADMIN', 'ADMIN', 'MANAGER', 'SALES_AGENT'],
+    eventType: 'lead.assigned',
+    payload: assignPayload,
   }).catch(() => undefined);
 
   res.json({
@@ -4049,7 +4066,11 @@ leadsRouter.post('/:id/reassign', requirePermissions(PERM_LEADS_REASSIGN), valid
     data: updated,
     message: `Lead successfully reassigned to ${targetAgent.user.displayName || targetAgent.agentCode}`,
   });
-});
+};
+
+// POST /:id/reassign & POST /:id/assign - Dedicated lead reassignment endpoints
+leadsRouter.post('/:id/reassign', requirePermissions(PERM_LEADS_REASSIGN), validateBody(reassignLeadSchema), handleReassignLead);
+leadsRouter.post('/:id/assign', requirePermissions(PERM_LEADS_REASSIGN), validateBody(reassignLeadSchema), handleReassignLead);
 
 // POST /bulk-reassign - Dedicated bulk lead reassignment endpoint
 const bulkReassignSchema = z.object({

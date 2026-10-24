@@ -3,6 +3,7 @@ import { SalesLeadStage } from '@prisma/client';
 import { logger } from './logger.js';
 import { assignLeadToNextCloser } from './lead-assignment-engine.js';
 import { normalizeLeadPhone, syncMarketingContactForLead } from './lead-contact-sync.js';
+import { persistApiRealtimeEvent } from './realtime.js';
 
 export interface UpsertLeadParams {
   tenantId: string;
@@ -163,6 +164,26 @@ export async function upsertCompanyLead(params: UpsertLeadParams): Promise<Upser
 
     await syncMarketingContactForLead(updated).catch(() => undefined);
 
+    await persistApiRealtimeEvent({
+      tenantId,
+      eventType: 'lead.updated',
+      payload: {
+        id: updated.id,
+        leadId: updated.id,
+        customerName: updated.customerName,
+        customerPhone: updated.customerPhone,
+        customerEmail: updated.customerEmail,
+        stage: updated.stage,
+        priority: updated.priority,
+        tags: updated.tags,
+        budgetAmount: updated.budgetAmount,
+        notes: updated.notes,
+        followUpAt: updated.followUpAt,
+        updatedAt: updated.updatedAt,
+      },
+      actorUserId: actorUserId || null,
+    }).catch(() => undefined);
+
     return {
       lead: updated,
       isDuplicate: true,
@@ -258,6 +279,28 @@ export async function upsertCompanyLead(params: UpsertLeadParams): Promise<Upser
   if (finalizedLead) {
     await syncMarketingContactForLead(finalizedLead).catch(() => undefined);
   }
+
+  const leadToReturn = finalizedLead || newLead;
+  await persistApiRealtimeEvent({
+    tenantId,
+    eventType: 'lead.created',
+    payload: {
+      id: leadToReturn.id,
+      leadId: leadToReturn.id,
+      customerName: leadToReturn.customerName,
+      customerPhone: leadToReturn.customerPhone,
+      customerEmail: leadToReturn.customerEmail,
+      stage: leadToReturn.stage,
+      source: leadToReturn.source,
+      priority: leadToReturn.priority,
+      tags: leadToReturn.tags,
+      budgetAmount: leadToReturn.budgetAmount,
+      assignedAgentId: leadToReturn.assignedAgentId,
+      notes: leadToReturn.notes,
+      createdAt: leadToReturn.createdAt,
+    },
+    actorUserId: actorUserId || null,
+  }).catch(() => undefined);
 
   return {
     lead: finalizedLead || newLead,

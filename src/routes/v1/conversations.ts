@@ -4207,6 +4207,17 @@ conversationsRouter.post('/:id/callback', async (req: Request, res: Response) =>
       metadata: { followUpAt: scheduledAt, reminderAt, conversationId: id },
     },
   }).catch(() => undefined);
+
+  await persistApiRealtimeEvent({
+    tenantId,
+    eventType: 'lead.updated',
+    payload: {
+      id: lead.id,
+      leadId: lead.id,
+      followUpAt: scheduledAt,
+    },
+    actorUserId: req.user?.userId,
+  }).catch(() => undefined);
   res.status(201).json({
     success: true,
     data: {
