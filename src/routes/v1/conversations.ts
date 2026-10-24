@@ -756,15 +756,9 @@ conversationsRouter.get('/', validateQuery(listConversationsQuerySchema), async 
 
   if (status) {
     andConditions.push({ status });
-    if (status !== 'ARCHIVED' && status !== 'archived') {
-      andConditions.push({
-        NOT: [{ payload: { path: ['recycled'], equals: true } }],
-      });
-    }
   } else {
     andConditions.push({
       status: { notIn: ['ARCHIVED', 'archived'] },
-      NOT: [{ payload: { path: ['recycled'], equals: true } }],
     });
   }
   if (customerPhone) andConditions.push({ customerPhone: { contains: customerPhone } });
