@@ -57,11 +57,15 @@ leadsRouter.get('/', validateQuery(listLeadsQuerySchema), async (req: Request, r
   }
 
   // Admins see the tenant; managers see their reporting team; closers see
-  // strictly only their own assigned leads.
+  // strictly only their own assigned leads plus leads shared with them.
   const authUser = req.user;
   if (authUser && (authUser.role === 'SALES_AGENT' || (authUser.role as any) === 'CLOSER')) {
     const scope = await getWorkspaceScope(tenantId, authUser);
-    where.assignedAgentId = scope.profileIds.length === 1 ? scope.profileIds[0] : { in: scope.profileIds.length ? scope.profileIds : ['__NO_ACCESS__'] };
+    const profileIds = scope.profileIds.length ? scope.profileIds : ['__NO_ACCESS__'];
+    where.OR = [
+      { assignedAgentId: { in: profileIds } },
+      { customFields: { path: ['sharedUserIds'], array_contains: authUser.userId } },
+    ];
   } else if (authUser && authUser.role === 'MANAGER') {
     const scope = await getWorkspaceScope(tenantId, authUser);
     where.assignedAgentId = { in: scope.profileIds.length ? scope.profileIds : ['__NO_ACCESS__'] };
@@ -84,7 +88,12 @@ leadsRouter.get('/', validateQuery(listLeadsQuerySchema), async (req: Request, r
       orConditions.push({ customerPhone: { contains: `+91${digitsOnly.slice(-10)}` } });
       orConditions.push({ customerPhone: { contains: digitsOnly.slice(-10) } });
     }
-    where.OR = orConditions;
+    if (where.OR) {
+      where.AND = [{ OR: where.OR }, { OR: orConditions }];
+      delete where.OR;
+    } else {
+      where.OR = orConditions;
+    }
   }
 
   const [total, leads] = await Promise.all([
@@ -1519,6 +1528,13 @@ async function verifyLeadAccess(leadId: string, req: Request) {
         (share.userId === user.userId || Boolean(share.agentProfileId && scope.profileIds.includes(share.agentProfileId))) &&
         (req.method === 'GET' || req.method === 'HEAD' || share.permission === 'REPLY')));
     }
+    if (!allowed) {
+      const custom = (lead.customFields && typeof lead.customFields === 'object' && !Array.isArray(lead.customFields))
+        ? (lead.customFields as Record<string, any>)
+        : {};
+      const shares = Array.isArray(custom.shares) ? custom.shares : [];
+      allowed = Boolean(shares.some((s: any) => !s.revokedAt && (s.userId === user.userId || (s.agentProfileId && scope.profileIds.includes(s.agentProfileId)))));
+    }
     if (!allowed) return { ok: false as const, status: 403, error: 'Forbidden', message: 'You are not authorized to access this lead' };
   }
 
@@ -1820,10 +1836,11 @@ export async function getLead360(req: Request, res: Response) {
     })),
     ...filteredActivityLogs.map((entry) => ({
       id: `activity:${entry.id}`,
-      kind: 'ACTIVITY',
+      kind: (entry.action === 'CALLBACK_SCHEDULED' || (entry.metadata as any)?.followUpAt) ? 'CALLBACK' : 'ACTIVITY',
       title: humanizeHistoryAction(entry.action),
       body: entry.note || humanizeHistoryAction(entry.action),
       createdAt: entry.createdAt.toISOString(),
+      dueAt: (entry.metadata as any)?.followUpAt || null,
       actorName: entry.actor?.displayName || entry.actor?.email || null,
       metadata: entry.metadata,
     })),
@@ -2236,7 +2253,10 @@ leadsRouter.patch('/:id', validateBody(updateLeadSchema), async (req: Request, r
   // The phone is the tenant-scoped lead identity key. It can be set when the
   // lead is created, but changing it would silently detach conversations,
   // notes, calls, and payment history from the original customer.
-  if (body.customerPhone !== undefined && body.customerPhone !== existing.customerPhone) {
+  if (
+    body.customerPhone !== undefined &&
+    normalizeLeadPhone(body.customerPhone) !== normalizeLeadPhone(existing.customerPhone)
+  ) {
     res.status(400).json({
       success: false,
       error: 'LeadPhoneImmutable',
@@ -2401,7 +2421,7 @@ leadsRouter.patch('/:id', validateBody(updateLeadSchema), async (req: Request, r
         assignmentId: existing.id,
         actorUserId: req.user?.userId,
         action: body.followUpAt ? 'CALLBACK_SCHEDULED' : 'CALLBACK_CLEARED',
-        note: body.followUpAt ? `Callback scheduled for ${body.followUpAt}` : 'Callback cleared',
+        note: body.followUpAt ? 'Callback scheduled' : 'Callback cleared',
         metadata: { followUpAt: body.followUpAt },
       },
     }));
@@ -3010,20 +3030,52 @@ leadsRouter.post('/:id/transfer', validateBody(transferLeadSchema), async (req: 
     return;
   }
 
-  const targetProfile = await prisma.salesAgentProfile.findFirst({
+  let targetProfile = await prisma.salesAgentProfile.findFirst({
     where: {
       tenantId,
-      status: 'ACTIVE',
       OR: [
         { id: targetAgentId },
         { userId: targetAgentId },
         { agentCode: targetAgentId },
+        { user: { id: targetAgentId } },
+        { user: { displayName: { equals: targetAgentId, mode: 'insensitive' } } },
+        { user: { email: { equals: targetAgentId, mode: 'insensitive' } } },
       ],
     },
     include: {
       user: { select: { id: true, displayName: true, email: true, phone: true, role: true } },
     },
   });
+
+  if (!targetProfile) {
+    const targetUser = await prisma.appAuthUser.findFirst({
+      where: {
+        tenantId,
+        OR: [
+          { id: targetAgentId },
+          { displayName: { equals: targetAgentId, mode: 'insensitive' } },
+          { email: { equals: targetAgentId, mode: 'insensitive' } },
+        ],
+      },
+    });
+    if (targetUser && targetUser.role !== 'SUPER_ADMIN' && targetUser.role !== 'ADMIN') {
+      targetProfile = await prisma.salesAgentProfile.upsert({
+        where: { userId: targetUser.id },
+        update: { status: 'ACTIVE' },
+        create: {
+          tenantId,
+          userId: targetUser.id,
+          agentCode: `AG-${targetUser.id.slice(-4).toUpperCase()}`,
+          status: 'ACTIVE',
+          canClaimLeads: true,
+          maxActiveLeads: 15,
+        },
+        include: {
+          user: { select: { id: true, displayName: true, email: true, phone: true, role: true } },
+        },
+      });
+    }
+  }
 
   if (!targetProfile) {
     res.status(400).json({
@@ -3161,6 +3213,206 @@ leadsRouter.post('/:id/transfer', validateBody(transferLeadSchema), async (req: 
     message: `Lead successfully transferred to ${targetName}`,
     error: null,
   });
+});
+
+const shareLeadSchema = z.object({
+  targetUserId: z.string().min(1, 'Target user ID or name is required'),
+  permission: z.enum(['REPLY', 'VIEW']).optional().default('REPLY'),
+  note: z.string().optional(),
+});
+
+// POST /:id/share - Share lead and conversation access with a teammate
+leadsRouter.post('/:id/share', validateBody(shareLeadSchema), async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const id = String(req.params.id);
+  const { targetUserId, permission, note } = req.body as z.infer<typeof shareLeadSchema>;
+  const user = req.user!;
+
+  const check = await verifyLeadAccess(id, req);
+  if (!check.ok) {
+    res.status(check.status).json({ success: false, error: check.error, message: check.message });
+    return;
+  }
+  const lead = check.lead;
+
+  // Resolve target user in this tenant
+  let targetUser = await prisma.appAuthUser.findFirst({
+    where: {
+      tenantId,
+      OR: [
+        { id: targetUserId },
+        { displayName: { equals: targetUserId, mode: 'insensitive' } },
+        { email: { equals: targetUserId, mode: 'insensitive' } },
+      ],
+    },
+    select: { id: true, displayName: true, email: true, role: true },
+  });
+
+  let targetProfile = null;
+  if (!targetUser) {
+    targetProfile = await prisma.salesAgentProfile.findFirst({
+      where: {
+        tenantId,
+        OR: [
+          { id: targetUserId },
+          { userId: targetUserId },
+          { agentCode: targetUserId },
+        ],
+      },
+      include: { user: { select: { id: true, displayName: true, email: true, role: true } } },
+    });
+    if (targetProfile) {
+      targetUser = targetProfile.user;
+    }
+  }
+
+  if (!targetUser) {
+    res.status(404).json({ success: false, error: 'UserNotFound', message: 'Target team member not found in this workspace' });
+    return;
+  }
+
+  // Update lead customFields.shares and customFields.sharedUserIds
+  const custom = (lead.customFields && typeof lead.customFields === 'object' && !Array.isArray(lead.customFields))
+    ? { ...(lead.customFields as Record<string, any>) }
+    : {};
+  const existingShares: any[] = Array.isArray(custom.shares) ? [...custom.shares] : [];
+  const targetId = targetUser.id;
+
+  const filteredShares = existingShares.filter((s: any) => s.userId !== targetId);
+  const newShare = {
+    userId: targetId,
+    displayName: targetUser.displayName || targetUser.email,
+    permission: permission || 'REPLY',
+    sharedAt: new Date().toISOString(),
+    sharedByUserId: user.userId,
+    sharedByName: user.displayName || 'Admin',
+    note: note || null,
+  };
+  filteredShares.push(newShare);
+
+  const sharedUserIds = Array.from(new Set([...(Array.isArray(custom.sharedUserIds) ? custom.sharedUserIds : []), targetId]));
+  custom.shares = filteredShares;
+  custom.sharedUserIds = sharedUserIds;
+
+  await prisma.salesLeadAssignment.update({
+    where: { id: lead.id },
+    data: { customFields: custom, updatedAt: new Date() },
+  });
+
+  // Symmetrically share conversation if linked
+  if (lead.conversationId) {
+    const conv = await prisma.appConversation.findFirst({
+      where: { id: lead.conversationId, tenantId },
+    });
+    if (conv) {
+      const convPayload = (conv.payload && typeof conv.payload === 'object' && !Array.isArray(conv.payload))
+        ? { ...(conv.payload as Record<string, any>) }
+        : {};
+      const convShares: any[] = Array.isArray(convPayload.shares) ? [...convPayload.shares] : [];
+      const convFiltered = convShares.filter((s: any) => s.userId !== targetId);
+      convFiltered.push({
+        userId: targetId,
+        displayName: targetUser.displayName,
+        permission: permission || 'REPLY',
+        sharedAt: new Date().toISOString(),
+        sharedByUserId: user.userId,
+      });
+      convPayload.shares = convFiltered;
+      await prisma.appConversation.update({
+        where: { id: conv.id },
+        data: { payload: convPayload as unknown as Prisma.InputJsonValue, updatedAt: new Date() },
+      }).catch(() => undefined);
+    }
+  }
+
+  const targetName = targetUser.displayName || targetUser.email || 'Teammate';
+  await prisma.salesLeadTimelineEntry.create({
+    data: {
+      tenantId,
+      leadId: lead.id,
+      userId: user.userId,
+      type: 'LEAD_SHARED',
+      body: `Lead and chat shared with ${targetName} (${permission === 'VIEW' ? 'View only' : 'Can reply'}).`,
+      metadata: { targetUserId: targetId, permission, note: note || null },
+    },
+  }).catch(() => undefined);
+
+  await prisma.salesActivityLog.create({
+    data: {
+      tenantId,
+      assignmentId: lead.id,
+      actorUserId: user.userId,
+      action: 'LEAD_SHARED',
+      note: `Lead shared with ${targetName}`,
+      metadata: { targetUserId: targetId, permission },
+    },
+  }).catch(() => undefined);
+
+  res.json({
+    success: true,
+    message: `Lead shared with ${targetName}`,
+    shares: filteredShares,
+  });
+});
+
+// GET /:id/shares - List users who have shared access to this lead
+leadsRouter.get('/:id/shares', async (req: Request, res: Response) => {
+  const check = await verifyLeadAccess(String(req.params.id), req);
+  if (!check.ok) {
+    res.status(check.status).json({ success: false, error: check.error, message: check.message });
+    return;
+  }
+  const lead = check.lead;
+  const custom = (lead.customFields && typeof lead.customFields === 'object' && !Array.isArray(lead.customFields))
+    ? { ...(lead.customFields as Record<string, any>) }
+    : {};
+  const shares = Array.isArray(custom.shares) ? custom.shares : [];
+  res.json({ success: true, shares });
+});
+
+// DELETE /:id/shares/:targetUserId - Revoke shared access
+leadsRouter.delete('/:id/shares/:targetUserId', async (req: Request, res: Response) => {
+  const check = await verifyLeadAccess(String(req.params.id), req);
+  if (!check.ok) {
+    res.status(check.status).json({ success: false, error: check.error, message: check.message });
+    return;
+  }
+  const lead = check.lead;
+  const targetUserId = String(req.params.targetUserId).trim();
+
+  const custom = (lead.customFields && typeof lead.customFields === 'object' && !Array.isArray(lead.customFields))
+    ? { ...(lead.customFields as Record<string, any>) }
+    : {};
+  const existingShares: any[] = Array.isArray(custom.shares) ? [...custom.shares] : [];
+  const updatedShares = existingShares.filter((s: any) => s.userId !== targetUserId);
+  const sharedUserIds = Array.isArray(custom.sharedUserIds) ? custom.sharedUserIds.filter((uid: string) => uid !== targetUserId) : [];
+
+  custom.shares = updatedShares;
+  custom.sharedUserIds = sharedUserIds;
+
+  await prisma.salesLeadAssignment.update({
+    where: { id: lead.id },
+    data: { customFields: custom, updatedAt: new Date() },
+  });
+
+  if (lead.conversationId) {
+    const conv = await prisma.appConversation.findFirst({
+      where: { id: lead.conversationId, tenantId: req.tenantId! },
+    });
+    if (conv) {
+      const convPayload = (conv.payload && typeof conv.payload === 'object' && !Array.isArray(conv.payload))
+        ? { ...(conv.payload as Record<string, any>) }
+        : {};
+      const convShares: any[] = Array.isArray(convPayload.shares) ? [...convPayload.shares] : [];
+      convPayload.shares = convShares.filter((s: any) => s.userId !== targetUserId);
+      await prisma.appConversation.update({
+        where: { id: conv.id },
+        data: { payload: convPayload as unknown as Prisma.InputJsonValue, updatedAt: new Date() },
+      }).catch(() => undefined);
+    }
+  }
+
+  res.json({ success: true, message: 'Share revoked successfully', shares: updatedShares });
 });
 
 const bindConversationSchema = z.object({
