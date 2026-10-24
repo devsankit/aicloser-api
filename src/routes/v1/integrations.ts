@@ -260,6 +260,90 @@ integrationsRouter.post('/indiamart/sync', requireRoles('ADMIN', 'SUPER_ADMIN'),
 });
 
 // ==========================================
+// JustDial Configuration & Webhook Endpoints
+// ==========================================
+
+// GET /justdial/config - Retrieve current JustDial settings
+integrationsRouter.get('/justdial/config', requireRoles('ADMIN', 'SUPER_ADMIN'), async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const workspace = await prisma.aicloserWorkspace.findUnique({
+    where: { id: tenantId },
+    select: { settings: true },
+  });
+
+  const wsSettings = (workspace?.settings as Record<string, any>) || {};
+  const jdConfig = wsSettings.integrations?.justdial || {};
+
+  res.json({
+    success: true,
+    data: {
+      secret: jdConfig.secret || `jd_sec_live_${tenantId}`,
+      requireSignature: Boolean(jdConfig.requireSignature),
+      distributionMode: jdConfig.distributionMode || 'ROUND_ROBIN',
+      webhookUrl: `https://api.aicloser.com/api/v1/integrations/justdial/webhook?token=${tenantId}`,
+    },
+    error: null,
+  });
+});
+
+// GET /justdial/webhook-url - Retrieve target webhook endpoint for JustDial portal
+integrationsRouter.get('/justdial/webhook-url', requireRoles('ADMIN', 'SUPER_ADMIN'), async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  res.json({
+    success: true,
+    data: {
+      webhookUrl: `https://api.aicloser.com/api/v1/integrations/justdial/webhook?token=${tenantId}`,
+      secretToken: `jd_sec_live_${tenantId}`,
+    },
+    error: null,
+  });
+});
+
+// POST /justdial/config - Save JustDial settings
+const justdialConfigSchema = z.object({
+  secret: z.string().optional(),
+  requireSignature: z.boolean().optional(),
+  distributionMode: z.enum(['ROUND_ROBIN', 'POOL']).optional(),
+});
+
+integrationsRouter.post('/justdial/config', requireRoles('ADMIN', 'SUPER_ADMIN'), validateBody(justdialConfigSchema), async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const body = req.body as z.infer<typeof justdialConfigSchema>;
+
+  const workspace = await prisma.aicloserWorkspace.findUnique({
+    where: { id: tenantId },
+    select: { settings: true },
+  });
+
+  const wsSettings = (workspace?.settings as Record<string, any>) || {};
+  const currentIntegrations = wsSettings.integrations || {};
+
+  await prisma.aicloserWorkspace.update({
+    where: { id: tenantId },
+    data: {
+      settings: {
+        ...wsSettings,
+        integrations: {
+          ...currentIntegrations,
+          justdial: {
+            ...(currentIntegrations.justdial || {}),
+            ...body,
+            updatedAt: new Date().toISOString(),
+          },
+        },
+      },
+    },
+  });
+
+  res.json({
+    success: true,
+    message: 'JustDial configuration saved successfully',
+    data: body,
+    error: null,
+  });
+});
+
+// ==========================================
 // 1. WhatsApp Official Business API Channels
 // ==========================================
 

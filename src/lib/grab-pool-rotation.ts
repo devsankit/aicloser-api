@@ -276,29 +276,46 @@ export async function syncAndRotatePoolSlots(
     }
   }
 
-  // 6. Slot unslotted backlog items ONLY up to each closer's capacity limit
+  // 6. Slot unslotted backlog items equally across eligible closers in round-robin order
+  let closerRoundRobinIndex = 0;
   for (const item of openPoolItems) {
     if (slottedPoolLeads[item.id]) continue;
 
-    // Gate closer eligibility: closer is only eligible for new pool slot if initialStageCount < configuredCapacity
-    const availableCloser = activeClosers.find((c) => {
+    // Filter all eligible closers who have capacity remaining in both initial stage and grab slots
+    const eligibleClosers = activeClosers.filter((c) => {
       const initialCount = closerInitialStageCounts[c.id] || 0;
       const slotCount = closerSlotCounts[c.id] || 0;
       return initialCount < configuredCapacity && slotCount < configuredCapacity;
     });
-    if (!availableCloser) {
+
+    if (eligibleClosers.length === 0) {
       // All closers have reached their active grab pool capacity limit in initial stage
       // Remaining open items stay in queue without generating slot expiration
       break;
     }
 
+    // Pick the eligible closer with the fewest active slots to guarantee equal distribution,
+    // breaking ties with round-robin cyclic ordering
+    eligibleClosers.sort((a, b) => {
+      const countA = closerSlotCounts[a.id] || 0;
+      const countB = closerSlotCounts[b.id] || 0;
+      if (countA !== countB) return countA - countB;
+      const idxA = (activeClosers.findIndex((c) => c.id === a.id) - closerRoundRobinIndex + activeClosers.length) % activeClosers.length;
+      const idxB = (activeClosers.findIndex((c) => c.id === b.id) - closerRoundRobinIndex + activeClosers.length) % activeClosers.length;
+      return idxA - idxB;
+    });
+
+    const selectedCloser = eligibleClosers[0];
+    const selectedIdx = activeClosers.findIndex((c) => c.id === selectedCloser.id);
+    closerRoundRobinIndex = (selectedIdx + 1) % activeClosers.length;
+
     slottedPoolLeads[item.id] = {
       poolItemId: item.id,
-      slottedAgentId: availableCloser.id,
+      slottedAgentId: selectedCloser.id,
       slottedAt: new Date(now).toISOString(),
       slotExpiresAt: new Date(now + SLOT_DURATION_MS).toISOString(),
     };
-    closerSlotCounts[availableCloser.id] = (closerSlotCounts[availableCloser.id] || 0) + 1;
+    closerSlotCounts[selectedCloser.id] = (closerSlotCounts[selectedCloser.id] || 0) + 1;
     stateChanged = true;
   }
 

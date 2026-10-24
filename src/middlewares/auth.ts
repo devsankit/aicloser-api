@@ -14,17 +14,29 @@ export async function authenticate(req: Request, res: Response, next: NextFuncti
     if (authHeader && authHeader.startsWith('Bearer ')) {
       token = authHeader.substring(7).trim();
     }
-    // 2. Check query string (Critical for native EventSource SSE and image/attachment previews)
-    else if (typeof req.query?.token === 'string' && req.query.token.trim()) {
-      token = req.query.token.trim();
-    } else if (typeof req.query?.accessToken === 'string' && req.query.accessToken.trim()) {
-      token = req.query.accessToken.trim();
-    }
-    // 3. Check HTTP-only cookies (both modern aicloser_token and legacy gx_session)
+    // 2. Check HTTP-only cookies (both modern aicloser_token and legacy gx_session)
     else if (req.cookies?.aicloser_token) {
       token = req.cookies.aicloser_token;
     } else if (req.cookies?.gx_session) {
       token = req.cookies.gx_session;
+    }
+    // 3. Check query string ONLY for SSE streaming, exports, and binary preview requests where custom headers cannot be passed
+    else if (
+      (typeof req.query?.token === 'string' && req.query.token.trim()) ||
+      (typeof req.query?.accessToken === 'string' && req.query.accessToken.trim())
+    ) {
+      const isStreamOrExport =
+        Boolean(req.headers.accept?.includes('text/event-stream')) ||
+        req.path.includes('/events') ||
+        req.path.includes('/stream') ||
+        req.path.includes('/telemetry') ||
+        req.path.includes('/export') ||
+        req.path.includes('/download') ||
+        req.path.includes('/preview');
+
+      if (isStreamOrExport) {
+        token = (typeof req.query?.token === 'string' ? req.query.token : (req.query?.accessToken as string)).trim();
+      }
     }
 
     if (!token) {
@@ -39,13 +51,11 @@ export async function authenticate(req: Request, res: Response, next: NextFuncti
 
     let decoded: any = null;
 
-    // Cryptographic signature verification across known valid secrets
+    // Cryptographic signature verification strictly from configured environment secrets
     const validSecrets = [
       env.JWT_SECRET,
       process.env.SESSION_SECRET,
       process.env.GIGXOMI_SESSION_SECRET,
-      'aicloser-super-secure-production-jwt-secret-2026-key',
-      'e88656903145ee2ad75187d3bbf95733183e298552269a01bbf81616b69f1bde',
     ].filter(Boolean) as string[];
 
     for (const secret of validSecrets) {

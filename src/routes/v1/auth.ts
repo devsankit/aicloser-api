@@ -413,6 +413,77 @@ authRouter.post('/signup', validateBody(signupSchema), async (req: Request, res:
 });
 
 // ==========================================
+// Update Password Endpoint
+// ==========================================
+
+const updatePasswordSchema = z.object({
+  password: z.string().min(6, 'Password must be at least 6 characters').optional(),
+  newPassword: z.string().min(6, 'New password must be at least 6 characters').optional(),
+  currentPassword: z.string().optional(),
+}).refine((data) => Boolean(data.password || data.newPassword), {
+  message: 'New password is required',
+  path: ['password'],
+});
+
+authRouter.post('/password', authenticate, validateBody(updatePasswordSchema), async (req: Request, res: Response) => {
+  const userId = req.user?.userId;
+  if (!userId) {
+    res.status(401).json({ success: false, error: 'Unauthorized', message: 'Authentication required' });
+    return;
+  }
+
+  const { password, newPassword, currentPassword } = req.body;
+  const targetPassword = (newPassword || password) as string;
+
+  const authUser = await prisma.appAuthUser.findUnique({
+    where: { id: userId },
+    select: { id: true, passwordHash: true, passwordSalt: true, email: true },
+  });
+
+  if (!authUser) {
+    res.status(404).json({ success: false, error: 'UserNotFound', message: 'User account not found' });
+    return;
+  }
+
+  // If current password was sent and user has an existing password, verify it
+  if (currentPassword && authUser.passwordHash && authUser.passwordSalt) {
+    if (!passwordsMatch(currentPassword, authUser.passwordSalt, authUser.passwordHash)) {
+      res.status(400).json({ success: false, error: 'InvalidPassword', message: 'Current password is incorrect' });
+      return;
+    }
+  }
+
+  const salt = randomBytes(16).toString('hex');
+  const hash = scryptSync(targetPassword, salt, 64).toString('hex');
+
+  await prisma.appAuthUser.update({
+    where: { id: userId },
+    data: {
+      passwordSalt: salt,
+      passwordHash: hash,
+    },
+  });
+
+  // Also update legacy User model if record exists
+  await prisma.user.updateMany({
+    where: { id: userId },
+    data: {
+      passwordHash: hash,
+      updatedAt: new Date(),
+    },
+  }).catch(() => undefined);
+
+  logger.info('User password updated successfully', { userId, email: authUser.email });
+
+  res.status(200).json({
+    success: true,
+    message: 'Password updated successfully',
+    data: { updated: true },
+    error: null,
+  });
+});
+
+// ==========================================
 // Developer Token Endpoints
 // ==========================================
 
