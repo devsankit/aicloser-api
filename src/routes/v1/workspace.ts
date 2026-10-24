@@ -171,81 +171,151 @@ workspaceRouter.get('/settings', async (req: Request, res: Response) => {
   });
 
   const settings = (workspace?.settings as Record<string, any>) || {};
+  const rolePermissions = (settings.rolePermissions as Record<string, any>) || {};
+
+  // Harmonized defaults
+  const normalizedSettings: Record<string, any> = {
+    chatSharingScope: 'WORKSPACE_WIDE',
+    leadAssignmentScope: 'WORKSPACE_WIDE',
+    closerChatSharingEnabled: true,
+    closerLeadReassignmentEnabled: false,
+    managerLeadDeletionEnabled: false,
+    allowManagerLeadDeletion: false,
+    phoneMaskingPolicy: 'LAST_4',
+    companionScannerRouting: 'DEDICATED',
+    leadExportProtection: true,
+    ...settings,
+  };
+
+  // Harmonize with rolePermissions if explicitly configured
+  if (rolePermissions.SALES_AGENT) {
+    if (typeof rolePermissions.SALES_AGENT['chat:share'] === 'boolean') {
+      normalizedSettings.closerChatSharingEnabled = rolePermissions.SALES_AGENT['chat:share'];
+    }
+    if (typeof rolePermissions.SALES_AGENT['leads:reassign'] === 'boolean') {
+      normalizedSettings.closerLeadReassignmentEnabled = rolePermissions.SALES_AGENT['leads:reassign'];
+    }
+  }
+  if (rolePermissions.MANAGER) {
+    if (typeof rolePermissions.MANAGER['leads:delete'] === 'boolean') {
+      normalizedSettings.managerLeadDeletionEnabled = rolePermissions.MANAGER['leads:delete'];
+      normalizedSettings.allowManagerLeadDeletion = rolePermissions.MANAGER['leads:delete'];
+    }
+  }
 
   res.json({
     success: true,
-    data: settings,
-    settings,
-    allowManagerLeadDeletion: Boolean(settings.allowManagerLeadDeletion),
+    data: normalizedSettings,
+    settings: normalizedSettings,
+    allowManagerLeadDeletion: Boolean(normalizedSettings.allowManagerLeadDeletion),
     error: null,
   });
 });
+
+// Helper: Unified Workspace Settings Updater with Bidirectional Role Permissions Sync
+const handleUpdateSettings = async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const body = req.body || {};
+
+  const workspace = await prisma.aicloserWorkspace.findUnique({
+    where: { id: tenantId },
+    select: { settings: true },
+  });
+
+  const currentSettings = (workspace?.settings as Record<string, any>) || {};
+  const updatedSettings: Record<string, any> = {
+    ...currentSettings,
+    ...body,
+  };
+
+  // Symmetrically sync bidirectional governance flags into rolePermissions
+  const rolePermissions = { ...((currentSettings.rolePermissions as Record<string, any>) || {}) };
+  rolePermissions.ADMIN = { ...(rolePermissions.ADMIN || {}) };
+  rolePermissions.MANAGER = { ...(rolePermissions.MANAGER || {}) };
+  rolePermissions.SALES_AGENT = { ...(rolePermissions.SALES_AGENT || {}) };
+
+  if (body.closerChatSharingEnabled !== undefined) {
+    const val = Boolean(body.closerChatSharingEnabled);
+    updatedSettings.closerChatSharingEnabled = val;
+    rolePermissions.SALES_AGENT['chat:share'] = val;
+  }
+  if (body.closerLeadReassignmentEnabled !== undefined) {
+    const val = Boolean(body.closerLeadReassignmentEnabled);
+    updatedSettings.closerLeadReassignmentEnabled = val;
+    rolePermissions.SALES_AGENT['leads:reassign'] = val;
+  }
+  if (body.managerLeadDeletionEnabled !== undefined || body.allowManagerLeadDeletion !== undefined) {
+    const val = Boolean(body.managerLeadDeletionEnabled ?? body.allowManagerLeadDeletion);
+    updatedSettings.managerLeadDeletionEnabled = val;
+    updatedSettings.allowManagerLeadDeletion = val;
+    rolePermissions.MANAGER['leads:delete'] = val;
+  }
+
+  updatedSettings.rolePermissions = rolePermissions;
+
+  const updated = await prisma.$transaction(async (tx) => {
+    const ws = await tx.aicloserWorkspace.update({
+      where: { id: tenantId },
+      data: {
+        settings: updatedSettings,
+        updatedAt: new Date(),
+      },
+    });
+
+    // Symmetrically propagate to active Sales Agent profiles in this workspace
+    if (body.closerChatSharingEnabled !== undefined || body.closerLeadReassignmentEnabled !== undefined) {
+      const agentProfiles = await tx.salesAgentProfile.findMany({
+        where: { tenantId, user: { role: 'SALES_AGENT' } },
+        select: { id: true, permissions: true },
+      });
+      for (const ap of agentProfiles) {
+        const curPerms = (ap.permissions as Record<string, boolean>) || {};
+        const newPerms = { ...curPerms };
+        if (body.closerChatSharingEnabled !== undefined) newPerms['chat:share'] = Boolean(body.closerChatSharingEnabled);
+        if (body.closerLeadReassignmentEnabled !== undefined) newPerms['leads:reassign'] = Boolean(body.closerLeadReassignmentEnabled);
+        await tx.salesAgentProfile.update({
+          where: { id: ap.id },
+          data: { permissions: newPerms },
+        });
+      }
+    }
+
+    // Symmetrically propagate to active Manager profiles in this workspace
+    if (body.managerLeadDeletionEnabled !== undefined || body.allowManagerLeadDeletion !== undefined) {
+      const managerProfiles = await tx.salesAgentProfile.findMany({
+        where: { tenantId, user: { role: 'MANAGER' } },
+        select: { id: true, permissions: true },
+      });
+      for (const mp of managerProfiles) {
+        const curPerms = (mp.permissions as Record<string, boolean>) || {};
+        await tx.salesAgentProfile.update({
+          where: { id: mp.id },
+          data: { permissions: { ...curPerms, 'leads:delete': Boolean(updatedSettings.allowManagerLeadDeletion) } },
+        });
+      }
+    }
+
+    return ws;
+  });
+
+  const finalSettings = updated.settings as Record<string, any>;
+
+  res.json({
+    success: true,
+    message: 'Workspace settings updated successfully',
+    data: finalSettings,
+    settings: finalSettings,
+    allowManagerLeadDeletion: Boolean(finalSettings?.allowManagerLeadDeletion),
+    error: null,
+  });
+};
 
 // PATCH /api/v1/workspace/settings - Update workspace settings (Admin / Super Admin)
-workspaceRouter.patch('/settings', requireRoles('ADMIN', 'SUPER_ADMIN'), async (req: Request, res: Response) => {
-  const tenantId = req.tenantId!;
-  const body = req.body || {};
-
-  const workspace = await prisma.aicloserWorkspace.findUnique({
-    where: { id: tenantId },
-    select: { settings: true },
-  });
-
-  const currentSettings = (workspace?.settings as Record<string, any>) || {};
-  const updatedSettings = {
-    ...currentSettings,
-    ...body,
-  };
-
-  const updated = await prisma.aicloserWorkspace.update({
-    where: { id: tenantId },
-    data: {
-      settings: updatedSettings,
-      updatedAt: new Date(),
-    },
-  });
-
-  res.json({
-    success: true,
-    message: 'Workspace settings updated successfully',
-    data: updated.settings,
-    settings: updated.settings,
-    allowManagerLeadDeletion: Boolean((updated.settings as Record<string, any>)?.allowManagerLeadDeletion),
-    error: null,
-  });
-});
+workspaceRouter.patch('/settings', requireRoles('ADMIN', 'SUPER_ADMIN'), handleUpdateSettings);
 
 // PUT /api/v1/workspace/settings - Alias for PATCH
-workspaceRouter.put('/settings', requireRoles('ADMIN', 'SUPER_ADMIN'), async (req: Request, res: Response) => {
-  const tenantId = req.tenantId!;
-  const body = req.body || {};
+workspaceRouter.put('/settings', requireRoles('ADMIN', 'SUPER_ADMIN'), handleUpdateSettings);
 
-  const workspace = await prisma.aicloserWorkspace.findUnique({
-    where: { id: tenantId },
-    select: { settings: true },
-  });
-
-  const currentSettings = (workspace?.settings as Record<string, any>) || {};
-  const updatedSettings = {
-    ...currentSettings,
-    ...body,
-  };
-
-  const updated = await prisma.aicloserWorkspace.update({
-    where: { id: tenantId },
-    data: {
-      settings: updatedSettings,
-      updatedAt: new Date(),
-    },
-  });
-
-  res.json({
-    success: true,
-    message: 'Workspace settings updated successfully',
-    data: updated.settings,
-    settings: updated.settings,
-    allowManagerLeadDeletion: Boolean((updated.settings as Record<string, any>)?.allowManagerLeadDeletion),
-    error: null,
-  });
-});
+// POST /api/v1/workspace/settings - Fallback Alias for PATCH to prevent 404
+workspaceRouter.post('/settings', requireRoles('ADMIN', 'SUPER_ADMIN'), handleUpdateSettings);
 

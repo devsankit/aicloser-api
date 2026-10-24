@@ -2751,6 +2751,28 @@ const handleAssignConversation = async (req: Request, res: Response) => {
     return;
   }
 
+  // Check workspace governance policy for Sales Closers reassignment
+  const isCallingCloser = user.role === 'SALES_AGENT' || (user.role as string) === 'CLOSER';
+  if (isCallingCloser) {
+    const ws = await prisma.aicloserWorkspace.findUnique({
+      where: { id: tenantId },
+      select: { settings: true },
+    });
+    const wsSettings = (ws?.settings as Record<string, any>) || {};
+    const isReassignBlocked =
+      wsSettings.closerLeadReassignmentEnabled === false ||
+      wsSettings.rolePermissions?.SALES_AGENT?.['leads:reassign'] === false;
+    if (isReassignBlocked) {
+      res.status(403).json({
+        success: false,
+        code: 'REASSIGNMENT_RESTRICTED',
+        error: 'Forbidden',
+        message: 'Lead and chat reassignment by sales closers is restricted under workspace governance policy.',
+      });
+      return;
+    }
+  }
+
   // 3. Resolve target agent profile
   let agentProfile = await prisma.salesAgentProfile.findFirst({
     where: {
@@ -3170,6 +3192,20 @@ conversationsRouter.post('/:id/share', validateBody(directShareBodySchema), asyn
   const userRole = req.user?.role;
   const isSalesAgent = userRole === 'SALES_AGENT' || (userRole as string) === 'CLOSER';
 
+  if (isSalesAgent) {
+    const isSharingBlocked =
+      wsSettings.closerChatSharingEnabled === false ||
+      wsSettings.rolePermissions?.SALES_AGENT?.['chat:share'] === false;
+    if (isSharingBlocked) {
+      res.status(403).json({
+        success: false,
+        error: 'Forbidden',
+        message: 'Chat sharing is disabled for sales closers under workspace governance policy.',
+      });
+      return;
+    }
+  }
+
   if (wsSettings.chatSharingScope === 'REPORTING_TEAM_ONLY' && isSalesAgent) {
     const isSameTeam = await checkSameReportingTeam(tenantId, req.user!.userId, targetUserId);
     if (!isSameTeam) {
@@ -3377,6 +3413,20 @@ conversationsRouter.post('/:id/shares', validateBody(createShareSchema), async (
   const wsSettings = (workspace?.settings as Record<string, any>) || {};
   const userRole = req.user?.role;
   const isSalesAgent = userRole === 'SALES_AGENT' || (userRole as string) === 'CLOSER';
+
+  if (isSalesAgent) {
+    const isSharingBlocked =
+      wsSettings.closerChatSharingEnabled === false ||
+      wsSettings.rolePermissions?.SALES_AGENT?.['chat:share'] === false;
+    if (isSharingBlocked) {
+      res.status(403).json({
+        success: false,
+        error: 'Forbidden',
+        message: 'Chat sharing is disabled for sales closers under workspace governance policy.',
+      });
+      return;
+    }
+  }
 
   if (wsSettings.chatSharingScope === 'REPORTING_TEAM_ONLY' && isSalesAgent) {
     const isSameTeam = await checkSameReportingTeam(tenantId, req.user!.userId, targetUserId);

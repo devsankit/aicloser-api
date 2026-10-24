@@ -1541,12 +1541,29 @@ teamRouter.get('/permissions/matrix', requireRoles('ADMIN', 'MANAGER', 'SUPER_AD
   };
 
   const workspace = await prisma.aicloserWorkspace.findUnique({ where: { id: req.tenantId! }, select: { settings: true } });
-  const saved = (workspace?.settings as { rolePermissions?: Record<string, Record<string, boolean>> } | null)?.rolePermissions || {};
+  const settings = (workspace?.settings as Record<string, any>) || {};
+  const saved = (settings.rolePermissions as Record<string, Record<string, boolean>>) || {};
+
+  // Symmetrically harmonize roleDefaults with any top-level workspace settings
+  const harmonizedSaved = { ...saved };
+  harmonizedSaved.SALES_AGENT = { ...(harmonizedSaved.SALES_AGENT || {}) };
+  harmonizedSaved.MANAGER = { ...(harmonizedSaved.MANAGER || {}) };
+
+  if (typeof settings.closerChatSharingEnabled === 'boolean' && harmonizedSaved.SALES_AGENT['chat:share'] === undefined) {
+    harmonizedSaved.SALES_AGENT['chat:share'] = settings.closerChatSharingEnabled;
+  }
+  if (typeof settings.closerLeadReassignmentEnabled === 'boolean' && harmonizedSaved.SALES_AGENT['leads:reassign'] === undefined) {
+    harmonizedSaved.SALES_AGENT['leads:reassign'] = settings.closerLeadReassignmentEnabled;
+  }
+  if ((typeof settings.managerLeadDeletionEnabled === 'boolean' || typeof settings.allowManagerLeadDeletion === 'boolean') && harmonizedSaved.MANAGER['leads:delete'] === undefined) {
+    harmonizedSaved.MANAGER['leads:delete'] = Boolean(settings.managerLeadDeletionEnabled ?? settings.allowManagerLeadDeletion);
+  }
+
   res.json({
     success: true,
     data: {
       catalog: permissionsCatalog,
-      roleDefaults: Object.fromEntries(Object.entries(roleDefaults).map(([role, defaults]) => [role, { ...defaults, ...(saved[role] || {}) }])),
+      roleDefaults: Object.fromEntries(Object.entries(roleDefaults).map(([role, defaults]) => [role, { ...defaults, ...(harmonizedSaved[role] || {}) }])),
     },
     error: null,
   });
@@ -1571,9 +1588,41 @@ teamRouter.put('/permissions/matrix', requireRoles('ADMIN', 'SUPER_ADMIN'), vali
     const workspace = await tx.aicloserWorkspace.findUniqueOrThrow({ where: { id: tenantId }, select: { settings: true } });
     const settings = (workspace.settings as Record<string, unknown>) || {};
     const previous = (settings.rolePermissions as Record<string, Record<string, boolean>>) || {};
-    await tx.aicloserWorkspace.update({ where: { id: tenantId }, data: { settings: { ...settings, rolePermissions: { ...previous, ...roles } } } });
+    const updatedRolePermissions = { ...previous, ...roles };
+
+    const updatedSettings: Record<string, any> = {
+      ...settings,
+      rolePermissions: updatedRolePermissions,
+    };
+
+    // Symmetrically sync matrix toggles into Workspace Governance settings
+    if (roles.SALES_AGENT) {
+      if (typeof roles.SALES_AGENT['chat:share'] === 'boolean') {
+        updatedSettings.closerChatSharingEnabled = roles.SALES_AGENT['chat:share'];
+      }
+      if (typeof roles.SALES_AGENT['leads:reassign'] === 'boolean') {
+        updatedSettings.closerLeadReassignmentEnabled = roles.SALES_AGENT['leads:reassign'];
+      }
+    }
+    if (roles.MANAGER) {
+      if (typeof roles.MANAGER['leads:delete'] === 'boolean') {
+        updatedSettings.managerLeadDeletionEnabled = roles.MANAGER['leads:delete'];
+        updatedSettings.allowManagerLeadDeletion = roles.MANAGER['leads:delete'];
+      }
+    }
+
+    await tx.aicloserWorkspace.update({
+      where: { id: tenantId },
+      data: { settings: updatedSettings, updatedAt: new Date() },
+    });
+
     for (const role of ['ADMIN', 'MANAGER', 'SALES_AGENT'] as const) {
-      if (roles[role]) await tx.salesAgentProfile.updateMany({ where: { tenantId, user: { role } }, data: { permissions: roles[role] } });
+      if (roles[role]) {
+        await tx.salesAgentProfile.updateMany({
+          where: { tenantId, user: { role } },
+          data: { permissions: roles[role] },
+        });
+      }
     }
   });
   res.json({ success: true, data: { saved: true, roles }, error: null });
