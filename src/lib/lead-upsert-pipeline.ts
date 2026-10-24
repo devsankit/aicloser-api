@@ -14,6 +14,7 @@ export interface UpsertLeadParams {
   budgetAmount?: number | null;
   notes?: string | null;
   stage?: SalesLeadStage;
+  priority?: string | null;
   customFields?: Record<string, any>;
   conversationId?: string | null;
   assignedAgentId?: string | null;
@@ -36,6 +37,15 @@ export interface UpsertLeadResult {
  */
 export const normalizePhoneNumber = normalizeLeadPhone;
 
+export function isPlaceholderEmail(email?: string | null): boolean {
+  if (!email) return true;
+  const clean = email.toLowerCase().trim();
+  if (['a@gmail.com', 'b@gmail.com', 'c@gmail.com', 'test@gmail.com', 'test@test.com', 'admin@gmail.com', 'no@gmail.com', 'na@na.com', 'none@none.com', 'dummy@gmail.com', 'abc@gmail.com', 'xyz@gmail.com', 'sample@gmail.com'].includes(clean)) return true;
+  if (/^(test|dummy|noemail|na|none|sample|placeholder|fake|null)@/i.test(clean)) return true;
+  if (/^[a-z]@(gmail|yahoo|outlook|hotmail)\.com$/i.test(clean)) return true;
+  return false;
+}
+
 /**
  * Universal Tenant-Isolated Lead Upsert & Ingestion Pipeline.
  * Guarantees zero unhandled duplicate key crashes and unifies deduplication across
@@ -52,6 +62,7 @@ export async function upsertCompanyLead(params: UpsertLeadParams): Promise<Upser
     budgetAmount,
     notes,
     stage,
+    priority,
     customFields,
     conversationId,
     createdById,
@@ -65,23 +76,22 @@ export async function upsertCompanyLead(params: UpsertLeadParams): Promise<Upser
   const last10 = normalizedPhone ? normalizedPhone.replace(/\D/g, '').slice(-10) : null;
   const upperSource = (source || 'DIRECT').toUpperCase().trim();
 
-  // 1. Strict Tenant-Scoped Duplicate Detection
+  // 1. Strict Tenant-Scoped Duplicate Detection (Phone-First!)
   let existingLead = null;
 
-  if (normalizedPhone) {
+  if (normalizedPhone && last10 && last10.length >= 7) {
     existingLead = await prisma.salesLeadAssignment.findFirst({
       where: {
         tenantId,
         OR: [
           { customerPhone: normalizedPhone },
-          ...(last10 ? [{ customerPhone: { contains: last10 } }] : []),
+          { customerPhone: { contains: last10 } },
         ],
       },
       orderBy: { createdAt: 'asc' },
     });
-  }
-
-  if (!existingLead && normalizedEmail) {
+  } else if (normalizedEmail && !isPlaceholderEmail(normalizedEmail)) {
+    // Fall back to email matching ONLY when no valid phone number was supplied
     existingLead = await prisma.salesLeadAssignment.findFirst({
       where: {
         tenantId,
@@ -121,6 +131,7 @@ export async function upsertCompanyLead(params: UpsertLeadParams): Promise<Upser
         budgetAmount: budgetAmount !== undefined && budgetAmount !== null ? budgetAmount : existingLead.budgetAmount,
         notes: updatedNotes,
         ...(stage ? { stage, ...(stage !== existingLead.stage ? { stageChangedAt: new Date() } : {}) } : {}),
+        ...(priority ? { priority } : {}),
         customFields: mergedCustomFields,
         conversationId: conversationId || existingLead.conversationId,
         lastContactedAt: new Date(),
@@ -205,6 +216,7 @@ export async function upsertCompanyLead(params: UpsertLeadParams): Promise<Upser
       customFields: customFields || {},
       conversationId: conversationId || null,
       stage: stage || 'NEW',
+      priority: priority || 'normal',
     },
   });
 

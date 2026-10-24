@@ -1147,6 +1147,28 @@ async function syncBaileysScrapedChatsToDatabase(
           }))
         : [];
 
+      // 360 Unified Lead Entity: Ensure SalesLeadAssignment exists for every scanned companion WhatsApp contact
+      let linkedLead: any = null;
+      try {
+        const upsertRes = await upsertCompanyLead({
+          tenantId,
+          customerName: chat.name && !chat.name.startsWith('+') ? chat.name : (chat.name || chat.phone),
+          customerPhone: chat.phone,
+          source: 'WHATSAPP_PERSONAL_QR',
+          actorUserId: authUser.userId,
+          stage: 'NEW',
+          customFields: {
+            whatsappPersonalId: authUser.userId,
+            whatsappPersonalPhone: chat.phone,
+            scannedByUserId: authUser.userId,
+            scannedByName: closerName,
+          },
+        });
+        linkedLead = upsertRes.lead;
+      } catch (upsertErr) {
+        logger.warn('Failed to upsert company lead for companion WhatsApp contact', { error: String(upsertErr) });
+      }
+
       if (existingConv) {
         const payload = (existingConv.payload as Record<string, unknown>) || {};
         const oldMessages = Array.isArray(payload.messages) ? (payload.messages as any[]) : [];
@@ -1164,6 +1186,11 @@ async function syncBaileysScrapedChatsToDatabase(
             customerName: chat.name && !chat.name.startsWith('+') ? chat.name : existingConv.customerName,
             payload: {
               ...payload,
+              leadId: linkedLead?.id || (payload as any)?.leadId,
+              companyId: tenantId,
+              whatsappPersonalId: authUser.userId,
+              scannedByUserId: authUser.userId,
+              scannedByName: closerName,
               messages: combined,
               lastMessagePreview: chat.lastMessagePreview || payload.lastMessagePreview,
               lastMessageAt: chat.lastMessageAt || payload.lastMessageAt,
@@ -1171,10 +1198,18 @@ async function syncBaileysScrapedChatsToDatabase(
             updatedAt: new Date(),
           },
         });
+
+        if (linkedLead && !linkedLead.conversationId) {
+          await prisma.salesLeadAssignment.update({
+            where: { id: linkedLead.id },
+            data: { conversationId: existingConv.id },
+          }).catch(() => undefined);
+        }
       } else {
+        const convId = `conv-wa-${crypto.randomUUID().slice(0, 8)}`;
         await prisma.appConversation.create({
           data: {
-            id: `conv-wa-${crypto.randomUUID().slice(0, 8)}`,
+            id: convId,
             tenantId,
             serviceId: 'svc-whatsapp-personal',
             serviceSlug: 'manual-chat',
@@ -1184,6 +1219,9 @@ async function syncBaileysScrapedChatsToDatabase(
             assignedFreelancerName: closerName,
             status: 'Active',
             payload: {
+              leadId: linkedLead?.id,
+              companyId: tenantId,
+              whatsappPersonalId: authUser.userId,
               messages: formattedMessages,
               sourceChannel: 'whatsapp',
               isPersonalQr: true,
@@ -1195,6 +1233,14 @@ async function syncBaileysScrapedChatsToDatabase(
             } as any,
           },
         });
+
+        if (linkedLead) {
+          await prisma.salesLeadAssignment.update({
+            where: { id: linkedLead.id },
+            data: { conversationId: convId },
+          }).catch(() => undefined);
+        }
+
         syncedCount++;
       }
     }

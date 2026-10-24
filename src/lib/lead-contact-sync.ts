@@ -3,9 +3,12 @@ import { persistApiRealtimeEvent } from './realtime.js';
 
 export function normalizeLeadPhone(raw?: string | null): string | null {
   if (!raw) return null;
-  const digits = String(raw).replace(/\D/g, '');
+  let digits = String(raw).replace(/\D/g, '');
   if (!digits) return null;
   if (String(raw).trim().startsWith('+')) return `+${digits}`;
+  if (digits.length === 11 && digits.startsWith('0')) {
+    digits = digits.slice(1);
+  }
   if (digits.length === 10) return `+91${digits}`;
   return `+${digits}`;
 }

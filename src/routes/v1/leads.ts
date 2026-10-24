@@ -1,4 +1,4 @@
-import { upsertCompanyLead, normalizePhoneNumber } from '../../lib/lead-upsert-pipeline.js';
+import { upsertCompanyLead, normalizePhoneNumber, isPlaceholderEmail } from '../../lib/lead-upsert-pipeline.js';
 import * as XLSX from 'xlsx';
 import { logger } from '../../lib/logger.js';
 import { maskPhoneNumber, isPhoneMaskingRequired } from '../../lib/phone-mask.js';
@@ -283,20 +283,29 @@ leadsRouter.post('/', validateBody(createLeadSchema), async (req: Request, res: 
   const cleanDigits = rawPhone.replace(/\D/g, "");
   const last10 = cleanDigits.length >= 10 ? cleanDigits.slice(-10) : cleanDigits;
 
+    let existing = null;
   if (last10 && last10.length >= 7) {
-    const existing = await prisma.salesLeadAssignment.findFirst({
+    existing = await prisma.salesLeadAssignment.findFirst({
       where: {
         tenantId,
         OR: [
           { customerPhone: body.customerPhone },
           { customerPhone: { contains: last10 } },
-          ...(body.customerEmail ? [{ customerEmail: body.customerEmail }] : []),
         ],
       },
       orderBy: [{ stage: 'desc' }, { createdAt: 'asc' }],
     });
+  } else if (body.customerEmail && !isPlaceholderEmail(body.customerEmail)) {
+    existing = await prisma.salesLeadAssignment.findFirst({
+      where: {
+        tenantId,
+        customerEmail: { equals: body.customerEmail.trim(), mode: 'insensitive' },
+      },
+      orderBy: [{ stage: 'desc' }, { createdAt: 'asc' }],
+    });
+  }
 
-    if (existing) {
+  if (existing) {
       // Enrich existing lead with any new notes / metadata without creating a duplicate row
       const updated = await prisma.salesLeadAssignment.update({
         where: { id: existing.id },
@@ -350,7 +359,6 @@ leadsRouter.post('/', validateBody(createLeadSchema), async (req: Request, res: 
       });
       return;
     }
-  }
 
   let lead;
   try {
@@ -4225,7 +4233,7 @@ const unifiedImportSchema = z.object({
 // POST /import - Unified Lead Import for CSV, Excel, WhatsApp, Google Sheets
 leadsRouter.post('/import', requirePermissions(PERM_LEADS_REASSIGN), validateBody(unifiedImportSchema), async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
-  const { source, rows, duplicateAction, distributionMode } = req.body;
+  const { source, targetStage, rows, duplicateAction, distributionMode } = req.body;
   const upperSource = source.toUpperCase().trim();
 
   let createdCount = 0;
@@ -4255,6 +4263,7 @@ leadsRouter.post('/import', requirePermissions(PERM_LEADS_REASSIGN), validateBod
       notes: row.notes,
       customFields: row.customFields,
       source: upperSource,
+      stage: row.stage || targetStage || 'NEW',
       duplicateAction: duplicateAction as any,
       distributionMode: distributionMode as any,
       actorUserId: req.user?.userId,

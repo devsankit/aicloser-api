@@ -2,6 +2,7 @@ import { maskPhoneNumber, isPhoneMaskingRequired } from '../../lib/phone-mask.js
 import { decryptWhatsAppToken } from '../../lib/crypto-vault.js';
 import { logger } from '../../lib/logger.js';
 import { Router, Request, Response } from 'express';
+import { upsertCompanyLead } from '../../lib/lead-upsert-pipeline.js';
 import multer from 'multer';
 import fs from 'fs';
 import path from 'path';
@@ -3779,17 +3780,24 @@ conversationsRouter.patch('/:id/ai-settings', validateBody(aiSettingsSchema), as
   });
 });
 
-// 8. PATCH /:id/stage - Update lead stage from chat workspace
+// 8. PATCH /:id/stage - Update lead stage from chat workspace (360 Synced)
 conversationsRouter.patch('/:id/stage', async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
   const id = String(req.params.id);
   const { stage } = req.body as { stage: string };
-  const requestedStage = String(stage || '').trim().toUpperCase();
 
-  if (!requestedStage) {
+  if (!stage) {
     res.status(400).json({ success: false, error: 'InvalidRequest', message: 'stage is required' });
     return;
   }
+
+  // Canonicalize stage name across UI identifiers and DB enums
+  let requestedStage = String(stage || '').trim().toUpperCase().replace(/[\s-]+/g, '_');
+  if (requestedStage === 'DEMO' || requestedStage === 'DEMO_BOOKED') requestedStage = 'QUALIFIED';
+  if (requestedStage === 'WON') requestedStage = 'CLOSED_WON';
+  if (requestedStage === 'LOST') requestedStage = 'CLOSED_LOST';
+  if (requestedStage === 'PROGRESS' || requestedStage === 'IN_PROGRESS') requestedStage = 'CONTACTED';
+  if (requestedStage === 'FOLLOWUP') requestedStage = 'FOLLOW_UP';
 
   const conversation = await prisma.appConversation.findFirst({
     where: { id, tenantId },
@@ -3828,7 +3836,7 @@ conversationsRouter.patch('/:id/stage', async (req: Request, res: Response) => {
   const phoneDigits = String(conversation.customerPhone || '').replace(/\D/g, '');
   const phoneSuffix = phoneDigits.length >= 10 ? phoneDigits.slice(-10) : '';
 
-  const linkedLeads = await prisma.salesLeadAssignment.findMany({
+  let linkedLeads = await prisma.salesLeadAssignment.findMany({
     where: {
       tenantId,
       OR: [
@@ -3839,6 +3847,26 @@ conversationsRouter.patch('/:id/stage', async (req: Request, res: Response) => {
     },
     select: { id: true, stage: true, customFields: true },
   });
+
+  // Guarantee 360 entity exists: if chat has no linked lead yet, auto-create it now
+  if (!linkedLeads.length && conversation.customerPhone) {
+    try {
+      const upsertRes = await upsertCompanyLead({
+        tenantId,
+        customerName: conversation.customerName || 'Inbound Lead',
+        customerPhone: conversation.customerPhone,
+        conversationId: id,
+        source: conversation.serviceSlug === 'manual-chat' ? 'WHATSAPP_PERSONAL_QR' : 'WHATSAPP',
+        stage: requestedStage as any,
+        actorUserId: req.user?.userId,
+      });
+      if (upsertRes.lead) {
+        linkedLeads.push(upsertRes.lead);
+      }
+    } catch (e) {
+      logger.warn('Failed to auto-upsert lead on chat stage change', { error: String(e) });
+    }
+  }
 
   if (!linkedLeads.length) {
     res.status(404).json({ success: false, error: 'NotFound', message: 'No linked lead record found for this conversation' });
@@ -3873,7 +3901,12 @@ conversationsRouter.patch('/:id/stage', async (req: Request, res: Response) => {
     where: { id },
     data: {
       leadStatusId: requestedStage,
-      payload: { ...currentPayload, leadStatusId: requestedStage, updatedAt: new Date().toISOString() },
+      payload: {
+        ...currentPayload,
+        leadId: linkedLeads[0]?.id || (currentPayload as any)?.leadId,
+        leadStatusId: requestedStage,
+        updatedAt: new Date().toISOString(),
+      },
       updatedAt: new Date(),
     },
   });
@@ -3889,10 +3922,16 @@ conversationsRouter.patch('/:id/stage', async (req: Request, res: Response) => {
     },
   }).catch(() => undefined)));
 
+  // Broadcast unified SSE with leadId so store.tsx updates Kanban board & Contacts immediately
   await persistApiRealtimeEvent({
     tenantId,
     eventType: 'lead.stage_changed',
-    payload: { conversationId: id, stage: requestedStage },
+    payload: {
+      id: linkedLeads[0]?.id,
+      leadId: linkedLeads[0]?.id,
+      stage: requestedStage,
+      conversationId: id,
+    },
     actorUserId: req.user?.userId,
   }).catch(() => undefined);
 
@@ -3902,7 +3941,144 @@ conversationsRouter.patch('/:id/stage', async (req: Request, res: Response) => {
   });
   await Promise.all(updatedStageLeads.map((l) => syncMarketingContactForLead(l))).catch(() => undefined);
 
-  res.json({ success: true, message: 'Lead stage updated successfully', affectedLeads: linkedLeads.length, error: null });
+  res.json({ success: true, message: 'Lead stage updated successfully', affectedLeads: linkedLeads.length, leadId: linkedLeads[0]?.id, stage: requestedStage, error: null });
+});
+
+// 8b. PATCH /:id/priority - Update lead priority from chat workspace
+conversationsRouter.patch('/:id/priority', async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const id = String(req.params.id);
+  const { priority } = req.body as { priority: string };
+  const requestedPriority = String(priority || 'medium').trim().toLowerCase();
+
+  const conversation = await prisma.appConversation.findFirst({ where: { id, tenantId } });
+  if (!conversation) return void res.status(404).json({ success: false, error: 'NotFound', message: 'Conversation not found' });
+  if (!(await verifyCloserAccess(req, conversation))) return void res.status(403).json({ success: false, error: 'Forbidden', message: 'Access denied' });
+
+  const phoneDigits = String(conversation.customerPhone || '').replace(/\D/g, '');
+  const phoneSuffix = phoneDigits.length >= 10 ? phoneDigits.slice(-10) : '';
+
+  let linkedLeads = await prisma.salesLeadAssignment.findMany({
+    where: {
+      tenantId,
+      OR: [
+        { conversationId: id },
+        ...phoneMatchConditions([conversation.customerPhone]),
+        ...(phoneSuffix ? [{ customerPhone: { endsWith: phoneSuffix } }] : []),
+      ],
+    },
+  });
+
+  if (!linkedLeads.length && conversation.customerPhone) {
+    const upsertRes = await upsertCompanyLead({
+      tenantId,
+      customerName: conversation.customerName || 'Inbound Lead',
+      customerPhone: conversation.customerPhone,
+      conversationId: id,
+      priority: requestedPriority,
+      source: conversation.serviceSlug === 'manual-chat' ? 'WHATSAPP_PERSONAL_QR' : 'WHATSAPP',
+      actorUserId: req.user?.userId,
+    });
+    if (upsertRes.lead) linkedLeads.push(upsertRes.lead);
+  }
+
+  if (linkedLeads.length) {
+    await prisma.salesLeadAssignment.updateMany({
+      where: { id: { in: linkedLeads.map((l) => l.id) } },
+      data: { priority: requestedPriority, conversationId: id, updatedAt: new Date() },
+    });
+  }
+
+  const payload = (conversation.payload as Record<string, any>) || {};
+  await prisma.appConversation.update({
+    where: { id },
+    data: { payload: { ...payload, priority: requestedPriority } },
+  });
+
+  await persistApiRealtimeEvent({
+    tenantId,
+    eventType: 'lead.updated',
+    payload: { id: linkedLeads[0]?.id, leadId: linkedLeads[0]?.id, priority: requestedPriority, conversationId: id },
+    actorUserId: req.user?.userId,
+  }).catch(() => undefined);
+
+  res.json({ success: true, message: 'Priority updated successfully', data: { priority: requestedPriority } });
+});
+
+// 8c. PATCH /:id/labels - Update lead labels/tags from chat workspace
+conversationsRouter.patch('/:id/labels', async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const id = String(req.params.id);
+  const { label, action = 'toggle', labels } = req.body as { label?: string; action?: 'add' | 'remove' | 'toggle'; labels?: string[] };
+
+  const conversation = await prisma.appConversation.findFirst({ where: { id, tenantId } });
+  if (!conversation) return void res.status(404).json({ success: false, error: 'NotFound', message: 'Conversation not found' });
+  if (!(await verifyCloserAccess(req, conversation))) return void res.status(403).json({ success: false, error: 'Forbidden', message: 'Access denied' });
+
+  const phoneDigits = String(conversation.customerPhone || '').replace(/\D/g, '');
+  const phoneSuffix = phoneDigits.length >= 10 ? phoneDigits.slice(-10) : '';
+
+  let linkedLeads = await prisma.salesLeadAssignment.findMany({
+    where: {
+      tenantId,
+      OR: [
+        { conversationId: id },
+        ...phoneMatchConditions([conversation.customerPhone]),
+        ...(phoneSuffix ? [{ customerPhone: { endsWith: phoneSuffix } }] : []),
+      ],
+    },
+  });
+
+  if (!linkedLeads.length && conversation.customerPhone) {
+    const upsertRes = await upsertCompanyLead({
+      tenantId,
+      customerName: conversation.customerName || 'Inbound Lead',
+      customerPhone: conversation.customerPhone,
+      conversationId: id,
+      source: conversation.serviceSlug === 'manual-chat' ? 'WHATSAPP_PERSONAL_QR' : 'WHATSAPP',
+      actorUserId: req.user?.userId,
+    });
+    if (upsertRes.lead) linkedLeads.push(upsertRes.lead);
+  }
+
+  const primaryLead = linkedLeads[0];
+  let updatedTags: string[] = [];
+
+  if (Array.isArray(labels)) {
+    updatedTags = Array.from(new Set(labels.map((l) => String(l).trim()).filter(Boolean)));
+  } else if (label && primaryLead) {
+    const cleanLabel = label.trim();
+    const currentTags = new Set(primaryLead.tags || []);
+    if (action === 'add') currentTags.add(cleanLabel);
+    else if (action === 'remove') currentTags.delete(cleanLabel);
+    else if (action === 'toggle') {
+      if (currentTags.has(cleanLabel)) currentTags.delete(cleanLabel);
+      else currentTags.add(cleanLabel);
+    }
+    updatedTags = Array.from(currentTags);
+  }
+
+  if (linkedLeads.length) {
+    await prisma.salesLeadAssignment.updateMany({
+      where: { id: { in: linkedLeads.map((l) => l.id) } },
+      data: { tags: updatedTags, conversationId: id, updatedAt: new Date() },
+    });
+  }
+
+  const payload = (conversation.payload as Record<string, any>) || {};
+  await prisma.appConversation.update({
+    where: { id },
+    data: { payload: { ...payload, tags: updatedTags, labels: updatedTags } },
+  });
+
+  await persistApiRealtimeEvent({
+    tenantId,
+    eventType: 'lead.updated',
+    payload: { id: primaryLead?.id, leadId: primaryLead?.id, tags: updatedTags, conversationId: id },
+    actorUserId: req.user?.userId,
+  }).catch(() => undefined);
+
+  res.json({ success: true, message: 'Labels updated successfully', data: { tags: updatedTags } });
 });
 
 // 9. POST /:id/notes - Add note to linked lead
