@@ -2105,18 +2105,34 @@ conversationsRouter.post('/:id/messages', validateBody(sendMessageSchema), async
       }).catch(() => null);
 
       if (useCompanion) {
-        // 1. Verify that a companion WhatsApp device is connected for this user
+        // 1. Verify that a companion WhatsApp device is connected for THIS user
         const devices = getTenantDevices(tenantId);
-        const isUserAdmin = ['ADMIN', 'SUPER_ADMIN'].includes(req.user?.role || '');
+        const myUserId = req.user?.userId;
+        const waServiceUrl = process.env.WA_SERVICE_URL || 'http://127.0.0.1:3015';
+
+        // Check live daemon status
+        let isDaemonOnline = false;
+        try {
+          const daemonRes = await fetch(`${waServiceUrl}/status`, { signal: AbortSignal.timeout(3000) });
+          const daemonJson = (await daemonRes.json().catch(() => null)) as any;
+          if (daemonJson?.ok && daemonJson.scanner?.status === 'CONNECTED' && daemonJson.scanner.connectedPhone) {
+            isDaemonOnline = true;
+          }
+        } catch {
+          isDaemonOnline = false;
+        }
+
         const connectedCompanion = devices.find(
-          (d) => d.status === 'connected' && (isUserAdmin || !d.scannedByUserId || d.scannedByUserId === req.user?.userId)
+          (d) => d.status === 'connected' && d.scannedByUserId === myUserId
         );
 
-        if (!connectedCompanion) {
+        if (!isDaemonOnline || !connectedCompanion) {
           logger.warn('Blocked companion WhatsApp outbound message: no connected device for user', {
-            userId: req.user?.userId,
+            userId: myUserId,
             tenantId,
             conversationId: conversation.id,
+            isDaemonOnline,
+            hasMatchingDevice: Boolean(connectedCompanion),
           });
           res.status(400).json({
             success: false,
@@ -2128,7 +2144,6 @@ conversationsRouter.post('/:id/messages', validateBody(sendMessageSchema), async
         }
 
         // 2. Dispatch via companion WhatsApp Baileys daemon
-        const waServiceUrl = process.env.WA_SERVICE_URL || 'http://127.0.0.1:3015';
         try {
           const waRes = await fetch(`${waServiceUrl}/send`, {
             method: 'POST',

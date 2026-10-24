@@ -1064,9 +1064,37 @@ integrationsRouter.get('/whatsapp/devices', async (req: Request, res: Response) 
   const tenantId = req.tenantId!;
   let devices = getTenantDevices(tenantId);
 
-  // If requester is a regular sales agent, show only their own scanned companion device
-  if (req.user?.role === 'SALES_AGENT') {
-    devices = devices.filter((d) => !d.scannedByUserId || d.scannedByUserId === req.user?.userId);
+  // Check live daemon status to ensure real connection state
+  const waServiceUrl = process.env.WA_SERVICE_URL || 'http://127.0.0.1:3015';
+  let isDaemonConnected = false;
+  let daemonPhone: string | null = null;
+  try {
+    const daemonRes = await fetch(`${waServiceUrl}/status`, { signal: AbortSignal.timeout(3000) });
+    const daemonJson = (await daemonRes.json().catch(() => null)) as any;
+    if (daemonJson?.ok && daemonJson.scanner?.status === 'CONNECTED' && daemonJson.scanner.connectedPhone) {
+      isDaemonConnected = true;
+      daemonPhone = daemonJson.scanner.connectedPhone;
+    }
+  } catch {}
+
+  // If daemon is not connected, ensure all device objects reflect disconnected status
+  if (!isDaemonConnected) {
+    devices.forEach((d) => {
+      d.status = 'disconnected';
+    });
+  } else if (daemonPhone) {
+    devices.forEach((d) => {
+      if (d.phoneNumber === daemonPhone) {
+        d.status = 'connected';
+      }
+    });
+  }
+
+  // Filter: if requester is a closer or agent, only show device they scanned
+  const myUserId = req.user?.userId;
+  const isAgent = ['SALES_AGENT', 'CLOSER'].includes(req.user?.role || '');
+  if (isAgent) {
+    devices = devices.filter((d) => d.scannedByUserId === myUserId);
   }
 
   const totalPendingLeads = devices.reduce((sum, d) => sum + (d.status === 'connected' ? d.pendingLeads : 0), 0);
