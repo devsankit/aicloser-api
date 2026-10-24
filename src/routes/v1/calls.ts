@@ -173,7 +173,17 @@ callsRouter.get('/', validateQuery(listCallsQuerySchema), async (req: Request, r
       where.agentId = profile?.id ?? '__NO_ACCESS__';
     }
   } else if (agentId) {
-    where.agentId = agentId;
+    const matchedProfile = await prisma.salesAgentProfile.findFirst({
+      where: {
+        tenantId,
+        OR: [
+          { id: agentId },
+          { userId: agentId },
+        ],
+      },
+      select: { id: true },
+    });
+    where.agentId = matchedProfile?.id || agentId;
   }
   if (recordingStatus) where.recordingStatus = recordingStatus as Prisma.EnumSalesMobileRecordingStatusFilter;
   if (search) {
@@ -193,8 +203,9 @@ callsRouter.get('/', validateQuery(listCallsQuerySchema), async (req: Request, r
       agent: {
         select: {
           id: true,
+          userId: true,
           agentCode: true,
-          user: { select: { displayName: true } },
+          user: { select: { id: true, displayName: true } },
         },
       },
       assignment: {
