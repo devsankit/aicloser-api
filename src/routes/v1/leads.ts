@@ -785,10 +785,13 @@ leadsRouter.get('/dashboard-summary', async (req: Request, res: Response) => {
     CONTACTED: 0,
     IN_PROGRESS: 0,
     DEMO: 0,
+    DEMO_SCHEDULED: 0,
     FOLLOW_UP: 0,
     NEGOTIATION: 0,
     CLOSED_WON: 0,
+    WON: 0,
     CLOSED_LOST: 0,
+    LOST: 0,
   };
 
   for (const item of stageAggregates) {
@@ -806,21 +809,24 @@ leadsRouter.get('/dashboard-summary', async (req: Request, res: Response) => {
     } else if (s === 'IN_PROGRESS') {
       stageCounts.IN_PROGRESS += count;
       openDealsValue += val;
-    } else if (s === 'DEMO') {
+    } else if (s.includes('DEMO') || s.includes('WEBINAR')) {
       stageCounts.DEMO += count;
+      stageCounts.DEMO_SCHEDULED += count;
       openDealsValue += val;
-    } else if (s === 'FOLLOW_UP') {
+    } else if (s.includes('FOLLOW')) {
       stageCounts.FOLLOW_UP += count;
       openDealsValue += val;
-    } else if (s === 'NEGOTIATION') {
+    } else if (s.includes('NEGOTI') || s.includes('QUOTE')) {
       stageCounts.NEGOTIATION += count;
       openDealsValue += val;
-    } else if (s === 'CLOSED_WON' || s === 'PAID' || s === 'WON') {
+    } else if (s.includes('WON') || s === 'PAID') {
       stageCounts.CLOSED_WON += count;
+      stageCounts.WON += count;
       wonCount += count;
       closedWonBudget += val;
-    } else if (s === 'CLOSED_LOST' || s === 'LOST' || s === 'RECYCLED') {
+    } else if (s.includes('LOST') || s.includes('RECYCLE') || s.includes('NOT_REACH')) {
       stageCounts.CLOSED_LOST += count;
+      stageCounts.LOST += count;
       lostCount += count;
     } else {
       stageCounts.NEW += count;
