@@ -1136,15 +1136,21 @@ async function syncBaileysScrapedChatsToDatabase(
       });
 
       const formattedMessages = Array.isArray(chat.messages)
-        ? chat.messages.map((m: any) => ({
-            id: m.id || `msg-${crypto.randomUUID().slice(0, 8)}`,
-            role: m.role || 'customer',
-            body: m.body || '',
-            createdAt: m.timestamp || new Date().toISOString(),
-            senderRole: m.role || 'customer',
-            senderLabel: m.role === 'sales' ? closerName : (chat.name || chat.phone),
-            status: 'read',
-          }))
+        ? chat.messages.map((m: any) => {
+            const isFromMe = Boolean(m.fromMe ?? m.key?.fromMe ?? (m.role === 'sales' || m.role === 'closer' || m.senderRole === 'sales'));
+            return {
+              id: m.id || m.key?.id || ('msg-' + crypto.randomUUID().slice(0, 8)),
+              role: isFromMe ? 'sales' : 'customer',
+              fromMe: isFromMe,
+              direction: isFromMe ? 'OUTBOUND' : 'INBOUND',
+              body: m.body || m.text || m.message?.conversation || '',
+              createdAt: m.timestamp ? (typeof m.timestamp === 'number' ? new Date(m.timestamp * 1000).toISOString() : new Date(m.timestamp).toISOString()) : new Date().toISOString(),
+              senderRole: isFromMe ? 'sales' : 'customer',
+              senderLabel: isFromMe ? closerName : (chat.name || chat.phone),
+              status: isFromMe ? 'read' : 'delivered',
+              attachments: m.attachments || m.mediaUrl ? [{ url: m.mediaUrl, type: m.mediaType || 'document', name: m.fileName || 'document' }] : [],
+            };
+          })
         : [];
 
       // 360 Unified Lead Entity: Ensure SalesLeadAssignment exists for every scanned companion WhatsApp contact

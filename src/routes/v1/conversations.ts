@@ -1442,12 +1442,14 @@ export async function softDeleteConversationRecord(
     const leadCustom = (lead.customFields && typeof lead.customFields === 'object' && !Array.isArray(lead.customFields))
       ? (lead.customFields as Record<string, any>)
       : {};
+    const previousStage = lead.stage !== 'RECYCLED' ? lead.stage : (leadCustom.previousStage || 'NEW');
     await prisma.salesLeadAssignment.update({
       where: { id: lead.id },
       data: {
         stage: 'RECYCLED',
         customFields: {
           ...leadCustom,
+          previousStage,
           recycled: true,
           deletedAt,
           deletedByUserId: user.userId,
@@ -1825,20 +1827,29 @@ conversationsRouter.post('/:id/restore', async (req: Request, res: Response) => 
     const leadCustom = (lead.customFields && typeof lead.customFields === 'object' && !Array.isArray(lead.customFields))
       ? { ...(lead.customFields as Record<string, any>) }
       : {};
+    const targetStage = (leadCustom.previousStage && leadCustom.previousStage !== 'RECYCLED') ? leadCustom.previousStage : 'NEW';
     delete leadCustom.recycled;
     delete leadCustom.deletedAt;
     delete leadCustom.deletedByUserId;
     delete leadCustom.deletedByName;
+    delete leadCustom.previousStage;
 
     await prisma.salesLeadAssignment.update({
       where: { id: lead.id },
       data: {
-        stage: 'NEW',
+        stage: targetStage as any,
         customFields: leadCustom,
         stageChangedAt: new Date(),
         updatedAt: new Date(),
       },
     });
+
+    await persistApiRealtimeEvent({
+      tenantId,
+      eventType: 'lead.stage_changed',
+      payload: { id: lead.id, leadId: lead.id, stage: targetStage },
+      actorUserId: user.userId,
+    }).catch(() => undefined);
   }
 
   return void res.json({

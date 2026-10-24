@@ -3,7 +3,7 @@ import * as XLSX from 'xlsx';
 import { logger } from '../../lib/logger.js';
 import { maskPhoneNumber, isPhoneMaskingRequired } from '../../lib/phone-mask.js';
 import { assignLeadToNextCloser } from '../../lib/lead-assignment-engine.js';
-import { Router, Request, Response } from 'express';
+import { Router, Request, Response, NextFunction } from 'express';
 import { z } from 'zod';
 import { prisma } from '../../lib/prisma.js';
 import { Prisma } from '@prisma/client';
@@ -11,7 +11,7 @@ import { authenticate } from '../../middlewares/auth.js';
 import { enforceTenantIsolation } from '../../middlewares/tenant-isolation.js';
 import { validateBody, validateQuery } from '../../middlewares/validate.js';
 import { SalesLeadStage, salesLeadStageSchema, SALES_LEAD_STAGES } from '../../types/leads.js';
-import { hasPermission, requirePermissions, PERM_LEADS_CLAIM, PERM_LEADS_REASSIGN } from '../../middlewares/rbac.js';
+import { hasPermission, requirePermissions, requireRoles, PERM_LEADS_CLAIM, PERM_LEADS_REASSIGN } from '../../middlewares/rbac.js';
 import { persistApiRealtimeEvent } from '../../lib/realtime.js';
 import { syncMarketingContactForLead, normalizeLeadPhone, deleteContactsAndLinkedLeadsTransactional, syncLeadConversationAssignment } from '../../lib/lead-contact-sync.js';
 import { getWorkspaceScope, checkSameReportingTeam } from '../../lib/workspace-scope.js';
@@ -115,22 +115,41 @@ leadsRouter.get('/', validateQuery(listLeadsQuerySchema), async (req: Request, r
     }),
   ]);
 
-  // Fetch active UpiPaymentLink records for returned leads to sync payment amounts and status
+  // Fetch active UpiPaymentLink, AppPaymentRequest, timeline notes, and strict open pool count for returned leads
   const leadIds = leads.map((l) => l.id);
   const phoneList = Array.from(new Set(leads.map((l) => l.customerPhone).filter(Boolean))) as string[];
 
-  const paymentLinks = (leadIds.length > 0 || phoneList.length > 0)
-    ? await prisma.upiPaymentLink.findMany({
-        where: {
-          tenantId,
-          OR: [
-            ...(phoneList.length > 0 ? [{ customerPhone: { in: phoneList } }] : []),
-            ...(leadIds.map((lid) => ({ customFields: { path: ['leadId'], equals: lid } }))),
-          ],
-        },
-        orderBy: { createdAt: 'desc' },
-      })
-    : [];
+  const [paymentLinks, appPayments, latestTimelineNotes, totalPoolCount] = await Promise.all([
+    (leadIds.length > 0 || phoneList.length > 0)
+      ? prisma.upiPaymentLink.findMany({
+          where: {
+            tenantId,
+            OR: [
+              ...(phoneList.length > 0 ? [{ customerPhone: { in: phoneList } }] : []),
+              ...(leadIds.map((lid) => ({ customFields: { path: ['leadId'], equals: lid } }))),
+            ],
+          },
+          orderBy: { createdAt: 'desc' },
+        })
+      : Promise.resolve([]),
+    prisma.appPaymentRequest.findMany({
+      where: { tenantId },
+      orderBy: { requestedAt: 'desc' },
+    }).catch(() => []),
+    leadIds.length > 0
+      ? prisma.salesLeadTimelineEntry.findMany({
+          where: {
+            leadId: { in: leadIds },
+            tenantId,
+            type: 'NOTE',
+          },
+          orderBy: { createdAt: 'desc' },
+        })
+      : Promise.resolve([]),
+    prisma.salesLeadPoolItem.count({
+      where: { tenantId, status: 'OPEN' },
+    }),
+  ]);
 
   const paymentByLeadId = new Map<string, (typeof paymentLinks)[0]>();
   const paymentByPhone = new Map<string, (typeof paymentLinks)[0]>();
@@ -140,8 +159,33 @@ leadsRouter.get('/', validateQuery(listLeadsQuerySchema), async (req: Request, r
     if (linkedLeadId && !paymentByLeadId.has(linkedLeadId)) {
       paymentByLeadId.set(linkedLeadId, pl);
     }
-    if (pl.customerPhone && !paymentByPhone.has(pl.customerPhone)) {
-      paymentByPhone.set(pl.customerPhone, pl);
+    if (pl.customerPhone) {
+      if (!paymentByPhone.has(pl.customerPhone)) paymentByPhone.set(pl.customerPhone, pl);
+      const digits = pl.customerPhone.replace(/\D/g, '').slice(-10);
+      if (digits && !paymentByPhone.has(digits)) paymentByPhone.set(digits, pl);
+    }
+  }
+
+  const appPaymentByLeadId = new Map<string, (typeof appPayments)[0]>();
+  const appPaymentByPhone = new Map<string, (typeof appPayments)[0]>();
+
+  for (const ap of appPayments) {
+    if (ap.assignmentId && !appPaymentByLeadId.has(ap.assignmentId)) {
+      appPaymentByLeadId.set(ap.assignmentId, ap);
+    }
+    const meta = (ap.metadata as Record<string, any>) || {};
+    const ph = meta.customerPhone || meta.phone || (ap as any).phone || (ap as any).customerPhone;
+    if (ph) {
+      if (!appPaymentByPhone.has(ph)) appPaymentByPhone.set(ph, ap);
+      const digits = String(ph).replace(/\D/g, '').slice(-10);
+      if (digits && !appPaymentByPhone.has(digits)) appPaymentByPhone.set(digits, ap);
+    }
+  }
+
+  const latestNoteByLeadId = new Map<string, string>();
+  for (const n of latestTimelineNotes) {
+    if (!latestNoteByLeadId.has(n.leadId) && n.body) {
+      latestNoteByLeadId.set(n.leadId, n.body);
     }
   }
 
@@ -153,16 +197,37 @@ leadsRouter.get('/', validateQuery(listLeadsQuerySchema), async (req: Request, r
   const shouldMask = isPhoneMaskingRequired(req.user, wsForMask?.settings as Record<string, any>);
 
   const sanitizedLeads = leads.map((l) => {
-    const pl = paymentByLeadId.get(l.id) || (l.customerPhone ? paymentByPhone.get(l.customerPhone) : null);
+    const digits = l.customerPhone ? l.customerPhone.replace(/\D/g, '').slice(-10) : '';
+    const pl = paymentByLeadId.get(l.id) || (l.customerPhone ? paymentByPhone.get(l.customerPhone) : null) || (digits ? paymentByPhone.get(digits) : null);
+    const ap = appPaymentByLeadId.get(l.id) || (l.leadId ? appPaymentByLeadId.get(l.leadId) : null) || (l.customerPhone ? appPaymentByPhone.get(l.customerPhone) : null) || (digits ? appPaymentByPhone.get(digits) : null);
+
+    let realPaymentAmount = 0;
+    let realPaymentStatus = 'UNPAID';
+
+    if (ap) {
+      realPaymentAmount = Number((ap as any).amount ?? ap.approvedAmount ?? ap.requestedAmount ?? 0);
+      realPaymentStatus = ap.status || 'UNPAID';
+    } else if (pl) {
+      realPaymentAmount = Number(pl.totalAmount || 0);
+      realPaymentStatus = pl.status || 'UNPAID';
+    }
+
     const rawBudget = Number(l.budgetAmount || 0);
-    const effectiveBudget = (rawBudget === 0 && pl) ? Number(pl.totalAmount) : rawBudget;
+    const effectiveBudget = (rawBudget === 0 && (realPaymentAmount > 0 || pl))
+      ? (realPaymentAmount > 0 ? realPaymentAmount : Number(pl?.totalAmount || 0))
+      : rawBudget;
+
+    const latestNoteText = l.notes || latestNoteByLeadId.get(l.id) || '';
 
     return {
       ...l,
+      notes: latestNoteText,
       budgetAmount: effectiveBudget,
-      paymentStatus: pl?.status || null,
-      paymentAmount: pl ? Number(pl.totalAmount) : null,
-      paymentLink: pl?.publicToken ? `/pay/${pl.publicToken}` : null,
+      realPaymentAmount,
+      realPaymentStatus,
+      paymentStatus: pl?.status || (realPaymentStatus !== 'UNPAID' ? realPaymentStatus : null),
+      paymentAmount: pl ? Number(pl.totalAmount) : (realPaymentAmount > 0 ? realPaymentAmount : null),
+      paymentLink: pl?.publicToken ? `/pay/${pl.publicToken}` : (ap?.paymentLink || null),
       customerPhone: shouldMask ? maskPhoneNumber(l.customerPhone, true) : l.customerPhone,
     };
   });
@@ -170,11 +235,13 @@ leadsRouter.get('/', validateQuery(listLeadsQuerySchema), async (req: Request, r
   res.json({
     success: true,
     data: sanitizedLeads,
+    totalPoolCount,
     pagination: {
       total,
       page,
       limit,
       totalPages: Math.ceil(total / limit),
+      totalPoolCount,
     },
     error: null,
   });
@@ -1038,20 +1105,23 @@ leadsRouter.get('/pool', async (req: Request, res: Response) => {
   const availableSlots = Math.max(0, grabCapacity - initialStageCount);
   const isAtQuota = !isAdmin && initialStageCount >= grabCapacity;
 
-  // 3. Query open pool items
-  const poolLeads = await prisma.salesLeadPoolItem.findMany({
-    where: {
-      tenantId,
-      status: 'OPEN',
-      ...(profile ? {
-        OR: [
-          { assignedAgentId: null },
-          { assignedAgentId: profile.id },
-        ],
-      } : {}),
-    },
-    orderBy: { createdAt: 'desc' },
-  });
+  // 3. Query open pool items and strict total open pool count
+  const [totalPoolCount, poolLeads] = await Promise.all([
+    prisma.salesLeadPoolItem.count({ where: { tenantId, status: 'OPEN' } }),
+    prisma.salesLeadPoolItem.findMany({
+      where: {
+        tenantId,
+        status: 'OPEN',
+        ...(profile ? {
+          OR: [
+            { assignedAgentId: null },
+            { assignedAgentId: profile.id },
+          ],
+        } : {}),
+      },
+      orderBy: { createdAt: 'desc' },
+    }),
+  ]);
 
   const now = Date.now();
 
@@ -1081,7 +1151,7 @@ leadsRouter.get('/pool', async (req: Request, res: Response) => {
   res.json({
     success: true,
     data: formattedLeads,
-    totalPoolCount: poolLeads.length,
+    totalPoolCount,
     mySlottedCount: formattedLeads.length,
     maxVisibleToCloser,
     initialStageKey,
@@ -2170,9 +2240,13 @@ leadsRouter.get('/export', async (req: Request, res: Response) => {
 
 leadsRouter.get('/:id/360', getLead360);
 
-leadsRouter.get('/:id', async (req: Request, res: Response) => {
+leadsRouter.get('/:id', async (req: Request, res: Response, next: NextFunction) => {
   const tenantId = req.tenantId!;
   const id = String(req.params.id);
+
+  if (id === 'import' || id === 'pool' || id === 'missed' || id === 'export' || id === 'stages') {
+    return next();
+  }
 
   const check = await verifyLeadAccess(id, req);
   if (!check.ok) {
@@ -2180,35 +2254,84 @@ leadsRouter.get('/:id', async (req: Request, res: Response) => {
     return;
   }
 
-  const lead = await prisma.salesLeadAssignment.findFirst({
-    where: { id: check.lead.id, tenantId },
-    include: {
-      assignedAgent: {
-        select: {
-          id: true,
-          agentCode: true,
-          user: { select: { displayName: true, email: true, phone: true } },
+  const [lead, appPayment, upiLink] = await Promise.all([
+    prisma.salesLeadAssignment.findFirst({
+      where: { id: check.lead.id, tenantId },
+      include: {
+        assignedAgent: {
+          select: {
+            id: true,
+            agentCode: true,
+            user: { select: { displayName: true, email: true, phone: true } },
+          },
+        },
+        mobileCalls: {
+          where: { tenantId },
+          orderBy: { startedAt: 'desc' },
+          take: 10,
+        },
+        activityLogs: {
+          where: { tenantId },
+          orderBy: { createdAt: 'desc' },
+          take: 20,
         },
       },
-      mobileCalls: {
-        where: { tenantId },
-        orderBy: { startedAt: 'desc' },
-        take: 10,
+    }),
+    prisma.appPaymentRequest.findFirst({
+      where: {
+        tenantId,
+        OR: [
+          { assignmentId: check.lead.id },
+          ...(check.lead.leadId ? [{ assignmentId: check.lead.leadId }] : []),
+        ],
       },
-      activityLogs: {
-        where: { tenantId },
-        orderBy: { createdAt: 'desc' },
-        take: 20,
+      orderBy: { requestedAt: 'desc' },
+    }).catch(() => null),
+    prisma.upiPaymentLink.findFirst({
+      where: {
+        tenantId,
+        OR: [
+          { customFields: { path: ['leadId'], equals: check.lead.id } },
+          ...(check.lead.customerPhone ? [{ customerPhone: check.lead.customerPhone }] : []),
+        ],
       },
-    },
-  });
+      orderBy: { createdAt: 'desc' },
+    }).catch(() => null),
+  ]);
 
   if (!lead) {
     res.status(404).json({ success: false, error: 'NotFound', message: 'Lead not found in this workspace' });
     return;
   }
 
-  res.json({ success: true, data: lead });
+  if (!lead.notes) {
+    const latestNote = await prisma.salesLeadTimelineEntry.findFirst({
+      where: { leadId: check.lead.id, tenantId, type: 'NOTE' },
+      orderBy: { createdAt: 'desc' },
+      select: { body: true },
+    });
+    if (latestNote?.body) {
+      (lead as any).notes = latestNote.body;
+    }
+  }
+
+  let realPaymentAmount = 0;
+  let realPaymentStatus = 'UNPAID';
+  if (appPayment) {
+    realPaymentAmount = Number((appPayment as any).amount ?? appPayment.approvedAmount ?? appPayment.requestedAmount ?? 0);
+    realPaymentStatus = appPayment.status || 'UNPAID';
+  } else if (upiLink) {
+    realPaymentAmount = Number(upiLink.totalAmount || 0);
+    realPaymentStatus = upiLink.status || 'UNPAID';
+  }
+
+  const enrichedLead = {
+    ...lead,
+    realPaymentAmount,
+    realPaymentStatus,
+  };
+
+  res.json({ success: true, data: enrichedLead });
 });
 
 const updateLeadSchema = z.object({
@@ -2601,12 +2724,15 @@ leadsRouter.delete('/:id', async (req: Request, res: Response) => {
     return;
   }
 
+  const previousStage = lead.stage !== 'RECYCLED' ? lead.stage : (customFields.previousStage || 'NEW');
+
   const updated = await prisma.salesLeadAssignment.update({
     where: { id: lead.id },
     data: {
       stage: 'RECYCLED',
       customFields: {
         ...customFields,
+        previousStage,
         recycled: true,
         deletedAt: new Date().toISOString(),
         deletedByUserId: user.userId,
@@ -2694,15 +2820,18 @@ leadsRouter.post('/:id/restore', async (req: Request, res: Response) => {
     ? { ...(lead.customFields as Record<string, any>) }
     : {};
 
+  const targetStage = (customFields.previousStage && customFields.previousStage !== 'RECYCLED') ? customFields.previousStage : 'NEW';
+
   delete customFields.recycled;
   delete customFields.deletedAt;
   delete customFields.deletedByUserId;
   delete customFields.deletedByName;
+  delete customFields.previousStage;
 
   const restored = await prisma.salesLeadAssignment.update({
     where: { id: lead.id },
     data: {
-      stage: 'NEW',
+      stage: targetStage as any,
       customFields,
       stageChangedAt: new Date(),
       updatedAt: new Date(),
@@ -2715,14 +2844,21 @@ leadsRouter.post('/:id/restore', async (req: Request, res: Response) => {
       assignmentId: lead.id,
       actorUserId: user.userId,
       action: 'LEAD_RESTORED',
-      note: `Lead restored from Recycle Bin by ${user.displayName || userRole}`,
+      note: `Lead restored from Recycle Bin back to ${targetStage} stage by ${user.displayName || userRole}`,
     },
   }).catch(() => undefined);
 
   await persistApiRealtimeEvent({
     tenantId,
     eventType: 'lead.restored',
-    payload: { leadId: lead.id },
+    payload: { leadId: lead.id, stage: targetStage },
+    actorUserId: user.userId,
+  }).catch(() => undefined);
+
+  await persistApiRealtimeEvent({
+    tenantId,
+    eventType: 'lead.stage_changed',
+    payload: { id: lead.id, leadId: lead.id, stage: targetStage },
     actorUserId: user.userId,
   }).catch(() => undefined);
 
@@ -3586,6 +3722,17 @@ leadsRouter.post('/:id/notes', async (req: Request, res: Response) => {
     },
   });
 
+  await prisma.salesLeadAssignment.update({
+    where: { id: check.lead.id },
+    data: { notes: noteText, updatedAt: new Date() },
+  });
+
+  persistApiRealtimeEvent({
+    tenantId,
+    eventType: 'lead.updated',
+    payload: { id: check.lead.id, leadId: check.lead.id, notes: noteText },
+  });
+
   res.status(201).json({ success: true, data: entry });
 });
 
@@ -3625,6 +3772,22 @@ leadsRouter.patch('/:id/notes/:noteId', async (req: Request, res: Response) => {
     where: { id: noteId },
     data: { body: body.trim() },
   });
+
+  const latestNote = await prisma.salesLeadTimelineEntry.findFirst({
+    where: { leadId: check.lead.id, tenantId, type: 'NOTE' },
+    orderBy: { createdAt: 'desc' },
+  });
+  if (latestNote) {
+    await prisma.salesLeadAssignment.update({
+      where: { id: check.lead.id },
+      data: { notes: latestNote.body, updatedAt: new Date() },
+    });
+    persistApiRealtimeEvent({
+      tenantId,
+      eventType: 'lead.updated',
+      payload: { id: check.lead.id, leadId: check.lead.id, notes: latestNote.body },
+    });
+  }
 
   await prisma.salesActivityLog.create({
     data: {
@@ -3668,6 +3831,20 @@ leadsRouter.delete('/:id/notes/:noteId', async (req: Request, res: Response) => 
 
   await prisma.salesLeadTimelineEntry.delete({
     where: { id: noteId },
+  });
+
+  const latestNote = await prisma.salesLeadTimelineEntry.findFirst({
+    where: { leadId: check.lead.id, tenantId, type: 'NOTE' },
+    orderBy: { createdAt: 'desc' },
+  });
+  await prisma.salesLeadAssignment.update({
+    where: { id: check.lead.id },
+    data: { notes: latestNote?.body || null, updatedAt: new Date() },
+  });
+  persistApiRealtimeEvent({
+    tenantId,
+    eventType: 'lead.updated',
+    payload: { id: check.lead.id, leadId: check.lead.id, notes: latestNote?.body || null },
   });
 
   await prisma.salesActivityLog.create({
@@ -4236,6 +4413,9 @@ leadsRouter.post('/bulk-reassign', requirePermissions(PERM_LEADS_REASSIGN), vali
 
 const unifiedImportSchema = z.object({
   source: z.string().default('CSV'),
+  targetStage: z.string().optional(),
+  batchId: z.string().optional(),
+  filename: z.string().optional(),
   rows: z.array(
     z.object({
       customerName: z.string().min(1, 'Customer name is required'),
@@ -4244,6 +4424,8 @@ const unifiedImportSchema = z.object({
       serviceInterest: z.string().optional(),
       budgetAmount: z.number().optional(),
       notes: z.string().optional(),
+      stage: z.string().optional(),
+      priority: z.string().optional(),
       customFields: z.record(z.any()).optional(),
     })
   ).min(1, 'Provide at least one row to import'),
@@ -4251,11 +4433,180 @@ const unifiedImportSchema = z.object({
   duplicateAction: z.enum(['SKIP', 'UPDATE', 'OVERWRITE']).default('SKIP'),
 });
 
+function mapToSalesLeadStage(raw?: string): SalesLeadStage {
+  if (!raw) return 'NEW';
+  const s = raw.toUpperCase().trim().replace(/[\s-]+/g, '_');
+  if (s === 'WON' || s === 'CLOSED_WON') return 'CLOSED_WON';
+  if (s === 'LOST' || s === 'CLOSED_LOST') return 'CLOSED_LOST';
+  if (s === 'NEGOTIATION' || s === 'NEGOTIATING') return 'NEGOTIATION';
+  if (s === 'FOLLOW_UP' || s === 'FOLLOWUP' || s === 'CALL_SCHEDULED' || s === 'HOT' || s === 'WARM') return 'FOLLOW_UP';
+  if (s === 'QUALIFIED' || s === 'DEMO') return 'QUALIFIED';
+  if (s === 'IN_PROGRESS' || s === 'PROGRESS' || s === 'CONTACTED') return 'CONTACTED';
+  if (s === 'RECYCLED' || s === 'TRASH' || s === 'DELETED') return 'RECYCLED';
+  if ((SALES_LEAD_STAGES as readonly string[]).includes(s)) return s as SalesLeadStage;
+  return 'NEW';
+}
+
+// GET /import/batches - List past CSV import batches from workspace settings
+leadsRouter.get('/import/batches', async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const ws = await prisma.aicloserWorkspace.findUnique({
+    where: { id: tenantId },
+    select: { settings: true },
+  });
+  const wsSettings = (ws?.settings as Record<string, any>) || {};
+  const importBatches = Array.isArray(wsSettings.importBatches) ? wsSettings.importBatches : [];
+
+  res.json({
+    success: true,
+    data: importBatches,
+    error: null,
+  });
+});
+
+// POST /import/batches/:batchId/rollback - Rollback / recycle leads imported in a specific batch
+leadsRouter.post('/import/batches/:batchId/rollback', async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const user = req.user;
+  const batchId = String(req.params.batchId);
+
+  if (!user || (user.role !== 'ADMIN' && user.role !== 'SUPER_ADMIN' && user.role !== 'MANAGER')) {
+    res.status(403).json({
+      success: false,
+      error: 'Forbidden',
+      message: 'Only workspace Admins and Managers can rollback lead import batches',
+    });
+    return;
+  }
+
+  // 1. Find all active leads associated with this import batch
+  const batchLeads = await prisma.salesLeadAssignment.findMany({
+    where: {
+      tenantId,
+      customFields: { path: ['importBatchId'], equals: batchId },
+      stage: { not: 'RECYCLED' },
+    },
+    select: { id: true, customFields: true },
+  });
+
+  // 2. Soft delete / recycle leads
+  for (const l of batchLeads) {
+    const cf = (l.customFields as Record<string, any>) || {};
+    await prisma.salesLeadAssignment.update({
+      where: { id: l.id },
+      data: {
+        stage: 'RECYCLED',
+        customFields: {
+          ...cf,
+          recycled: true,
+          deletedAt: new Date().toISOString(),
+          deletedByUserId: user.userId,
+          deletedByName: user.displayName || user.role,
+          rollbackBatchId: batchId,
+        },
+        stageChangedAt: new Date(),
+        updatedAt: new Date(),
+      },
+    });
+
+    await prisma.salesActivityLog.create({
+      data: {
+        tenantId,
+        assignmentId: l.id,
+        actorUserId: user.userId,
+        action: 'LEAD_RECYCLED',
+        note: `Lead rolled back from import batch ${batchId}`,
+        metadata: { batchId, deletedByUserId: user.userId },
+      },
+    }).catch(() => undefined);
+  }
+
+  // Also archive any open pool items linked to these leads
+  const leadIds = batchLeads.map((l) => l.id);
+  if (leadIds.length > 0) {
+    await prisma.salesLeadPoolItem.updateMany({
+      where: {
+        tenantId,
+        convertedAssignmentId: { in: leadIds },
+        status: 'OPEN',
+      },
+      data: {
+        status: 'ARCHIVED',
+      },
+    }).catch(() => undefined);
+  }
+
+  // 3. Update status in workspace settings importBatches
+  const ws = await prisma.aicloserWorkspace.findUnique({
+    where: { id: tenantId },
+    select: { settings: true },
+  });
+  const wsSettings = (ws?.settings as Record<string, any>) || {};
+  const importBatches = Array.isArray(wsSettings.importBatches) ? wsSettings.importBatches : [];
+  let found = false;
+
+  const updatedBatches = importBatches.map((b: any) => {
+    if (b.id === batchId) {
+      found = true;
+      return {
+        ...b,
+        status: 'ROLLED_BACK',
+        rolledBackAt: new Date().toISOString(),
+        rolledBackBy: user.displayName || user.userId,
+        recycledCount: batchLeads.length,
+      };
+    }
+    return b;
+  });
+
+  if (!found) {
+    updatedBatches.unshift({
+      id: batchId,
+      filename: 'import.csv',
+      source: 'CSV',
+      totalRows: batchLeads.length,
+      createdCount: 0,
+      updatedCount: 0,
+      skippedDuplicates: 0,
+      targetStage: 'NEW',
+      timestamp: new Date().toISOString(),
+      status: 'ROLLED_BACK',
+      rolledBackAt: new Date().toISOString(),
+      rolledBackBy: user.displayName || user.userId,
+      recycledCount: batchLeads.length,
+    });
+  }
+
+  await prisma.aicloserWorkspace.update({
+    where: { id: tenantId },
+    data: {
+      settings: {
+        ...wsSettings,
+        importBatches: updatedBatches,
+      } as any,
+      updatedAt: new Date(),
+    },
+  });
+
+  res.json({
+    success: true,
+    message: `Batch ${batchId} rolled back successfully. ${batchLeads.length} leads moved to recycle bin.`,
+    data: {
+      batchId,
+      recycledCount: batchLeads.length,
+      status: 'ROLLED_BACK',
+    },
+    error: null,
+  });
+});
+
 // POST /import - Unified Lead Import for CSV, Excel, WhatsApp, Google Sheets
 leadsRouter.post('/import', requirePermissions(PERM_LEADS_REASSIGN), validateBody(unifiedImportSchema), async (req: Request, res: Response) => {
   const tenantId = req.tenantId!;
-  const { source, targetStage, rows, duplicateAction, distributionMode } = req.body;
+  const { source, targetStage, batchId: inputBatchId, filename, rows, duplicateAction, distributionMode } = req.body;
   const upperSource = source.toUpperCase().trim();
+  const batchId = inputBatchId || ('BAT-' + Date.now().toString(36).toUpperCase());
+  const defaultBatchTargetStage = (targetStage || 'NEW').toUpperCase().trim();
 
   let createdCount = 0;
   let updatedCount = 0;
@@ -4274,7 +4625,16 @@ leadsRouter.post('/import', requirePermissions(PERM_LEADS_REASSIGN), validateBod
   }
 
   for (const row of rows) {
-    const res = await upsertCompanyLead({
+    const rawStage = (row.stage || targetStage || 'NEW').toUpperCase().trim();
+    const stageToUse = mapToSalesLeadStage(rawStage);
+
+    const rowCustomFields = {
+      ...(row.customFields || {}),
+      importBatchId: batchId,
+      ...(row.priority ? { priority: row.priority } : {}),
+    };
+
+    const resUpsert = await upsertCompanyLead({
       tenantId,
       customerName: row.customerName,
       customerPhone: row.customerPhone,
@@ -4282,32 +4642,70 @@ leadsRouter.post('/import', requirePermissions(PERM_LEADS_REASSIGN), validateBod
       serviceInterest: row.serviceInterest,
       budgetAmount: row.budgetAmount,
       notes: row.notes,
-      customFields: row.customFields,
+      customFields: rowCustomFields,
       source: upperSource,
-      stage: row.stage || targetStage || 'NEW',
+      stage: stageToUse as any,
+      priority: row.priority,
       duplicateAction: duplicateAction as any,
       distributionMode: distributionMode as any,
       actorUserId: req.user?.userId,
     });
 
-    if (res.wasCreated) createdCount++;
-    else if (res.wasUpdated) updatedCount++;
+    if (resUpsert.wasCreated) createdCount++;
+    else if (resUpsert.wasUpdated) updatedCount++;
     else skippedDuplicates++;
 
-    if (sampleAssignments.length < 10 && res.lead) {
+    if (sampleAssignments.length < 10 && resUpsert.lead) {
       sampleAssignments.push({
-        leadId: res.lead.id,
-        customerName: res.lead.customerName,
-        stage: res.lead.stage,
-        assignedAgentId: res.lead.assignedAgentId,
+        leadId: resUpsert.lead.id,
+        customerName: resUpsert.lead.customerName,
+        stage: resUpsert.lead.stage,
+        assignedAgentId: resUpsert.lead.assignedAgentId,
       });
     }
+  }
+
+  // Batch History Persistence in workspace.settings.importBatches
+  const batchRecord = {
+    id: batchId,
+    filename: filename || 'import.csv',
+    source: upperSource,
+    totalRows: rows.length,
+    createdCount,
+    updatedCount,
+    skippedDuplicates,
+    targetStage: defaultBatchTargetStage,
+    timestamp: new Date().toISOString(),
+    status: 'COMPLETED',
+  };
+
+  try {
+    const ws = await prisma.aicloserWorkspace.findUnique({
+      where: { id: tenantId },
+      select: { settings: true },
+    });
+    const wsSettings = (ws?.settings as Record<string, any>) || {};
+    const importBatches = Array.isArray(wsSettings.importBatches) ? wsSettings.importBatches : [];
+    importBatches.unshift(batchRecord);
+    await prisma.aicloserWorkspace.update({
+      where: { id: tenantId },
+      data: {
+        settings: {
+          ...wsSettings,
+          importBatches: importBatches.slice(0, 100),
+        } as any,
+        updatedAt: new Date(),
+      },
+    });
+  } catch (err) {
+    logger.error('Failed to save import batch record to workspace settings', { error: String(err), batchId });
   }
 
   res.status(201).json({
     success: true,
     message: `Import complete: ${createdCount} created, ${updatedCount} updated, ${skippedDuplicates} duplicates skipped`,
     data: {
+      batchId,
       source: upperSource,
       totalRows: rows.length,
       createdCount,
