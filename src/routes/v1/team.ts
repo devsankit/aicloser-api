@@ -793,6 +793,7 @@ teamRouter.post('/break/start', validateBody(breakStartSchema), async (req: Requ
   // If already on break, return current active break state
   if (stats.isOnBreak && stats.activeBreak) {
     const activePayload = {
+      success: true,
       isOnBreak: true,
       breakStartedAt: stats.activeBreak.breakStartedAt,
       breakExpiresAt: stats.activeBreak.breakExpiresAt,
@@ -802,7 +803,6 @@ teamRouter.post('/break/start', validateBody(breakStartSchema), async (req: Requ
       allowedMinutes: stats.allowedMinutes,
     };
     return void res.json({
-      success: true,
       ...activePayload,
       data: activePayload,
       message: `Already on break. ${Math.ceil(stats.remainingSeconds / 60)} minutes remaining.`,
@@ -883,6 +883,7 @@ teamRouter.post('/break/start', validateBody(breakStartSchema), async (req: Requ
   }
 
   const startPayload = {
+    success: true,
     isOnBreak: true,
     breakStartedAt,
     breakExpiresAt,
@@ -893,7 +894,6 @@ teamRouter.post('/break/start', validateBody(breakStartSchema), async (req: Requ
   };
 
   res.json({
-    success: true,
     ...startPayload,
     data: startPayload,
     message: `Break started. ${Math.ceil(remainingSec / 60)} minutes remaining today.`,
@@ -993,6 +993,7 @@ teamRouter.post('/break/end', async (req: Request, res: Response) => {
   });
 
   const endPayload = {
+    success: true,
     isOnBreak: false,
     elapsedSeconds: actualDuration,
     remainingSeconds: updatedStats.remainingSeconds,
@@ -1001,7 +1002,6 @@ teamRouter.post('/break/end', async (req: Request, res: Response) => {
   };
 
   res.json({
-    success: true,
     ...endPayload,
     data: endPayload,
     message: 'Break ended/paused successfully',
@@ -1095,12 +1095,18 @@ teamRouter.get('/break/logs', async (req: Request, res: Response) => {
     });
 
     const stats = computeUserBreakStats(user.userId, profile?.id || null, wsSettings);
-    const isAdminOrManager = user.role === 'ADMIN' || user.role === 'SUPER_ADMIN' || user.role === 'MANAGER';
-    const seeAll = isAdminOrManager && scope === 'all';
+    const isCloser = user.role === 'SALES_AGENT' || user.role === 'CLOSER';
+    // Strictly isolate: regular closers can NEVER see any other user's breaks
+    const seeAll = !isCloser && (user.role === 'ADMIN' || user.role === 'SUPER_ADMIN' || user.role === 'MANAGER') && scope === 'all';
+    const startOfDay = getStartOfTodayMs();
 
     const filteredLogs = breakHistory
       .filter((item) => {
         if (!item || !item.startedAt) return false;
+        const startTime = new Date(item.startedAt).getTime();
+        // Stale items from previous days are excluded from the daily quota table
+        if (scope !== 'all_history' && startTime < startOfDay) return false;
+
         if (!seeAll) {
           const isUser = item.userId === user.userId || (profile && item.profileId === profile.id);
           if (!isUser) return false;
@@ -1110,14 +1116,35 @@ teamRouter.get('/break/logs', async (req: Request, res: Response) => {
       .map((item) => {
         const isCurrentActive = item.status === 'IN_PROGRESS';
         let currentDuration = item.durationSeconds || 0;
+        const startMs = new Date(item.startedAt).getTime();
         if (isCurrentActive) {
-          currentDuration = Math.max(0, Math.round((Date.now() - new Date(item.startedAt).getTime()) / 1000));
+          // If in progress for longer than allowed quota or started before today, auto-expire
+          if (startMs < startOfDay || (Date.now() - startMs) > (stats.allowedSeconds * 1000)) {
+            currentDuration = item.initialRemainingSeconds || stats.allowedSeconds;
+            return {
+              id: item.id || `brk-${item.startedAt}`,
+              userId: item.userId,
+              profileId: item.profileId,
+              userName: item.userName && item.userName !== 'Sales Closer' ? item.userName : (user.displayName || user.email || 'You'),
+              startedAt: item.startedAt,
+              endedAt: item.endedAt || item.breakExpiresAt || new Date(startMs + currentDuration * 1000).toISOString(),
+              durationSeconds: currentDuration,
+              status: 'EXPIRED',
+              date: item.date || item.startedAt.split('T')[0],
+            };
+          }
+          currentDuration = Math.max(0, Math.round((Date.now() - startMs) / 1000));
         }
+
+        const resolvedName = item.userName && item.userName !== 'Sales Closer'
+          ? item.userName
+          : (item.userId === user.userId ? (user.displayName || user.email || 'You') : 'Sales Closer');
+
         return {
           id: item.id || `brk-${item.startedAt}`,
           userId: item.userId,
           profileId: item.profileId,
-          userName: item.userName || 'Sales Closer',
+          userName: resolvedName,
           startedAt: item.startedAt,
           endedAt: item.endedAt || null,
           durationSeconds: currentDuration,
