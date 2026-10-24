@@ -143,20 +143,15 @@ export async function syncAndRotatePoolSlots(
   const closerInitialStageCounts: Record<string, number> = {};
   await Promise.all(
     activeClosers.map(async (c) => {
-      const count = await prisma.salesLeadAssignment.count({
+      const leads = await prisma.salesLeadAssignment.findMany({
         where: {
           tenantId,
           assignedAgentId: c.id,
           stage: initialStageKey as any,
-          NOT: {
-            customFields: {
-              path: ['inGrabPool'],
-              equals: true,
-            },
-          },
         },
+        select: { customFields: true },
       });
-      closerInitialStageCounts[c.id] = count;
+      closerInitialStageCounts[c.id] = leads.filter((l) => (l.customFields as any)?.inGrabPool !== true).length;
     })
   );
 

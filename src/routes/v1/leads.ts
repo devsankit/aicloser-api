@@ -932,21 +932,17 @@ leadsRouter.get('/pool', async (req: Request, res: Response) => {
   const initialStageLabel = stages[0]?.label || 'New Lead';
 
   // Calculate closer's leads in initialStageKey
-  const initialStageCount = profile
-    ? await prisma.salesLeadAssignment.count({
+  const initialLeads = profile
+    ? await prisma.salesLeadAssignment.findMany({
         where: {
           tenantId,
           assignedAgentId: profile.id,
           stage: initialStageKey as any,
-          NOT: {
-            customFields: {
-              path: ['inGrabPool'],
-              equals: true,
-            },
-          },
         },
+        select: { customFields: true },
       })
-    : 0;
+    : [];
+  const initialStageCount = initialLeads.filter((l) => (l.customFields as any)?.inGrabPool !== true).length;
 
   const availableSlots = Math.max(0, grabCapacity - initialStageCount);
   const isAtQuota = !isAdmin && initialStageCount >= grabCapacity;
@@ -2725,19 +2721,15 @@ async function handlePoolClaim(req: Request, res: Response) {
   const rrSettings = (wsSettings.roundRobinSettings as Record<string, any>) || {};
   const grabCapacity = Number(rrSettings.maxVisibleToCloser) || Number(wsSettings.poolCapacity) || (profile.maxActiveLeads && profile.maxActiveLeads > 0 ? profile.maxActiveLeads : 25);
 
-  const initialStageCount = await prisma.salesLeadAssignment.count({
+  const initialLeads = await prisma.salesLeadAssignment.findMany({
     where: {
       tenantId,
       assignedAgentId: profile.id,
       stage: initialStageKey as any,
-      NOT: {
-        customFields: {
-          path: ['inGrabPool'],
-          equals: true,
-        },
-      },
     },
+    select: { customFields: true },
   });
+  const initialStageCount = initialLeads.filter((l) => (l.customFields as any)?.inGrabPool !== true).length;
 
   const isAdmin = user.role === 'ADMIN' || user.role === 'SUPER_ADMIN' || user.role === 'MANAGER';
   if (!isAdmin && initialStageCount >= grabCapacity) {
