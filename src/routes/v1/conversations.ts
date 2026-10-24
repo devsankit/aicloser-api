@@ -3810,9 +3810,63 @@ conversationsRouter.patch('/:id/stage', async (req: Request, res: Response) => {
   if (requestedStage === 'PROGRESS' || requestedStage === 'IN_PROGRESS') requestedStage = 'CONTACTED';
   if (requestedStage === 'FOLLOWUP') requestedStage = 'FOLLOW_UP';
 
-  const conversation = await prisma.appConversation.findFirst({
+  let conversation = await prisma.appConversation.findFirst({
     where: { id, tenantId },
   });
+
+  if (!conversation) {
+    conversation = await prisma.appConversation.findFirst({
+      where: {
+        tenantId,
+        OR: [
+          { payload: { path: ['leadId'], equals: id } },
+          { payload: { path: ['assignmentId'], equals: id } },
+        ],
+      },
+    });
+  }
+
+  if (!conversation) {
+    const directLead = await prisma.salesLeadAssignment.findFirst({
+      where: { id, tenantId },
+    });
+    if (directLead) {
+      if (directLead.conversationId) {
+        conversation = await prisma.appConversation.findFirst({
+          where: { id: directLead.conversationId, tenantId },
+        });
+      }
+      if (!conversation) {
+        await prisma.salesLeadAssignment.update({
+          where: { id: directLead.id },
+          data: { stage: requestedStage as any, stageChangedAt: new Date() },
+        });
+        await prisma.salesActivityLog.create({
+          data: {
+            tenantId,
+            assignmentId: directLead.id,
+            actorUserId: req.user?.userId,
+            action: 'LEAD_STAGE_CHANGED',
+            note: `Lead stage changed from ${directLead.stage} to ${requestedStage}`,
+            metadata: { previousStage: directLead.stage, newStage: requestedStage },
+          },
+        }).catch(() => undefined);
+        await persistApiRealtimeEvent({
+          tenantId,
+          eventType: 'lead.stage_changed',
+          payload: {
+            id: directLead.id,
+            leadId: directLead.id,
+            stage: requestedStage,
+          },
+          actorUserId: req.user?.userId,
+        }).catch(() => undefined);
+
+        res.json({ success: true, message: 'Lead stage updated successfully', affectedLeads: 1, leadId: directLead.id, stage: requestedStage, error: null });
+        return;
+      }
+    }
+  }
 
   if (!conversation) {
     res.status(404).json({ success: false, error: 'NotFound', message: 'Conversation not found' });
