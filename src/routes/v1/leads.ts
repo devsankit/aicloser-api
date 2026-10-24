@@ -412,11 +412,21 @@ leadsRouter.get('/pipeline-bootstrap', async (req: Request, res: Response) => {
     where.stage = { not: 'RECYCLED' };
   }
 
+  // 1. Resolve dynamic capacity from workspace settings rather than hardcoded fallbacks
+  const workspaceRecord = await prisma.aicloserWorkspace.findUnique({
+    where: { id: tenantId },
+    select: { settings: true },
+  });
+  const wsSettings = (workspaceRecord?.settings as Record<string, any>) || {};
+  const rrSettings = (wsSettings.roundRobinSettings as Record<string, any>) || {};
+  const configuredCapacity = Math.max(1, Number(rrSettings.maxVisibleToCloser) || Number(wsSettings.poolCapacity) || 25);
+  const maxActivePerCloser = Math.max(1, Number(rrSettings.maxActiveLeadsPerCloser) || 50);
+
   const limitParam = req.query.limit ? Number(req.query.limit) : 250;
   const leadLimit = Math.min(500, Math.max(1, isNaN(limitParam) ? 250 : limitParam));
   const maxVisibleToCloser = req.query.maxVisibleToCloser
-    ? Math.min(50, Math.max(1, isNaN(Number(req.query.maxVisibleToCloser)) ? 5 : Number(req.query.maxVisibleToCloser)))
-    : 5;
+    ? Math.min(100, Math.max(1, isNaN(Number(req.query.maxVisibleToCloser)) ? configuredCapacity : Number(req.query.maxVisibleToCloser)))
+    : configuredCapacity;
 
   // 2. Run all sub-queries concurrently in parallel
   const [
@@ -617,7 +627,7 @@ leadsRouter.get('/pipeline-bootstrap', async (req: Request, res: Response) => {
     phone: agent.user?.phone || null,
     role: agent.user?.role || 'SALES_AGENT',
     activeLeads: countByCloser.get(agent.id) ?? 0,
-    maxCapacity: agent.maxActiveLeads ?? 15,
+    maxCapacity: agent.maxActiveLeads && agent.maxActiveLeads > 0 ? agent.maxActiveLeads : maxActivePerCloser,
     canClaimLeads: agent.canClaimLeads ?? true,
     status: agent.status,
   }));
@@ -1098,7 +1108,16 @@ leadsRouter.post('/pool/auto-distribute', async (req: Request, res: Response) =>
   }
   const body = parsed.data;
 
-  // 1. Find eligible active sales agents
+  // 1. Resolve workspace capacity settings
+  const wsRecord = await prisma.aicloserWorkspace.findUnique({
+    where: { id: tenantId },
+    select: { settings: true },
+  });
+  const wsSettings = (wsRecord?.settings as Record<string, any>) || {};
+  const rrSettings = (wsSettings.roundRobinSettings as Record<string, any>) || {};
+  const defaultCloserCapacity = Math.max(1, Number(rrSettings.maxActiveLeadsPerCloser) || 50);
+
+  // 2. Find eligible active sales agents
   const activeProfiles = await prisma.salesAgentProfile.findMany({
     where: {
       tenantId,
@@ -1120,7 +1139,7 @@ leadsRouter.post('/pool/auto-distribute', async (req: Request, res: Response) =>
 
   const eligibleClosers = activeProfiles
     .map((p) => {
-      const maxActiveLeads = p.maxActiveLeads && p.maxActiveLeads > 0 ? p.maxActiveLeads : 15;
+      const maxActiveLeads = p.maxActiveLeads && p.maxActiveLeads > 0 ? p.maxActiveLeads : defaultCloserCapacity;
       const currentActive = p._count.leadAssignments;
       const remainingCapacity = Math.max(0, maxActiveLeads - currentActive);
       return {
@@ -1601,6 +1620,24 @@ export async function getLead360(req: Request, res: Response) {
     }).catch(() => undefined);
   }
 
+  let personalQrScannedByUserId = customFieldsObj.personalQrScannedByUserId || null;
+  let personalQrScannedByName = customFieldsObj.personalQrScannedByName || null;
+
+  if (personalQrConversationId && (!personalQrScannedByUserId || !personalQrScannedByName)) {
+    const pConv = await prisma.appConversation.findFirst({
+      where: { id: personalQrConversationId, tenantId },
+      select: { payload: true },
+    });
+    if (pConv?.payload && typeof pConv.payload === 'object') {
+      const pl = pConv.payload as Record<string, any>;
+      personalQrScannedByUserId = pl.scannedByUserId || personalQrScannedByUserId;
+      personalQrScannedByName = pl.scannedByName || personalQrScannedByName;
+    }
+  }
+
+  const hasDualConversations = Boolean(metaCloudConversationId && personalQrConversationId);
+  const primaryConversationType = conversation?.serviceSlug === 'manual-chat' ? 'PERSONAL_QR' : (conversation ? 'OFFICIAL_API' : 'NONE');
+
   // 4. Payments directly linked or by phone
   const payments = await prisma.upiPaymentLink.findMany({
     where: {
@@ -1780,6 +1817,10 @@ export async function getLead360(req: Request, res: Response) {
       ...lead,
       metaCloudConversationId,
       personalQrConversationId,
+      personalQrScannedByUserId,
+      personalQrScannedByName,
+      hasDualConversations,
+      primaryConversationType,
       aiScore: lead.aiScore ?? 50,
       aiSentiment: lead.aiSentiment || 'NEUTRAL',
       aiSummary: lead.aiSummary || null,
@@ -1787,10 +1828,16 @@ export async function getLead360(req: Request, res: Response) {
         ...customFieldsObj,
         metaCloudConversationId,
         personalQrConversationId,
+        personalQrScannedByUserId,
+        personalQrScannedByName,
       },
     },
     metaCloudConversationId,
     personalQrConversationId,
+    personalQrScannedByUserId,
+    personalQrScannedByName,
+    hasDualConversations,
+    primaryConversationType,
     assignedAgent: lead.assignedAgent ? {
       id: lead.assignedAgent.id,
       agentCode: lead.assignedAgent.agentCode,
@@ -3052,6 +3099,97 @@ leadsRouter.post('/:id/transfer', validateBody(transferLeadSchema), async (req: 
     success: true,
     lead: updatedLead,
     message: `Lead successfully transferred to ${targetName}`,
+    error: null,
+  });
+});
+
+const bindConversationSchema = z.object({
+  conversationId: z.string().min(1, 'conversationId is required'),
+  channelType: z.enum(['OFFICIAL_API', 'PERSONAL_QR']).optional(),
+});
+
+// POST /:id/bind-conversation - Explicitly match and bind a WhatsApp API or Personal QR conversation to a lead
+leadsRouter.post('/:id/bind-conversation', validateBody(bindConversationSchema), async (req: Request, res: Response) => {
+  const tenantId = req.tenantId!;
+  const id = String(req.params.id);
+  const { conversationId, channelType } = req.body as z.infer<typeof bindConversationSchema>;
+  const user = req.user!;
+
+  const check = await verifyLeadAccess(id, req);
+  if (!check.ok) {
+    res.status(check.status).json({ success: false, error: check.error, message: check.message });
+    return;
+  }
+  const lead = check.lead;
+
+  const conv = await prisma.appConversation.findFirst({
+    where: { id: conversationId, tenantId },
+  });
+  if (!conv) {
+    res.status(404).json({ success: false, error: 'ConversationNotFound', message: 'Conversation not found in workspace' });
+    return;
+  }
+
+  const isPersonalQr = channelType === 'PERSONAL_QR' || conv.serviceSlug === 'manual-chat';
+  const customFieldsObj = (lead.customFields && typeof lead.customFields === 'object' && !Array.isArray(lead.customFields))
+    ? { ...(lead.customFields as Record<string, any>) }
+    : {};
+
+  if (isPersonalQr) {
+    customFieldsObj.personalQrConversationId = conv.id;
+    customFieldsObj.personalQrScannedByUserId = (conv.payload as any)?.scannedByUserId || user.userId;
+    customFieldsObj.personalQrScannedByName = (conv.payload as any)?.scannedByName || user.displayName;
+  } else {
+    customFieldsObj.metaCloudConversationId = conv.id;
+  }
+
+  const leadCode = String((lead.customFields as any)?.leadCode || ('LEAD-' + lead.id.slice(-6).toUpperCase()));
+
+  const updatedLead = await prisma.salesLeadAssignment.update({
+    where: { id: lead.id },
+    data: {
+      conversationId: conv.id,
+      customFields: customFieldsObj,
+      updatedAt: new Date(),
+    },
+  });
+
+  // Link lead back into conversation payload
+  const convPayload = (conv.payload && typeof conv.payload === 'object' && !Array.isArray(conv.payload))
+    ? { ...(conv.payload as Record<string, any>) }
+    : {};
+  convPayload.leadId = lead.id;
+  convPayload.leadCode = leadCode;
+
+  await prisma.appConversation.update({
+    where: { id: conv.id },
+    data: { payload: convPayload, updatedAt: new Date() },
+  }).catch(() => undefined);
+
+  await prisma.salesActivityLog.create({
+    data: {
+      tenantId,
+      assignmentId: lead.id,
+      actorUserId: user.userId,
+      action: 'CONVERSATION_BOUND',
+      note: `Bound ${isPersonalQr ? 'Personal QR' : 'Official WhatsApp API'} chat to lead ${leadCode}`,
+      metadata: { conversationId: conv.id, channelType: isPersonalQr ? 'PERSONAL_QR' : 'OFFICIAL_API' },
+    },
+  }).catch(() => undefined);
+
+  res.json({
+    success: true,
+    message: `Conversation successfully bound to lead ${leadCode}`,
+    data: {
+      leadId: lead.id,
+      leadCode,
+      conversationId: conv.id,
+      channelType: isPersonalQr ? 'PERSONAL_QR' : 'OFFICIAL_API',
+      metaCloudConversationId: customFieldsObj.metaCloudConversationId || null,
+      personalQrConversationId: customFieldsObj.personalQrConversationId || null,
+      personalQrScannedByUserId: customFieldsObj.personalQrScannedByUserId || null,
+      personalQrScannedByName: customFieldsObj.personalQrScannedByName || null,
+    },
     error: null,
   });
 });
