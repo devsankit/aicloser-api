@@ -1049,7 +1049,7 @@ function persistDevicesToDisk() {
   }
 }
 
-function getTenantDevices(tenantId: string): WhatsAppCompanionDevice[] {
+export function getTenantDevices(tenantId: string): WhatsAppCompanionDevice[] {
   ensureDevicesLoaded();
   let list = companionDevicesStore.get(tenantId);
   if (!list) {

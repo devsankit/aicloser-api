@@ -17,6 +17,7 @@ import { persistApiRealtimeEvent } from '../../lib/realtime.js';
 import { getWorkspaceScope, checkSameReportingTeam } from '../../lib/workspace-scope.js';
 import { syncMarketingContactForLead, normalizeLeadPhone, deleteContactsAndLinkedLeadsTransactional } from '../../lib/lead-contact-sync.js';
 import { getLead360 } from './leads.js';
+import { getTenantDevices } from './integrations.js';
 
 export const conversationsRouter = Router();
 
@@ -83,12 +84,19 @@ export interface Window24HourStatus {
   is24HourWindowOpen: boolean;
   lastInboundAt: string | null;
   windowExpiresAt: string | null;
+  remainingMs?: number;
+  windowHours?: number;
+  isAdLead?: boolean;
 }
 
-export function calculate24HourWindow(conversation: {
-  serviceSlug?: string | null;
-  payload?: any;
-}): Window24HourStatus {
+export function calculate24HourWindow(
+  conversation: {
+    serviceSlug?: string | null;
+    payload?: any;
+    isAdLead?: boolean;
+  },
+  linkedLead?: any
+): Window24HourStatus {
   const serviceSlug = String(conversation.serviceSlug || '').toLowerCase();
 
   // Personal QR chats (companion WhatsApp via Baileys) have no 24-hour service window limit
@@ -97,11 +105,25 @@ export function calculate24HourWindow(conversation: {
       is24HourWindowOpen: true,
       lastInboundAt: null,
       windowExpiresAt: null,
+      remainingMs: undefined,
+      windowHours: 0,
+      isAdLead: false,
     };
   }
 
   const payload = (conversation.payload as Record<string, unknown>) || {};
   const rawMessages = Array.isArray(payload.messages) ? (payload.messages as Record<string, unknown>[]) : [];
+
+  const isAd = Boolean(
+    conversation.isAdLead ||
+    payload.isAdLead === true ||
+    payload.source === 'Ads' ||
+    payload.leadSource === 'Ads' ||
+    (payload.referral as any)?.source_type === 'ad' ||
+    linkedLead?.source === 'Ads' ||
+    (linkedLead?.rawSource || '').toLowerCase().includes('ad') ||
+    (typeof payload.sourceChannel === 'string' && payload.sourceChannel.toLowerCase().includes('ad'))
+  );
 
   let lastInboundTime = 0;
 
@@ -128,25 +150,34 @@ export function calculate24HourWindow(conversation: {
     }
   }
 
+  const windowHours = isAd ? 72 : 24;
+  const WINDOW_MS = windowHours * 60 * 60 * 1000;
+
   if (lastInboundTime === 0) {
     // Official API: No inbound message received yet from customer. Free-form messaging locked.
     return {
       is24HourWindowOpen: false,
       lastInboundAt: null,
       windowExpiresAt: null,
+      remainingMs: 0,
+      windowHours,
+      isAdLead: isAd,
     };
   }
 
   const now = Date.now();
-  const WINDOW_MS = 24 * 60 * 60 * 1000;
   const expiresAt = lastInboundTime + WINDOW_MS;
+  const remainingMs = Math.max(0, expiresAt - now);
 
   if (now >= expiresAt) {
-    // 24-hour window has expired. Free-form messaging locked.
+    // Window has expired. Free-form messaging locked.
     return {
       is24HourWindowOpen: false,
       lastInboundAt: new Date(lastInboundTime).toISOString(),
       windowExpiresAt: null,
+      remainingMs: 0,
+      windowHours,
+      isAdLead: isAd,
     };
   }
 
@@ -154,6 +185,9 @@ export function calculate24HourWindow(conversation: {
     is24HourWindowOpen: true,
     lastInboundAt: new Date(lastInboundTime).toISOString(),
     windowExpiresAt: new Date(expiresAt).toISOString(),
+    remainingMs,
+    windowHours,
+    isAdLead: isAd,
   };
 }
 
@@ -896,7 +930,7 @@ conversationsRouter.get('/', validateQuery(listConversationsQuerySchema), async 
 
     const isOfficialApi = channelSource === 'OFFICIAL_API' && serviceSlug !== 'manual-chat';
     const isPersonalQr = channelSource === 'QR_SCANNER' || serviceSlug === 'manual-chat';
-    const windowStatus = calculate24HourWindow(c);
+    const windowStatus = calculate24HourWindow(c, lead);
 
     const scannedByName =
       channelSource === 'QR_SCANNER'
@@ -939,6 +973,9 @@ conversationsRouter.get('/', validateQuery(listConversationsQuerySchema), async 
       is24HourWindowOpen: windowStatus.is24HourWindowOpen,
       lastInboundAt: windowStatus.lastInboundAt,
       windowExpiresAt: windowStatus.windowExpiresAt,
+      remainingMs: windowStatus.remainingMs,
+      windowHours: windowStatus.windowHours,
+      isAdLead: windowStatus.isAdLead,
       stage: lead?.stage || 'NEW',
       leadStage: lead?.stage || 'NEW',
       leadId: lead?.id || null,
@@ -1687,6 +1724,9 @@ conversationsRouter.get('/:id', async (req: Request, res: Response) => {
       is24HourWindowOpen: windowStatus.is24HourWindowOpen,
       lastInboundAt: windowStatus.lastInboundAt,
       windowExpiresAt: windowStatus.windowExpiresAt,
+      remainingMs: windowStatus.remainingMs,
+      windowHours: windowStatus.windowHours,
+      isAdLead: windowStatus.isAdLead,
     },
     error: null,
   });
@@ -1976,6 +2016,9 @@ conversationsRouter.post('/get-or-create', validateBody(getOrCreateConversationS
         is24HourWindowOpen: windowStatus.is24HourWindowOpen,
         lastInboundAt: windowStatus.lastInboundAt,
         windowExpiresAt: windowStatus.windowExpiresAt,
+        remainingMs: windowStatus.remainingMs,
+        windowHours: windowStatus.windowHours,
+        isAdLead: windowStatus.isAdLead,
       },
     },
     error: null,
@@ -2050,8 +2093,41 @@ conversationsRouter.post('/:id/messages', validateBody(sendMessageSchema), async
         body.dispatchChannel === 'PERSONAL' ||
         (body.dispatchChannel !== 'OFFICIAL_API' && (conversation as any).serviceSlug === 'manual-chat');
 
+      const linkedLead = await prisma.salesLeadAssignment.findFirst({
+        where: {
+          tenantId,
+          OR: [
+            { conversationId: conversation.id },
+            { customerPhone: conversation.customerPhone },
+            ...(payload.leadId ? [{ id: String(payload.leadId) }] : []),
+          ],
+        },
+      }).catch(() => null);
+
       if (useCompanion) {
-        // Dispatch via companion WhatsApp Baileys daemon
+        // 1. Verify that a companion WhatsApp device is connected for this user
+        const devices = getTenantDevices(tenantId);
+        const isUserAdmin = ['ADMIN', 'SUPER_ADMIN'].includes(req.user?.role || '');
+        const connectedCompanion = devices.find(
+          (d) => d.status === 'connected' && (isUserAdmin || !d.scannedByUserId || d.scannedByUserId === req.user?.userId)
+        );
+
+        if (!connectedCompanion) {
+          logger.warn('Blocked companion WhatsApp outbound message: no connected device for user', {
+            userId: req.user?.userId,
+            tenantId,
+            conversationId: conversation.id,
+          });
+          res.status(400).json({
+            success: false,
+            error: 'PersonalWhatsAppNotConnected',
+            code: 'PERSONAL_WA_NOT_CONNECTED',
+            message: 'Personal WhatsApp is not connected for your account. Please scan your personal WhatsApp QR code before sending messages.',
+          });
+          return;
+        }
+
+        // 2. Dispatch via companion WhatsApp Baileys daemon
         const waServiceUrl = process.env.WA_SERVICE_URL || 'http://127.0.0.1:3015';
         try {
           const waRes = await fetch(`${waServiceUrl}/send`, {
@@ -2060,6 +2136,7 @@ conversationsRouter.post('/:id/messages', validateBody(sendMessageSchema), async
             body: JSON.stringify({
               to: cleanPhone,
               body: messageBody,
+              sessionId: connectedCompanion.id,
             }),
             signal: AbortSignal.timeout(10_000),
           });
@@ -2073,16 +2150,30 @@ conversationsRouter.post('/:id/messages', validateBody(sendMessageSchema), async
               messageId: waData.messageId,
             });
           } else {
-            outboundDispatchError = waData?.error || 'Failed to dispatch via companion WhatsApp';
+            const errDetail = waData?.error || 'Failed to dispatch via companion WhatsApp';
             logger.warn('Companion WhatsApp outbound dispatch failed', {
               conversationId: conversation.id,
               recipientPhone: cleanPhone,
-              error: outboundDispatchError,
+              error: errDetail,
             });
+            res.status(400).json({
+              success: false,
+              error: 'CompanionWhatsAppDispatchFailed',
+              code: 'COMPANION_DISPATCH_FAILED',
+              message: `Personal WhatsApp failed to send: ${errDetail}. Check that your companion phone is online.`,
+            });
+            return;
           }
         } catch (err: any) {
-          outboundDispatchError = err?.message || 'Companion WhatsApp daemon unreachable';
-          logger.error('Error dispatching via companion WhatsApp daemon', { error: outboundDispatchError });
+          const errMsg = err?.message || 'Companion WhatsApp daemon unreachable';
+          logger.error('Error dispatching via companion WhatsApp daemon', { error: errMsg });
+          res.status(400).json({
+            success: false,
+            error: 'CompanionWhatsAppDispatchFailed',
+            code: 'COMPANION_DISPATCH_FAILED',
+            message: `Personal WhatsApp service unavailable (${errMsg}). Please check phone connection or rescan QR code.`,
+          });
+          return;
         }
       } else {
         // Official Meta WhatsApp Cloud API dispatch
@@ -2195,19 +2286,23 @@ conversationsRouter.post('/:id/messages', validateBody(sendMessageSchema), async
             return;
           }
         } else {
-          // Free-form message: MUST verify 24-hour customer service window
-          const windowStatus = calculate24HourWindow(conversation);
+          // Free-form message: MUST verify 24-hour / 72-hour customer service window
+          const windowStatus = calculate24HourWindow(conversation, linkedLead);
           if (!windowStatus.is24HourWindowOpen) {
-            logger.warn('Blocked free-form WhatsApp outbound message: 24h window closed', {
+            logger.warn('Blocked free-form WhatsApp outbound message: service window closed', {
               conversationId: conversation.id,
               recipientPhone: cleanPhone,
+              windowHours: windowStatus.windowHours,
             });
             res.status(400).json({
               success: false,
-              error: 'Meta24HourWindowClosed',
-              message: 'Meta 24-hour customer service window is closed. Free-form messaging is locked. You must send an approved WhatsApp Template to contact this user.',
+              error: 'MetaServiceWindowClosed',
+              code: 'META_WINDOW_CLOSED',
+              message: `Meta customer service window is closed (${windowStatus.windowHours}h window expired). Free-form messaging is locked. You must send an approved WhatsApp Template to contact this user.`,
               data: {
                 is24HourWindowOpen: false,
+                windowHours: windowStatus.windowHours,
+                isAdLead: windowStatus.isAdLead,
                 windowExpiresAt: null,
               },
             });
